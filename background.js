@@ -474,7 +474,11 @@ function buildCampaignSpendPayload({
   size,
   offset,
   timeUnit = "DAILY",
+  isCheckCampain = false,
 }) {
+  const valueFilter = isCheckCampain
+    ? ["ENABLED", "PAUSED"]
+    : ["ENABLED", "PAUSED", "ARCHIVED"];
   return {
     reportConfig: {
       reportId: "CrossProgramCampaignReport",
@@ -487,7 +491,7 @@ function buildCampaignSpendPayload({
             comparisonOperator: "IN",
             field: "state",
             not: false,
-            values: ["ENABLED", "PAUSED"],
+            values: valueFilter,
           },
         ],
       },
@@ -498,13 +502,19 @@ function buildCampaignSpendPayload({
   };
 }
 
-async function fetchAllCampaignSpend(startDate, endDate, pageSize = 300) {
+async function fetchAllCampaignSpend(
+  startDate,
+  endDate,
+  pageSize = 300,
+  isCheckCampain = false
+) {
   const firstJson = await fetchAdsJsonCS(
     buildCampaignSpendPayload({
       startDate,
       endDate,
       size: Math.max(1, Math.min(pageSize, 300)),
       offset: 0,
+      isCheckCampain,
     })
   );
 
@@ -523,6 +533,7 @@ async function fetchAllCampaignSpend(startDate, endDate, pageSize = 300) {
         endDate,
         size: pageSize,
         offset: page * pageSize,
+        isCheckCampain,
       })
     );
     const report = js?.report || js?.data?.report || {};
@@ -860,7 +871,7 @@ function checkInvalidCampaignNames(campaigns, employeeCodes) {
 async function checkCampaign(date) {
   if (!date) throw new Error("date (YYYY-MM-DD) required");
   const employeeCodes = await fetchEmployeeCodes();
-  const rows = await fetchAllCampaignSpend(date, date, 300);
+  const rows = await fetchAllCampaignSpend(date, date, 300, true);
 
   const result = checkInvalidCampaignNames(rows, employeeCodes);
 
@@ -943,9 +954,9 @@ export async function connectSocketIO(force = false) {
       },
       reconnection: true,
       reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
+      reconnectionDelay: 2000,
       reconnectionDelayMax: 10000,
-      timeout: 20000,
+      timeout: 180000,
     });
 
     socket.on("connect", async () => {
