@@ -95,6 +95,7 @@ function deriveApiUrls(ingestUrl) {
     importReportUrl: `${base}/api/ext/import-report`,
     importAdsUrl: `${base}/api/ext/import-ads`,
     getSeller: `${base}/api/user/employee-code`,
+    importFBMUrl: `${base}/api/shipping-batches`,
   };
 }
 
@@ -137,6 +138,16 @@ function parseTSV(tsv) {
 function buildNewOrdersPayload() {
   return {
     type: "newOrdersReport",
+    reportVersion: "new",
+    includeSalesChannel: false,
+    numDays: "1",
+    numMonth: "0",
+    numYear: "2015",
+  };
+}
+function buildFBMOrdersPayload() {
+  return {
+    type: "fbmUnshippedOrdersReport",
     reportVersion: "new",
     includeSalesChannel: false,
     numDays: "1",
@@ -385,6 +396,64 @@ async function runReportAllOrders(referenceOverride) {
     shopId,
     file: { name: `orders-all-${referenceId}.txt`, text: tsv },
   });
+
+  return { ok: true, rows, documentId, referenceId, ingest };
+}
+
+// Confirm Shipping
+async function runImportFBMOrders(referenceOverride, machineId, label) {
+  const { ingestUrl, ingestToken, refNewOrders } = await getCfg();
+  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
+  const { importFBMUrl } = deriveApiUrls(ingestUrl);
+
+  let referenceId = referenceOverride;
+  if (!referenceId) {
+    try {
+      referenceId = await requestReferenceIdNew(buildFBMOrdersPayload());
+    } catch (e) {
+      referenceId = refNewOrders;
+    }
+  }
+  if (!referenceId) throw new Error("No referenceId found for FBM orders.");
+
+  const st = await pollUntilReady(referenceId, {
+    intervalMs: 10000,
+    maxAttempts: 5,
+  });
+
+  let tsv,
+    documentId = null,
+    rows = 0;
+  if (st.direct) {
+    tsv = st.tsv;
+    rows = parseTSV(tsv).rows.length;
+  } else {
+    const r = await downloadByDocumentId(st.documentId);
+    tsv = r.tsv;
+    documentId = r.documentId;
+    rows = r.rows;
+  }
+
+  const fd = new FormData();
+  fd.append(
+    "file",
+    new Blob([tsv], { type: "text/plain" }),
+    `orders-FBM-${referenceId}.txt`
+  );
+  fd.append("machineId", machineId);
+  fd.append("label", label);
+
+  const resp = await fetch(importFBMUrl, {
+    method: "POST",
+    headers: { "x-access-token": ingestToken || "" },
+    body: fd,
+  });
+  if (!resp.ok) throw new Error(`Backend ${resp.status}`);
+  const ingest = (resp.headers.get("content-type") || "")
+    .toLowerCase()
+    .includes("application/json")
+    ? await resp.json()
+    : { ok: true, raw: await resp.text() };
 
   return { ok: true, rows, documentId, referenceId, ingest };
 }
@@ -733,6 +802,35 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 });
 
+//  Handle Confirm Shipping
+async function handleImportFBMOrders(trigger = "auto") {
+  const { base, shopId, clientId, clientLabel } =
+    await getBaseShopAndIdentity();
+  try {
+    await runImportFBMOrders(undefined, clientId, clientLabel);
+    await postLogSingle({
+      base,
+      shopId,
+      machineId: clientId,
+      label: clientLabel,
+      action: trigger,
+      level: "success",
+      message: "✅ Import FBM order success!",
+    });
+  } catch (e) {
+    await postLogSingle({
+      base,
+      shopId,
+      machineId: clientId,
+      label: clientLabel,
+      action: trigger,
+      level: "error",
+      message: "❌ Import FBM order error!",
+    });
+  }
+  return { ok: true, message: "Import FBM order success!" };
+}
+
 /* ===============================
    Auto-capture Amazon Ads headers (CSRF) via webRequest
    =============================== */
@@ -993,8 +1091,8 @@ export async function connectSocketIO(force = false) {
       const { type, payload } = task || {};
       try {
         switch (type) {
-          case "PULL_ALL":
-            runFullFlowAndEmitLogs("click");
+          case "IMPORT_FBM_ORDERS":
+            handleImportFBMOrders("click");
             break;
           case "IMPORT_ORDERS":
             runFullFlowAndEmitLogs("click");
