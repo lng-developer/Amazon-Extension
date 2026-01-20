@@ -89,11 +89,7 @@ function deriveApiUrls(ingestUrl) {
   return {
     base,
     importNewUrl: `${base}/api/order/update-from-xlsx`,
-    reportAllUrl: `${base}/api/report/import-file`,
     adsSpendUrl: `${base}/api/ads/import-day`,
-    importOrderUrl: `${base}/api/ext/import-order`,
-    importReportUrl: `${base}/api/ext/import-report`,
-    importAdsUrl: `${base}/api/ext/import-ads`,
     getSeller: `${base}/api/user/employee-code`,
     importFBMUrl: `${base}/api/shipping-batches`,
   };
@@ -155,15 +151,7 @@ function buildFBMOrdersPayload() {
     numYear: "2015",
   };
 }
-function buildAllOrdersPayload(startDur = "P1D", endDur = "P0D") {
-  return {
-    type: "allOrdersReport",
-    reportVersion: "orderDateVersion",
-    includeSalesChannel: null,
-    startDate: startDur,
-    endDate: endDur,
-  };
-}
+
 async function requestReferenceIdNew(body) {
   const url = `${SC_BASE}/order-reports-and-feeds/api/reportRequest`;
   const res = await requestOnce(url, {
@@ -181,23 +169,7 @@ async function requestReferenceIdNew(body) {
   const j = await res.json();
   return j?.referenceId || j?.data?.referenceId;
 }
-async function requestReferenceIdAll(body) {
-  const url = `${SC_BASE}/order-reports-and-feeds/api/v1/reportRequest`;
-  const res = await requestOnce(url, {
-    method: "POST",
-    headers: { "content-type": "application/json;charset=UTF-8" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok)
-    throw new Error(
-      `reportRequest ALL ${res.status} — ${(
-        await res.text().catch(() => "")
-      ).slice(0, 200)}`
-    );
-  if (!isJson(res)) throw new Error(`reportRequest ALL non-JSON`);
-  const j = await res.json();
-  return j?.referenceId || j?.data?.referenceId;
-}
+
 async function checkReportReady(referenceId) {
   const url = `${SC_BASE}/order-reports-and-feeds/api/documentMetadata?referenceId=${encodeURIComponent(
     referenceId
@@ -353,49 +325,6 @@ async function runImportNewOrders(referenceOverride) {
     .includes("application/json")
     ? await resp.json()
     : { ok: true, raw: await resp.text() };
-
-  return { ok: true, rows, documentId, referenceId, ingest };
-}
-
-async function runReportAllOrders(referenceOverride) {
-  const { ingestUrl, shopId, refAllOrders } = await getCfg();
-  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
-  const { reportAllUrl } = deriveApiUrls(ingestUrl);
-
-  let referenceId = referenceOverride;
-  if (!referenceId) {
-    try {
-      referenceId = await requestReferenceIdAll(
-        buildAllOrdersPayload("P1D", "P0D")
-      );
-    } catch (e) {
-      referenceId = refAllOrders;
-    }
-  }
-  if (!referenceId) throw new Error("No referenceId found for ALL orders");
-
-  const st = await pollUntilReady(referenceId, {
-    intervalMs: 10000,
-    maxAttempts: 5,
-  });
-
-  let tsv,
-    documentId = null,
-    rows = 0;
-  if (st.direct) {
-    tsv = st.tsv;
-    rows = parseTSV(tsv).rows.length;
-  } else {
-    const r = await downloadByDocumentId(st.documentId);
-    tsv = r.tsv;
-    documentId = r.documentId;
-    rows = r.rows;
-  }
-
-  const ingest = await postFileTo(reportAllUrl, {
-    shopId,
-    file: { name: `orders-all-${referenceId}.txt`, text: tsv },
-  });
 
   return { ok: true, rows, documentId, referenceId, ingest };
 }
@@ -649,48 +578,6 @@ async function runExportAdsSpend(date) {
   return { ok: true, rows: rows.length, ingest: ingestRes };
 }
 
-/* ===============================
-   AUTO SCHEDULER — 0h/4h/8h/12h/16h/20h (LOCAL)
-   =============================== */
-const AUTO_ALARM = "apo-auto-fixed";
-let autoBusy = false;
-
-function nextAlignedTs(fromTs = Date.now(), baseHour = 0, everyHours = 4) {
-  const d = new Date(fromTs);
-  d.setMinutes(0, 0, 0);
-  let h = d.getHours();
-  const mod = (((h - baseHour) % everyHours) + everyHours) % everyHours;
-  if (mod !== 0 || fromTs > d.getTime()) {
-    h = h + (everyHours - mod);
-    d.setHours(h, 0, 0, 0);
-  }
-  if (d.getTime() <= fromTs) d.setHours(d.getHours() + everyHours, 0, 0, 0);
-  return d.getTime();
-}
-
-async function scheduleNextAnchor() {
-  await chrome.alarms.clear(AUTO_ALARM);
-  const when = nextAlignedTs(Date.now(), 0, 4);
-  chrome.alarms.create(AUTO_ALARM, { when });
-  log("[AUTO] next tick at", new Date(when).toLocaleString());
-}
-
-async function scheduleAutoRun(enable = true) {
-  await chrome.alarms.clear(AUTO_ALARM);
-  await chrome.storage.local.set({ autoEnabled: enable });
-
-  if (!enable) {
-    log("[AUTO] disabled");
-    return { ok: true, enabled: false };
-  }
-  await scheduleNextAnchor();
-  return {
-    ok: true,
-    enabled: true,
-    schedule: "00:00 | 04:00 | 08:00 | 12:00 | 16:00 | 20:00",
-  };
-}
-
 async function postLogSingle({
   base,
   token,
@@ -750,13 +637,6 @@ async function runFullFlowAndEmitLogs(trigger = "auto") {
     } catch (error) {
       phases.push({ type: "import", status: "fail" });
     }
-    try {
-      await runReportAllOrders(undefined);
-      phases.push({ type: "report", status: "success" });
-    } catch (error) {
-      phases.push({ type: "report", status: "fail" });
-    }
-
     await postLogSingle({
       base,
       shopId,
@@ -782,32 +662,12 @@ async function runFullFlowAndEmitLogs(trigger = "auto") {
   return { ok: true, phases };
 }
 
-async function runAutoJob() {
-  if (autoBusy) {
-    console.log("[AUTO] skip, job is running");
-    return { ok: false, message: "busy" };
-  }
-  autoBusy = true;
-  try {
-    return await runFullFlowAndEmitLogs("auto");
-  } finally {
-    autoBusy = false;
-  }
-}
-
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === AUTO_ALARM) {
-    await runAutoJob();
-    await scheduleNextAnchor();
-  }
-});
-
 //  Handle Confirm Shipping
 async function handleImportFBMOrders(trigger = "auto") {
   const { base, shopId, clientId, clientLabel } =
     await getBaseShopAndIdentity();
   try {
-    await runImportFBMOrders(undefined, clientId, clientLabel);
+    await runImportFBMOrders(undefined, shopId, clientLabel);
     await postLogSingle({
       base,
       shopId,
@@ -1194,32 +1054,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return sendResponse(await checkCampaign(date));
       }
 
-      // Auto on/off
-      if (msg.type === "AUTO_ENABLE")
-        return sendResponse(await scheduleAutoRun(true));
-      if (msg.type === "AUTO_DISABLE")
-        return sendResponse(await scheduleAutoRun(false));
-      if (msg.type === "AUTO_SET")
-        return sendResponse(await scheduleAutoRun(!!msg.enabled));
-
       sendResponse({ ok: false, message: "Unknown command" });
     } catch (e) {
       sendResponse({ ok: false, message: String(e?.message || e) });
     }
   })();
   return true;
-});
-
-/* ---------- Lifecycle ---------- */
-chrome.runtime.onInstalled.addListener(async () => {
-  const st = await chrome.storage.local.get(["autoEnabled"]);
-  await ensureIdentity();
-  await scheduleAutoRun(st.autoEnabled ?? true);
-});
-
-chrome.runtime.onStartup.addListener(async () => {
-  const st = await chrome.storage.local.get(["autoEnabled"]);
-  await ensureIdentity();
-  if (st.autoEnabled ?? true) await scheduleNextAnchor();
-  else await chrome.alarms.clear(AUTO_ALARM);
 });
