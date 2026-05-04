@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "APO LNG Group",
-  "version": "0.2.0",
+  "name": "AMZ EXTENSION LNG",
+  "version": "0.3.0",
   "description": "Auto Pull Order - LNG Group",
   "icons": {
     "16": "logo.jpg",
@@ -41,7 +41,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "APO LNG Group",
+    "default_title": "AMZ EXTENSION LNG",
     "default_popup": "options.html",
     "default_icon": {
       "16": "logo.jpg",

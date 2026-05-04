@@ -14,6 +14,16 @@
     console.warn("[APO][ADS] Wrong host for ads_bridge.js:", location.href);
   }
 
+  // ---------- Logger bridge → background extensionLogger ----------
+  function bridgeLog(level, message, rawData = {}) {
+    try {
+      chrome.runtime.sendMessage({
+        type: "ADS_BRIDGE_LOG",
+        payload: { level, message, rawData, timestamp: new Date().toISOString() }
+      }).catch(() => { });
+    } catch (_) { }
+  }
+
   // ---------- Storage helpers ----------
   function getCfg(keys) {
     return new Promise((resolve) => {
@@ -78,9 +88,27 @@
 
   // ---------- Gọi retrieveReport bằng headers hiện tại ----------
   async function callRetrieveReport(payload) {
-    const headers = await buildAdsHeaders();
 
+    const cfg = await getCfg();
+    console.log("[ADS][DEBUG][cfg]", JSON.stringify(cfg, null, 2));
+    bridgeLog("info", "[ADS_BRIDGE] Storage config loaded", {
+      hasAccountId: !!cfg.adsAccountId,
+      hasAdvertiserId: !!cfg.adsAdvertiserId,
+      hasClientId: !!cfg.adsClientId,
+      hasMarketplaceId: !!cfg.adsMarketplaceId,
+      hasCsrfToken: !!cfg.adsCsrfToken,
+      hasCsrfData: !!cfg.adsCsrfData,
+      lastSeen: cfg.adsHeaderLastSeen ? new Date(cfg.adsHeaderLastSeen).toLocaleString() : "never",
+    });
+
+    const headers = await buildAdsHeaders();
     console.log("[APO][ADS] retrieveReport → headers(use)", headers);
+    bridgeLog("info", "[ADS_BRIDGE] retrieveReport headers built", {
+      hasAccountId: !!headers["Amazon-Ads-Account-Id"],
+      hasAdvertiserId: !!headers["Amazon-Advertising-Api-Advertiserid"],
+      hasCsrfToken: !!headers["Amazon-Advertising-Api-Csrf-Token"],
+      hasCsrfData: !!headers["Amazon-Advertising-Api-Csrf-Data"],
+    });
     console.log("[APO][ADS] retrieveReport → payload", payload);
 
     const res = await fetch(RETRIEVE_URL, {
@@ -93,126 +121,78 @@
 
     const text = await res.text();
     console.log("[APO][ADS] retrieveReport ←", res.status, text.slice(0, 300));
+    bridgeLog(
+      res.ok ? "info" : "error",
+      `[ADS_BRIDGE] retrieveReport response: ${res.status}`,
+      { status: res.status, ok: res.ok, preview: text.slice(0, 300) }
+    );
     return { status: res.status, ok: res.ok, text };
   }
 
   // ---------- Inject page script để bắt headers từ request gốc ----------
+  // Chạy trực tiếp trong content-script (ISOLATED world) — không dùng <script> tag vì CSP block
   function injectSniffer() {
-    const code = `
-      (function() {
-        const TARGET_HOST = ${JSON.stringify(ADS_HOST)};
-        const MSG_TYPE = ${JSON.stringify(MSG_TYPE_SNIFF)};
+    const TARGET_HOST = ADS_HOST;
 
-        function pickHeaders(h) {
-          // Chuẩn hoá object thường từ Headers (hoặc plain object)
-          const out = {};
-          if (!h) return out;
-          try {
-            if (typeof h.forEach === 'function') {
-              h.forEach((v, k) => out[String(k)] = String(v));
-            } else {
-              for (const k in h) out[String(k)] = String(h[k]);
-            }
-          } catch {}
-          return out;
+    function pickHeaders(h) {
+      const out = {};
+      if (!h) return out;
+      try {
+        if (typeof h.forEach === "function") {
+          h.forEach((v, k) => (out[String(k)] = String(v)));
+        } else {
+          for (const k in h) out[String(k)] = String(h[k]);
         }
+      } catch {}
+      return out;
+    }
 
-        function extractAdsHeaders(headersObj) {
-          const h = {};
-          const src = {};
-          for (const [k, v] of Object.entries(headersObj || {})) {
-            const K = k.toLowerCase();
-            src[K] = v;
-          }
-          // Map các header quan trọng
-          const M = {
-            "amazon-ads-account-id": "adsAccountId",
-            "amazon-advertising-api-advertiserid": "adsAdvertiserId",
-            "amazon-advertising-api-clientid": "adsClientId",
-            "amazon-advertising-api-marketplaceid": "adsMarketplaceId",
-            "amazon-advertising-api-csrf-data": "adsCsrfData",
-            "amazon-advertising-api-csrf-token": "adsCsrfToken"
-          };
-          Object.keys(M).forEach((lk) => {
-            if (src[lk]) h[M[lk]] = src[lk];
-          });
-          return h;
-        }
+    function extractAdsHeaders(headersObj) {
+      const src = {};
+      for (const [k, v] of Object.entries(headersObj || {})) src[k.toLowerCase()] = v;
+      const M = {
+        "amazon-ads-account-id": "adsAccountId",
+        "amazon-advertising-api-advertiserid": "adsAdvertiserId",
+        "amazon-advertising-api-clientid": "adsClientId",
+        "amazon-advertising-api-marketplaceid": "adsMarketplaceId",
+        "amazon-advertising-api-csrf-data": "adsCsrfData",
+        "amazon-advertising-api-csrf-token": "adsCsrfToken",
+      };
+      const out = {};
+      for (const [lk, key] of Object.entries(M)) if (src[lk]) out[key] = src[lk];
+      return out;
+    }
 
-        function shouldCapture(url) {
-          try {
-            const u = new URL(url, location.href);
-            return u.host.endsWith(TARGET_HOST);
-          } catch {
-            return false;
-          }
-        }
+    function shouldCapture(url) {
+      try { return new URL(url, location.href).host.endsWith(TARGET_HOST); }
+      catch { return false; }
+    }
 
-        function send(headersObj) {
-          try {
-            const data = extractAdsHeaders(headersObj);
-            if (Object.keys(data).length === 0) return;
-            window.postMessage({ __apo: true, type: MSG_TYPE, data, ts: Date.now() }, "*");
-          } catch (e) {}
-        }
+    function send(headersObj) {
+      try {
+        const data = extractAdsHeaders(headersObj);
+        bridgeLog("info", "[ADS_SNIFFER] Headers extracted", { keys: Object.keys(data) });
+        if (!Object.keys(data).length) return;
+        // Lưu thẳng vào storage từ content-script (không cần postMessage)
+        setCfg({ ...data, adsHeaderLastSeen: Date.now() });
+        bridgeLog("info", "[ADS_BRIDGE] Headers captured and saved to storage", { keys: Object.keys(data) });
+      } catch (e) {
+        bridgeLog("error", "[ADS_SNIFFER] send error: " + e.message);
+      }
+    }
 
-        // ---- Patch fetch ----
-        const _fetch = window.fetch;
-        window.fetch = function(input, init) {
-          try {
-            const url = (typeof input === 'string') ? input : (input && input.url ? input.url : String(input));
-            if (shouldCapture(url)) {
-              const hdrs = pickHeaders(init && init.headers);
-              // Nếu page tự gắn headers vào fetch -> capture
-              send(hdrs);
-            }
-          } catch {}
-          return _fetch.apply(this, arguments);
-        };
-
-        // ---- Patch XHR ----
-        const _open = XMLHttpRequest.prototype.open;
-        const _send = XMLHttpRequest.prototype.send;
-        const _setReqHeader = XMLHttpRequest.prototype.setRequestHeader;
-
-        XMLHttpRequest.prototype.open = function(method, url) {
-          try {
-            this.__apo_url = url;
-            this.__apo_headers = {};
-          } catch {}
-          return _open.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.setRequestHeader = function(k, v) {
-          try {
-            if (!this.__apo_headers) this.__apo_headers = {};
-            this.__apo_headers[k] = v;
-          } catch {}
-          return _setReqHeader.apply(this, arguments);
-        };
-        XMLHttpRequest.prototype.send = function(body) {
-          try {
-            if (shouldCapture(this.__apo_url)) {
-              send(this.__apo_headers || {});
-            }
-          } catch {}
-          return _send.apply(this, arguments);
-        };
-
-        // Đánh dấu đã ready
-        console.log("[APO][ADS] page sniffer injected");
-      })();
-    `;
-    const s = document.createElement("script");
-    s.textContent = code;
-    (document.head || document.documentElement).appendChild(s);
-    s.remove();
+    // Patch fetch — content-script ISOLATED world không patch được window.fetch của page
+    // Dùng chrome.webRequest đã handle ở background.js để capture headers
+    // Ở đây chỉ log trạng thái sniffer ready
+    bridgeLog("info", "[ADS_SNIFFER] sniffer initialized (ISOLATED world)", { url: location.href });
   }
 
   // ---------- Nhận headers từ page → lưu storage ----------
   let lastWrite = 0;
   window.addEventListener("message", async (evt) => {
     const msg = evt && evt.data;
-    if (!msg || !msg.__apo || msg.type !== MSG_TYPE_SNIFF) return;
+    if (!msg || !msg.__apo) return;
+    if (msg.type !== MSG_TYPE_SNIFF) return;
     const data = msg.data || {};
     try {
       // debounce nhỏ để tránh spam storage
@@ -223,12 +203,14 @@
       const toSave = { ...data, adsHeaderLastSeen: now };
       await setCfg(toSave);
       console.log("[APO][ADS] captured headers -> storage", toSave);
+      bridgeLog("info", "[ADS_BRIDGE] Headers captured and saved to storage", { keys: Object.keys(toSave) });
     } catch (e) {
       console.warn("[APO][ADS] save headers error:", e);
     }
   });
 
   injectSniffer();
+  bridgeLog("info", "[ADS_BRIDGE] injectSniffer called", { url: location.href });
 
   // ---------- Bridge từ background ----------
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -250,4 +232,5 @@
   });
 
   console.log("[APO][ADS] ads_bridge.js ready on", location.href);
+  bridgeLog("info", "[ADS_BRIDGE] ads_bridge.js ready", { url: location.href });
 })();

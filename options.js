@@ -202,6 +202,236 @@ on($("#btnSocketConnect"), "click", async () => {
   }
 });
 
+/* ================================================================
+   AUTO CLICK Connect Socket — chu kỳ cấu hình bằng input (phút)
+   - Lưu vào chrome.storage.local key: socketAutoIntervalMin
+   - 0 hoặc trống = tắt auto
+   ================================================================ */
+const DEFAULT_SOCKET_AUTO_INTERVAL_MIN = 60;
+let _socketAutoTimer = null;
+
+function applySocketAutoInterval(minutes) {
+  if (_socketAutoTimer) {
+    clearInterval(_socketAutoTimer);
+    _socketAutoTimer = null;
+  }
+  const m = Number(minutes);
+  if (!m || m <= 0 || !Number.isFinite(m)) {
+    log("⏰ [Auto] Auto Connect Socket: TẮT");
+    return;
+  }
+  const ms = m * 60 * 1000;
+  _socketAutoTimer = setInterval(() => {
+    const btn = $("#btnSocketConnect");
+    if (!btn) return;
+    log(`⏰ [Auto] Tự động click Connect Socket (mỗi ${m} phút)...`);
+    btn.click();
+  }, ms);
+  log(`⏰ [Auto] Auto Connect Socket: BẬT — mỗi ${m} phút`);
+}
+
+(async () => {
+  try {
+    const { socketAutoIntervalMin } = await chrome.storage.local.get([
+      "socketAutoIntervalMin",
+    ]);
+    const initial =
+      socketAutoIntervalMin === undefined || socketAutoIntervalMin === null
+        ? DEFAULT_SOCKET_AUTO_INTERVAL_MIN
+        : Number(socketAutoIntervalMin);
+    const inp = $("#socketAutoInterval");
+    if (inp) inp.value = String(initial);
+    applySocketAutoInterval(initial);
+  } catch (e) {
+    log("⏰ [Auto] Init error:", e?.message || e);
+  }
+})();
+
+on($("#btnSaveSocketAutoInterval"), "click", async () => {
+  try {
+    const raw = $("#socketAutoInterval")?.value;
+    const minutes =
+      raw === "" || raw === null || raw === undefined ? 0 : Number(raw);
+    if (Number.isNaN(minutes) || minutes < 0) {
+      return log("❌ Vui lòng nhập số phút hợp lệ (>= 0).");
+    }
+    await chrome.storage.local.set({ socketAutoIntervalMin: minutes });
+    log(`💾 Đã lưu Auto Connect Socket interval = ${minutes} phút`);
+    applySocketAutoInterval(minutes);
+  } catch (e) {
+    log("❌ Save auto interval error:", e?.message || e);
+  }
+});
+
+/* ========== Run Diagnostics ========== */
+on($("#btnRunDiagnostics"), "click", async () => {
+  // Clear log trước khi chạy diagnostics
+  const logBox = $("#log");
+  if (logBox) logBox.textContent = "";
+  
+  log("🔍 Running connection diagnostics...");
+  try {
+    const res = await chrome.runtime.sendMessage({ type: "RUN_DIAGNOSTICS" });
+    log("✅ Diagnostics started - results will appear below");
+  } catch (e) {
+    log("❌ Diagnostics error:", e.message || e);
+  }
+});
+
+/* ========== Test Upload Tracking ========== */
+on($("#btnTestUpload"), "click", async () => {
+  // Clear log trước khi test
+  const logBox = $("#log");
+  if (logBox) logBox.textContent = "";
+  
+  log("🧪 Testing upload tracking to Amazon...");
+  try {
+    const res = await chrome.runtime.sendMessage({ type: "TEST_UPLOAD_TRACKING" });
+    log("✅ Test upload triggered - watch results below");
+  } catch (e) {
+    log("❌ Test upload error:", e.message || e);
+  }
+});
+
+/* ========== Test CSRF Token Extraction ========== */
+on($("#btnTestCSRF"), "click", async () => {
+  // Clear log trước khi test
+  const logBox = $("#log");
+  if (logBox) logBox.textContent = "";
+  
+  log("🔑 Testing CSRF token extraction...");
+  try {
+    const res = await chrome.runtime.sendMessage({ type: "TEST_CSRF_EXTRACTION" });
+    if (res.ok && res.csrfToken) {
+      log(`✅ CSRF Token found: ${res.csrfToken.slice(0, 30)}...`);
+      log("🧪 You can now test upload with this token");
+    } else {
+      log("❌ No CSRF token found - check if you're logged into Amazon");
+    }
+  } catch (e) {
+    log("❌ CSRF test error:", e.message || e);
+  }
+});
+
+/* ========== Check Amazon Cookies ========== */
+on($("#btnCheckCookies"), "click", async () => {
+  log("🍪 Checking Amazon cookies...");
+  try {
+    const res = await chrome.runtime.sendMessage({ type: "CHECK_AMAZON_COOKIES" });
+    if (res.ok) {
+      log("✅ Cookie check completed - see results above");
+    } else {
+      log("❌ Cookie check failed:", res.error);
+    }
+  } catch (e) {
+    log("❌ Cookie check error:", e.message || e);
+  }
+});
+
+/* ========== Open Amazon Seller Central ========== */
+on($("#btnOpenAmazon"), "click", async () => {
+  log("🌐 Opening Amazon Seller Central...");
+  try {
+    const res = await chrome.runtime.sendMessage({ type: "OPEN_AMAZON_SC" });
+    if (res && res.ok) {
+      log("✅ Amazon Seller Central opened - please login and test again");
+    } else {
+      log("❌ Auto-open failed. Please manually open:");
+      log("   1. New tab → https://sellercentral.amazon.com");
+      log("   2. Login with your Amazon Seller account");
+      log("   3. Navigate to Order Reports");
+      log("   4. Come back and test upload");
+    }
+  } catch (e) {
+    log("❌ Auto-open failed. Please manually open:");
+    log("   1. New tab → https://sellercentral.amazon.com");
+    log("   2. Login with your Amazon Seller account");
+    log("   3. Navigate to Order Reports");
+    log("   4. Come back and test upload");
+  }
+});
+
+/* ========== Auto Config Modal ========== */
+
+const TYPE_LABEL = {
+  IMPORT_ORDER:    "📦 Import Orders",
+  IMPORT_FBM:      "🚚 Import FBM",
+  IMPORT_ADS:      "📈 Import Ads",
+  UPLOAD_TRACKING: "📤 Upload Tracking",
+  PULL_TRACKING:   "🔄 Pull Tracking",
+};
+
+let _autoConfigTimer = null;
+
+function renderAutoConfigList(records) {
+  const list = $("#autoConfigList");
+  if (!list) return;
+  if (!records.length) {
+    list.innerHTML = '<div style="color:#9ca3af;font-size:12px;text-align:center;padding:20px;">Khong co du lieu</div>';
+    return;
+  }
+  list.innerHTML = records.map(r => {
+    const statusColor = r.status ? "#16a34a" : "#dc2626";
+    const statusText  = r.status ? "Bat" : "Tat";
+    const label       = TYPE_LABEL[r.type] || r.type;
+    const updatedAt   = new Date(r.updated_at).toLocaleString("vi-VN");
+    return '<div style="border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;">'
+      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+      + '<span style="font-weight:700;font-size:12px;color:#374151;">' + label + '</span>'
+      + '<span style="font-size:12px;font-weight:600;color:' + statusColor + ';">' + statusText + '</span>'
+      + '</div>'
+      + '<div style="font-size:11px;color:#6b7280;display:flex;flex-direction:column;gap:2px;">'
+      + '<span>Shop: <b style="color:#111827;">' + r.shopName + '</b></span>'
+      + '<span>Interval: <b style="color:#111827;">' + r.time + ' phut</b></span>'
+      + '<span>' + r.describe + '</span>'
+      + '<span>Cap nhat: ' + updatedAt + '</span>'
+      + '</div></div>';
+  }).join("");
+}
+
+async function loadAutoConfig() {
+  try {
+    const { ingestUrl = "", shopId = "" } = await chrome.storage.local.get(["ingestUrl", "shopId"]);
+    if (!ingestUrl || !shopId) return log("Chua co API Base URL hoac Shop ID");
+
+    const list = $("#autoConfigList");
+    if (list) list.innerHTML = `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:20px;">Dang tai...</div>`;
+
+    const res = await fetch(`${ingestUrl}/api/auto-config?shopId=${shopId}`);
+    const json = await res.json();
+    if (!json.success) return log("API tra loi:", JSON.stringify(json));
+
+    const records = (json.data || []).filter(r => r.shopId === shopId);
+    renderAutoConfigList(records);
+    log("✅ Auto config da duoc cap nhat");
+  } catch (e) {
+    log("Auto Config load error:", e?.message || e);
+    const list = $("#autoConfigList");
+    if (list) list.innerHTML = `<div style="color:#dc2626;font-size:12px;text-align:center;padding:20px;">Loi tai du lieu</div>`;
+  }
+}
+
+
+on($("#btnAutoConfig"), "click", async () => {
+  clearInterval(_autoConfigTimer);
+  const overlay = $("#autoConfigOverlay");
+  if (overlay) overlay.style.display = "flex";
+  await loadAutoConfig();
+  _autoConfigTimer = setInterval(async () => {
+    log("🔄 [Auto Config] Auto refresh...");
+    await loadAutoConfig();
+  }, 5 * 60 * 1000);
+});
+
+on($("#reloadAutoConfig"), "click", () => loadAutoConfig());
+
+on($("#closeAutoConfig"), "click", () => {
+  const overlay = $("#autoConfigOverlay");
+  if (overlay) overlay.style.display = "none";
+  clearInterval(_autoConfigTimer);
+  _autoConfigTimer = null;
+});
+
 /* ========== Nhận cập nhật từ background ========== */
 chrome.runtime.onMessage.addListener((msg) => {
   // Đồng bộ trạng thái auto nếu background phát lại
@@ -210,5 +440,36 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (t) t.checked = !!msg.enabled;
     log("AUTO_STATUS:", msg.enabled);
   }
-  if (msg?.type === "LOG") log(msg.payload);
+  
+  if (msg?.type === "LOG") {
+    log(msg.payload);
+  }
+  
+  // Nhận debug logs từ background
+  if (msg?.type === "DEBUG_LOG") {
+    const { message, level, timestamp } = msg.payload;
+    
+    // Tạo styled log message
+    let styledMessage = `[${timestamp}] ${message}`;
+    
+    // Thêm vào log box với styling dựa trên level
+    const logBox = $("#log");
+    if (logBox) {
+      const currentContent = logBox.textContent;
+      logBox.textContent = currentContent + (currentContent ? "\n" : "") + styledMessage;
+      
+      // Auto scroll to bottom
+      logBox.scrollTop = logBox.scrollHeight;
+      
+      // Add color styling based on level
+      if (level === 'error') {
+        // Highlight error messages
+        const lines = logBox.textContent.split('\n');
+        const lastLine = lines[lines.length - 1];
+        if (lastLine.includes('❌') || lastLine.includes('Failed') || lastLine.includes('error')) {
+          // Could add special styling here if needed
+        }
+      }
+    }
+  }
 });
