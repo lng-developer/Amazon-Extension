@@ -5,6 +5,12 @@
 //   rồi postMessage về content-script -> lưu chrome.storage.local
 
 (() => {
+  if (window.__APO_ADS_BRIDGE_READY__) {
+    console.debug("[APO][ADS] ads_bridge.js already initialized");
+    return;
+  }
+  window.__APO_ADS_BRIDGE_READY__ = true;
+
   const ADS_HOST = "advertising.amazon.com";
   const ADS_BASE = `https://${ADS_HOST}`;
   const RETRIEVE_URL = `${ADS_BASE}/a9g-api-gateway/cm/dds/retrieveReport`;
@@ -60,9 +66,7 @@
     const h = {
       accept: "application/json, text/javascript, */*; q=0.01",
       "content-type": "application/json;charset=UTF-8",
-      "accept-encoding": "gzip, deflate, br, zstd",
       "accept-language": "vi-VN,vi;q=0.9,en-US;q=0.6,en;q=0.5",
-      referer: `${ADS_BASE}/cm/campaigns`,
       Advertisertype: "SELLER",
     };
 
@@ -102,7 +106,13 @@
     });
 
     const headers = await buildAdsHeaders();
-    console.log("[APO][ADS] retrieveReport → headers(use)", headers);
+    const safeHeadersForLog = Object.fromEntries(
+      Object.entries(headers).map(([k, v]) => [
+        k,
+        /csrf|token|account|advertiser|client/i.test(k) && v ? `${String(v).slice(0, 6)}...` : v,
+      ])
+    );
+    console.log("[APO][ADS] retrieveReport → headers(use)", safeHeadersForLog);
     bridgeLog("info", "[ADS_BRIDGE] retrieveReport headers built", {
       hasAccountId: !!headers["Amazon-Ads-Account-Id"],
       hasAdvertiserId: !!headers["Amazon-Advertising-Api-Advertiserid"],
@@ -116,6 +126,8 @@
       credentials: "include",
       mode: "cors",
       headers,
+      referrer: `${ADS_BASE}/cm/campaigns`,
+      referrerPolicy: "strict-origin-when-cross-origin",
       body: JSON.stringify(payload),
     });
 
@@ -181,10 +193,9 @@
       }
     }
 
-    // Patch fetch — content-script ISOLATED world không patch được window.fetch của page
-    // Dùng chrome.webRequest đã handle ở background.js để capture headers
-    // Ở đây chỉ log trạng thái sniffer ready
-    bridgeLog("info", "[ADS_SNIFFER] sniffer initialized (ISOLATED world)", { url: location.href });
+    // Page-context sniffer được inject từ background bằng chrome.scripting.executeScript({ world: "MAIN" }).
+    // File này chỉ nhận window.postMessage và lưu headers vào chrome.storage.local.
+    bridgeLog("info", "[ADS_SNIFFER] content bridge initialized", { url: location.href });
   }
 
   // ---------- Nhận headers từ page → lưu storage ----------

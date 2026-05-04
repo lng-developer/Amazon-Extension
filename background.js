@@ -193,6 +193,139 @@ const ADS_BASE = "https://advertising.amazon.com";
 const ADS_RETRIEVE_URL =
   "https://advertising.amazon.com/a9g-api-gateway/cm/dds/retrieveReport";
 
+/* ---------- Amazon Ads Auth Hardening ---------- */
+const ADS_HEADER_STORAGE_KEYS = [
+  "adsAccountId",
+  "adsAdvertiserId",
+  "adsClientId",
+  "adsMarketplaceId",
+  "adsCsrfData",
+  "adsCsrfToken",
+  "adsHeaderLastSeen",
+];
+const ADS_HEADER_REFRESH_TIMEOUT_MS = 25 * 1000;
+const ADS_TAB_LOAD_TIMEOUT_MS = 35 * 1000;
+const ADS_PAGE_SETTLE_MS = 3500;
+
+const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isAdsHeaderComplete(st = {}) {
+  return !!(
+    st.adsAccountId &&
+    st.adsAdvertiserId &&
+    st.adsClientId &&
+    st.adsMarketplaceId &&
+    st.adsCsrfData &&
+    st.adsCsrfToken
+  );
+}
+
+async function readAdsHeaderState() {
+  return chrome.storage.local.get(ADS_HEADER_STORAGE_KEYS);
+}
+
+async function clearAdsHeaders(reason = "unknown") {
+  await chrome.storage.local.remove(ADS_HEADER_STORAGE_KEYS);
+  debugLog(`🧹 [ADS-AUTH] Cleared cached Ads headers: ${reason}`, "info");
+  extensionLogger?.logInfo("[ADS-AUTH] Cleared cached Ads headers", { reason });
+}
+
+function isAdsSignInText(text = "") {
+  return /sign[\s-]?in|password|passkey|authentication|login|unauthorized|csrf/i.test(String(text || ""));
+}
+
+function createAdsError(message, status = 0, responseText = "") {
+  const err = new Error(message);
+  err.status = status;
+  err.responseText = responseText;
+  err.code = status === 401 || status === 403 || isAdsSignInText(responseText)
+    ? "ADS_AUTH_ERROR"
+    : "ADS_API_ERROR";
+  return err;
+}
+
+function isAdsAuthError(error) {
+  const status = Number(error?.status || 0);
+  return (
+    status === 401 ||
+    status === 403 ||
+    error?.code === "ADS_AUTH_ERROR" ||
+    isAdsSignInText(error?.responseText || error?.message || "")
+  );
+}
+
+async function waitForAdsTabComplete(tabId, timeoutMs = ADS_TAB_LOAD_TIMEOUT_MS) {
+  const existing = await chrome.tabs.get(tabId).catch(() => null);
+  if (existing?.status === "complete") return true;
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const onUpdated = (tid, info) => {
+      if (tid === tabId && info.status === "complete") finish(true);
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+}
+
+async function getAdsPageHint(tabId) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        href: location.href,
+        title: document.title,
+        bodyText: (document.body?.innerText || "").slice(0, 1200),
+      }),
+    });
+    return res?.result || {};
+  } catch (e) {
+    return { error: e?.message || String(e) };
+  }
+}
+
+async function waitForAdsHeaderCapture({ since = 0, timeoutMs = ADS_HEADER_REFRESH_TIMEOUT_MS } = {}) {
+  const initial = await readAdsHeaderState();
+  if (isAdsHeaderComplete(initial) && (!since || Number(initial.adsHeaderLastSeen || 0) >= since - 1000)) {
+    return true;
+  }
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = async (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.storage.onChanged.removeListener(listener);
+      if (!ok) {
+        const latest = await readAdsHeaderState();
+        ok = isAdsHeaderComplete(latest) && (!since || Number(latest.adsHeaderLastSeen || 0) >= since - 1000);
+      }
+      resolve(!!ok);
+    };
+
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const watched = new Set(ADS_HEADER_STORAGE_KEYS);
+    const listener = async (changes, areaName) => {
+      if (areaName !== "local") return;
+      if (!Object.keys(changes || {}).some((k) => watched.has(k))) return;
+      const latest = await readAdsHeaderState();
+      if (isAdsHeaderComplete(latest) && (!since || Number(latest.adsHeaderLastSeen || 0) >= since - 1000)) {
+        finish(true);
+      }
+    };
+    chrome.storage.onChanged.addListener(listener);
+  });
+}
+
+
 /* ---------- Cookies & CSRF (Seller Central) ---------- */
 async function getCookie(url, name) {
   try {
@@ -984,49 +1117,150 @@ async function runImportFBMOrders(referenceOverride, machineId, label) {
    ADS via content-script
    =============================== */
 async function ensureAdsTab() {
-  let tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
-  let tab;
-  const isNew = !tabs.length;
+  const tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
+  let tab = tabs.find((t) => t.url?.includes("/cm/")) || tabs[0];
 
-  if (!isNew) {
-    tab = tabs[0];
-    debugLog(`🌐 [ADS-TAB] Reusing existing ads tab: ${tab.id}`, "info");
-    extensionLogger?.logInfo("[ADS-TAB] Reusing existing ads tab", { tabId: tab.id, url: tab.url });
-  } else {
-    debugLog(`🌐 [ADS-TAB] Opening new ads tab...`, "info");
-    extensionLogger?.logInfo("[ADS-TAB] Opening new ads tab");
+  if (!tab) {
+    debugLog("🌐 [ADS-TAB] Opening Amazon Ads campaigns page...", "info");
+    extensionLogger?.logInfo("[ADS-TAB] Opening Amazon Ads campaigns page");
     tab = await chrome.tabs.create({
       url: `${ADS_BASE}/cm/campaigns`,
       active: true,
     });
+  } else {
+    debugLog(`🌐 [ADS-TAB] Reusing existing ads tab: ${tab.id}`, "info");
+    extensionLogger?.logInfo("[ADS-TAB] Reusing existing ads tab", { tabId: tab.id, url: tab.url });
   }
 
-  if (tab.status !== "complete") {
-    debugLog(`⏳ [ADS-TAB] Waiting for tab to load...`, "info");
-    await new Promise((resolve) => {
-      const onUpdated = (tid, info) => {
-        if (tid === tab.id && info.status === "complete") {
-          chrome.tabs.onUpdated.removeListener(onUpdated);
-          resolve();
-        }
-      };
-      chrome.tabs.onUpdated.addListener(onUpdated);
-    });
-    debugLog(`✅ [ADS-TAB] Tab loaded`, "success");
-    extensionLogger?.logInfo("[ADS-TAB] Tab loaded", { tabId: tab.id });
-  }
-
-  // Nếu tab mới → đợi trang tự gọi API để webRequest capture headers
-  if (isNew) {
-    debugLog(`⏳ [ADS-TAB] Waiting for page to trigger API calls...`, "info");
-    extensionLogger?.logInfo("[ADS-TAB] Waiting for page API calls to capture headers");
-  }
-
+  await waitForAdsTabComplete(tab.id);
   return tab.id;
+}
+
+async function injectAdsMainWorldSniffer(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => {
+        const ADS_HOST = "advertising.amazon.com";
+        const MSG_TYPE = "APO_ADS_HEADER_SNIFF";
+        if (window.__APO_ADS_MAIN_WORLD_SNIFFER__) return;
+        window.__APO_ADS_MAIN_WORLD_SNIFFER__ = true;
+
+        const MAP = {
+          "amazon-ads-account-id": "adsAccountId",
+          "amazon-advertising-api-advertiserid": "adsAdvertiserId",
+          "amazon-advertising-api-clientid": "adsClientId",
+          "amazon-advertising-api-marketplaceid": "adsMarketplaceId",
+          "amazon-advertising-api-csrf-data": "adsCsrfData",
+          "amazon-advertising-api-csrf-token": "adsCsrfToken",
+        };
+
+        function normalizeHeaders(headers) {
+          const out = {};
+          if (!headers) return out;
+          try {
+            if (headers instanceof Headers) {
+              headers.forEach((v, k) => (out[String(k).toLowerCase()] = String(v)));
+            } else if (Array.isArray(headers)) {
+              headers.forEach(([k, v]) => (out[String(k).toLowerCase()] = String(v)));
+            } else {
+              Object.entries(headers).forEach(([k, v]) => (out[String(k).toLowerCase()] = String(v)));
+            }
+          } catch (_) {}
+          return out;
+        }
+
+        function shouldCapture(url) {
+          try {
+            return new URL(url, location.href).host.endsWith(ADS_HOST);
+          } catch (_) {
+            return false;
+          }
+        }
+
+        function extract(headers) {
+          const src = normalizeHeaders(headers);
+          const out = {};
+          for (const [k, storageKey] of Object.entries(MAP)) {
+            if (src[k]) out[storageKey] = src[k];
+          }
+          return out;
+        }
+
+        function publish(headers) {
+          const data = extract(headers);
+          if (!Object.keys(data).length) return;
+          window.postMessage({ __apo: true, type: MSG_TYPE, data }, "*");
+        }
+
+        const nativeFetch = window.fetch;
+        window.fetch = function patchedFetch(input, init = {}) {
+          try {
+            const url = typeof input === "string" ? input : input?.url;
+            if (url && shouldCapture(url)) {
+              const merged = {
+                ...normalizeHeaders(input?.headers),
+                ...normalizeHeaders(init?.headers),
+              };
+              publish(merged);
+            }
+          } catch (_) {}
+          return nativeFetch.apply(this, arguments);
+        };
+
+        const nativeOpen = XMLHttpRequest.prototype.open;
+        const nativeSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+        const nativeSend = XMLHttpRequest.prototype.send;
+
+        XMLHttpRequest.prototype.open = function patchedOpen(method, url) {
+          this.__apoAdsUrl = url;
+          this.__apoAdsHeaders = {};
+          return nativeOpen.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.setRequestHeader = function patchedSetRequestHeader(name, value) {
+          try {
+            this.__apoAdsHeaders[String(name).toLowerCase()] = String(value);
+          } catch (_) {}
+          return nativeSetRequestHeader.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.send = function patchedSend() {
+          try {
+            if (this.__apoAdsUrl && shouldCapture(this.__apoAdsUrl)) {
+              publish(this.__apoAdsHeaders || {});
+            }
+          } catch (_) {}
+          return nativeSend.apply(this, arguments);
+        };
+      },
+    });
+    debugLog("✅ [ADS-SNIFFER] Main-world sniffer injected", "success");
+    return true;
+  } catch (e) {
+    debugLog(`⚠️ [ADS-SNIFFER] Main-world injection skipped: ${e?.message || e}`, "info");
+    return false;
+  }
+}
+
+async function ensureAdsBridgeInjected(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["ads_bridge.js"],
+    });
+  } catch (e) {
+    // Nếu content script đã tồn tại hoặc tab chưa cho inject, sendMessage phía dưới sẽ xác nhận lại.
+    debugLog(`ℹ️ [ADS-BRIDGE] executeScript note: ${e?.message || e}`, "info");
+  }
+  await injectAdsMainWorldSniffer(tabId);
 }
 
 async function adsRetrieveViaContentScript(payload) {
   const tabId = await ensureAdsTab();
+  await ensureAdsBridgeInjected(tabId);
+
   const sendOnce = () =>
     chrome.tabs.sendMessage(tabId, {
       type: "ADS_FETCH_REPORT",
@@ -1034,121 +1268,110 @@ async function adsRetrieveViaContentScript(payload) {
       payload,
     });
 
-  try {
-    const r = await sendOnce();
-    if (r) return r;
-  } catch (_) { }
-
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["ads_bridge.js"],
-    });
-    await new Promise((r) => setTimeout(r, 300));
-  } catch (_) { }
-
-  for (let i = 0; i < 2; i++) {
+  let lastError = null;
+  for (let i = 0; i < 4; i++) {
     try {
       const r = await sendOnce();
       if (r) return r;
-    } catch {
-      await new Promise((r) => setTimeout(r, 400));
+    } catch (e) {
+      lastError = e;
+      if (i === 1) await ensureAdsBridgeInjected(tabId);
+      await delayMs(400 + i * 300);
     }
   }
-  throw new Error("Could not establish connection to ads_bridge.js");
+
+  throw new Error(`Could not establish connection to ads_bridge.js${lastError?.message ? `: ${lastError.message}` : ""}`);
 }
 
-async function fetchAdsJsonCS(payload) {
-  // Initialize logger if not exists
-  if (!extensionLogger) {
-    await initializeLogger();
-  }
+async function fetchAdsJsonCS(payload, options = {}) {
+  if (!extensionLogger) await initializeLogger();
 
-  // Log Amazon Ads API call
-  if (extensionLogger) {
-    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Making Amazon Ads API call via content script', {
-      payloadKeys: Object.keys(payload || {}),
-      startDate: payload?.startDate,
-      endDate: payload?.endDate,
-      offset: payload?.offset,
-      size: payload?.size,
-      timestamp: new Date().toISOString()
-    });
-  }
+  const maxAttempts = Number(options.maxAttempts || 2);
+  let lastError = null;
 
-  try {
-    const r = await adsRetrieveViaContentScript(payload);
-
-    if (!r) {
-      const error = new Error("retrieveReport no response");
-      if (extensionLogger) {
-        await extensionLogger.logError(error, {
-          payload: payload,
-          endpoint: 'Amazon Ads API'
-        }, '[IMPORT_ADS_SPEND] Amazon Ads API returned no response');
-      }
-      throw error;
-    }
-
-    if (!r.ok) {
-      const sample = typeof r.text === "string" ? r.text : JSON.stringify(r.text || "");
-      const error = new Error(`retrieveReport ${r.status} — ${sample.slice(0, 200)}`);
-
-      if (extensionLogger) {
-        await extensionLogger.logError(error, {
-          status: r.status,
-          responseText: sample.slice(0, 500),
-          payload: payload,
-          endpoint: 'Amazon Ads API'
-        }, '[IMPORT_ADS_SPEND] Amazon Ads API request failed');
-      }
-      throw error;
-    }
-
-    let j;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      j = JSON.parse(r.text || "{}");
+      if (attempt > 1) {
+        debugLog(`🔁 [ADS-AUTH] Retrying retrieveReport after auth refresh (${attempt}/${maxAttempts})`, "info");
+        await ensureFreshAdsHeaders({ force: true, reason: `retry-${attempt}` });
+      }
 
-      // Log successful API response
-      if (extensionLogger) {
-        const report = j?.report || j?.data?.report || {};
-        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Amazon Ads API response received', {
+      extensionLogger?.logInfo("[IMPORT_ADS_SPEND] Making Amazon Ads API call via content script", {
+        attempt,
+        maxAttempts,
+        payloadKeys: Object.keys(payload || {}),
+        startDate: payload?.startDate,
+        endDate: payload?.endDate,
+        offset: payload?.offset,
+        size: payload?.size,
+        timestamp: new Date().toISOString(),
+      });
+
+      const r = await adsRetrieveViaContentScript(payload);
+      if (!r) throw createAdsError("retrieveReport no response", 0, "");
+
+      const sample = typeof r.text === "string" ? r.text : JSON.stringify(r.text || "");
+
+      if (!r.ok) {
+        const error = createAdsError(`retrieveReport ${r.status} — ${sample.slice(0, 200)}`, r.status, sample);
+        extensionLogger?.logError(error, {
           status: r.status,
+          attempt,
+          responseText: sample.slice(0, 500),
+          payload,
+          endpoint: "Amazon Ads API",
+        }, "[IMPORT_ADS_SPEND] Amazon Ads API request failed");
+
+        if (isAdsAuthError(error) && attempt < maxAttempts) {
+          await clearAdsHeaders(`retrieveReport-${r.status}`);
+          lastError = error;
+          continue;
+        }
+        throw error;
+      }
+
+      try {
+        const j = JSON.parse(r.text || "{}");
+        const report = j?.report || j?.data?.report || {};
+        extensionLogger?.logInfo("[IMPORT_ADS_SPEND] Amazon Ads API response received", {
+          status: r.status,
+          attempt,
           responseSize: r.text?.length || 0,
           numberOfRecords: report?.numberOfRecords || 0,
           dataRows: Array.isArray(report?.data) ? report.data.length : 0,
           hasReport: !!report,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
         });
-      }
-
-    } catch (parseError) {
-      const sample = typeof r.text === "string" ? r.text : JSON.stringify(r.text || "");
-      const error = new Error(`retrieveReport non-JSON: ${sample.slice(0, 200)}`);
-
-      if (extensionLogger) {
-        await extensionLogger.logError(error, {
+        return j;
+      } catch (parseError) {
+        const error = createAdsError(`retrieveReport non-JSON: ${sample.slice(0, 200)}`, r.status || 0, sample);
+        error.parseError = parseError.message;
+        extensionLogger?.logError(error, {
+          attempt,
           responseText: sample.slice(0, 500),
           parseError: parseError.message,
-          payload: payload,
-          endpoint: 'Amazon Ads API'
-        }, '[IMPORT_ADS_SPEND] Amazon Ads API returned non-JSON response');
+          payload,
+          endpoint: "Amazon Ads API",
+        }, "[IMPORT_ADS_SPEND] Amazon Ads API returned non-JSON response");
+
+        if (isAdsAuthError(error) && attempt < maxAttempts) {
+          await clearAdsHeaders("retrieveReport-non-json-auth-page");
+          lastError = error;
+          continue;
+        }
+        throw error;
+      }
+    } catch (error) {
+      lastError = error;
+      if (isAdsAuthError(error) && attempt < maxAttempts) {
+        await clearAdsHeaders(`catch-${error.status || error.code || "auth"}`);
+        continue;
       }
       throw error;
     }
-
-    return j;
-
-  } catch (error) {
-    // Log any other errors
-    if (extensionLogger && !error.message.includes('retrieveReport')) {
-      await extensionLogger.logError(error, {
-        payload: payload,
-        endpoint: 'Amazon Ads API'
-      }, '[IMPORT_ADS_SPEND] Amazon Ads API call failed with unexpected error');
-    }
-    throw error;
   }
+
+  throw lastError || new Error("retrieveReport failed after auth retry");
 }
 
 function buildCampaignSpendPayload({
@@ -1371,8 +1594,8 @@ async function runExportAdsSpend(date) {
 
   const { adsSpendUrl } = deriveApiUrls(ingestUrl);
 
-  // Đảm bảo CSRF headers còn hạn trước khi gọi Ads API
-  await ensureFreshAdsHeaders();
+  // Đảm bảo Ads headers còn hạn trước khi gọi Ads API
+  await ensureFreshAdsHeaders({ reason: "runExportAdsSpend" });
 
   if (!date) {
     const error = new Error("date (YYYY-MM-DD) required");
@@ -1385,7 +1608,6 @@ async function runExportAdsSpend(date) {
     }
     throw error;
   }
-  uploadtracking
   try {
     // Log fetching campaign data
     if (extensionLogger) {
@@ -2144,94 +2366,117 @@ function collectAdsHeaders(requestHeaders = []) {
   return out;
 }
 
+let lastAdsHeaderWriteAt = 0;
+
 async function saveAdsHeadersIfAny(found) {
-  const keys = Object.keys(found);
+  const clean = Object.fromEntries(
+    Object.entries(found || {}).filter(([, value]) => value !== undefined && value !== null && String(value) !== "")
+  );
+  const keys = Object.keys(clean);
   if (!keys.length) return;
 
-  const current = await chrome.storage.local.get(keys);
-  let changed = false;
-  for (const k of keys) {
-    if (found[k] && found[k] !== current[k]) {
-      changed = true;
-      break;
-    }
-  }
-  if (changed) {
-    await chrome.storage.local.set({
-      ...found,
-      adsHeaderLastSeen: Date.now(),
-    });
-    log("[ADS] headers updated:", Object.keys(found).join(", "));
-  }
+  const current = await chrome.storage.local.get(ADS_HEADER_STORAGE_KEYS);
+  const merged = { ...current, ...clean };
+  const changed = keys.some((k) => clean[k] && clean[k] !== current[k]);
+  const hasCoreHeaders = isAdsHeaderComplete(merged);
+  const now = Date.now();
+
+  // Nếu Amazon vẫn gửi cùng token cũ, vẫn update lastSeen để chứng minh session còn sống.
+  if (!changed && hasCoreHeaders && now - lastAdsHeaderWriteAt < 5000) return;
+
+  const payload = { ...clean };
+  if (hasCoreHeaders) payload.adsHeaderLastSeen = now;
+
+  await chrome.storage.local.set(payload);
+  lastAdsHeaderWriteAt = now;
+
+  log("[ADS] headers captured:", keys.join(", "));
+  extensionLogger?.logInfo("[ADS-AUTH] Ads headers captured", {
+    keys,
+    changed,
+    hasCoreHeaders,
+    lastSeen: payload.adsHeaderLastSeen,
+  });
 }
 
 /* ===============================
    Đảm bảo CSRF headers còn hạn trước khi gọi Ads API
    - Nếu headers chưa có hoặc > 30 phút → mở tab ads, đợi capture xong
    =============================== */
-const ADS_HEADER_TTL_MS = 30 * 60 * 1000; // 30 phút
+const ADS_HEADER_TTL_MS = 20 * 60 * 1000; // giảm TTL để hạn chế token cũ gây 401
 
-async function ensureFreshAdsHeaders() {
-  const { adsCsrfToken, adsCsrfData, adsHeaderLastSeen } =
-    await chrome.storage.local.get(["adsCsrfToken", "adsCsrfData", "adsHeaderLastSeen"]);
+async function forceRefreshAdsHeaders(reason = "manual") {
+  const startedAt = Date.now();
+  debugLog(`🔄 [ADS-AUTH] Force refresh Ads headers — reason: ${reason}`, "info");
+  extensionLogger?.logInfo("[ADS-AUTH] Force refresh Ads headers", { reason });
 
-  const age = adsHeaderLastSeen ? Date.now() - adsHeaderLastSeen : Infinity;
-  const isValid = adsCsrfToken && adsCsrfData && age < ADS_HEADER_TTL_MS;
-
-  debugLog(`🔑 [ADS-AUTH] CSRF status: ${isValid ? "valid" : "expired/missing"} (age: ${Math.round(age / 1000)}s)`, isValid ? "info" : "error");
-  extensionLogger?.logInfo("[ADS-AUTH] CSRF header check", {
-    hasToken: !!adsCsrfToken,
-    hasData: !!adsCsrfData,
-    ageSeconds: Math.round(age / 1000),
-    isValid,
-  });
-
-  if (isValid) return true;
-
-  // Mở tab ads để trigger capture headers mới
-  debugLog("🔄 [ADS-AUTH] Opening ads tab to refresh CSRF headers...", "info");
-  extensionLogger?.logInfo("[ADS-AUTH] Opening ads tab to refresh CSRF headers");
+  await clearAdsHeaders(reason);
 
   const tabId = await ensureAdsTab();
 
-  // Reload tab để chắc chắn trang tự gọi API mới
-  debugLog("🔄 [ADS-AUTH] Reloading ads tab to trigger fresh API calls...", "info");
-  extensionLogger?.logInfo("[ADS-AUTH] Reloading ads tab");
+  // Navigate về trang Campaigns, inject sniffer, rồi reload để bắt request gốc sau khi sniffer đã sẵn sàng.
+  await chrome.tabs.update(tabId, { url: `${ADS_BASE}/cm/campaigns`, active: true });
+  await waitForAdsTabComplete(tabId);
+  await ensureAdsBridgeInjected(tabId);
+
   await chrome.tabs.reload(tabId);
+  await waitForAdsTabComplete(tabId);
+  await ensureAdsBridgeInjected(tabId);
+  await delayMs(ADS_PAGE_SETTLE_MS);
 
-  // Đợi tab load xong sau reload
-  await new Promise((resolve) => {
-    const onUpdated = (tid, info) => {
-      if (tid === tabId && info.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(onUpdated);
-        resolve();
-      }
-    };
-    chrome.tabs.onUpdated.addListener(onUpdated);
-  });
-
-  debugLog("⏳ [ADS-AUTH] Waiting for page API calls to capture headers...", "info");
-  extensionLogger?.logInfo("[ADS-AUTH] Waiting for page API calls to capture headers");
-
-  // Đợi headers được capture qua webRequest, không có timeout
-  const captured = await new Promise((resolve) => {
-    const listener = (changes) => {
-      if (changes.adsCsrfToken || changes.adsCsrfData) {
-        chrome.storage.onChanged.removeListener(listener);
-        resolve(true);
-      }
-    };
-    chrome.storage.onChanged.addListener(listener);
-  });
-
-  debugLog(`🔑 [ADS-AUTH] Header refresh ${captured ? "success" : "timeout"}`, captured ? "success" : "error");
-  extensionLogger?.logInfo(`[ADS-AUTH] Header refresh ${captured ? "success" : "timeout"}`, { captured });
+  let captured = await waitForAdsHeaderCapture({ since: startedAt });
 
   if (!captured) {
-    throw new Error("❌ Không thể lấy Ads CSRF headers. Hãy mở advertising.amazon.com và tương tác để capture headers.");
+    // Lần dự phòng: nhiều khi Amazon Ads lazy-load sau vài giây hoặc cần thêm reload.
+    debugLog("🔁 [ADS-AUTH] First refresh did not capture headers, retrying once...", "info");
+    await chrome.tabs.reload(tabId);
+    await waitForAdsTabComplete(tabId);
+    await ensureAdsBridgeInjected(tabId);
+    await delayMs(ADS_PAGE_SETTLE_MS + 1500);
+    captured = await waitForAdsHeaderCapture({ since: startedAt, timeoutMs: ADS_HEADER_REFRESH_TIMEOUT_MS });
   }
 
-  return true;
+  const latest = await readAdsHeaderState();
+  if (captured && isAdsHeaderComplete(latest)) {
+    debugLog("✅ [ADS-AUTH] Fresh Ads headers ready", "success");
+    extensionLogger?.logInfo("[ADS-AUTH] Fresh Ads headers ready", {
+      lastSeen: latest.adsHeaderLastSeen,
+      ageSeconds: Math.round((Date.now() - Number(latest.adsHeaderLastSeen || 0)) / 1000),
+    });
+    return true;
+  }
+
+  const hint = await getAdsPageHint(tabId);
+  const reasonText = isAdsSignInText(`${hint.href || ""}
+${hint.title || ""}
+${hint.bodyText || ""}`)
+    ? "Amazon Ads đang yêu cầu login/reauth. Mở tab advertising.amazon.com, đăng nhập lại rồi chạy lại."
+    : "Không capture được Ads headers từ Amazon Ads page.";
+
+  throw createAdsError(`Không thể refresh Ads headers: ${reasonText}`, 401, JSON.stringify(hint).slice(0, 1000));
+}
+
+async function ensureFreshAdsHeaders({ force = false, reason = "preflight" } = {}) {
+  const st = await readAdsHeaderState();
+  const age = st.adsHeaderLastSeen ? Date.now() - Number(st.adsHeaderLastSeen) : Infinity;
+  const isValid = isAdsHeaderComplete(st) && age < ADS_HEADER_TTL_MS;
+
+  debugLog(`🔑 [ADS-AUTH] Header status: ${isValid ? "valid" : "expired/missing"} — age ${Math.round(age / 1000)}s`, isValid ? "info" : "error");
+  extensionLogger?.logInfo("[ADS-AUTH] Header preflight", {
+    force,
+    reason,
+    isValid,
+    ageSeconds: Math.round(age / 1000),
+    hasAccountId: !!st.adsAccountId,
+    hasAdvertiserId: !!st.adsAdvertiserId,
+    hasClientId: !!st.adsClientId,
+    hasMarketplaceId: !!st.adsMarketplaceId,
+    hasCsrfData: !!st.adsCsrfData,
+    hasCsrfToken: !!st.adsCsrfToken,
+  });
+
+  if (!force && isValid) return true;
+  return forceRefreshAdsHeaders(reason);
 }
 
 
