@@ -2,85 +2,172 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>APO LNG - Popup</title>
+    <title>APO LNG - Control Panel</title>
     <link rel="stylesheet" href="options.css" />
   </head>
 
   <body>
-    <div class="wrap">
+    <div class="app-shell">
 
-      <!-- HEADER -->
-      <div class="header">
-        <div class="header-logo">
-          <span class="header-icon">🚀</span>
-          <span class="header-title">APO LNG</span>
+      <!-- HERO HEADER -->
+      <section class="hero">
+        <div class="hero-left">
+          <div class="brand-mark">LNG</div>
+          <div>
+            <div class="eyebrow">Amazon / Etsy Automation</div>
+            <h1>APO Control</h1>
+          </div>
         </div>
-        <span class="header-badge">v3.0-Test</span>
-      </div>
 
-      <!-- CONFIG -->
-      <div class="card">
-        <div class="card-title">🔧 Configuration</div>
-        <div class="input-grid">
-          <div class="input-group">
+        <div class="hero-right">
+          <span class="status-dot"></span>
+          <span class="version-badge">v3.1-Test</span>
+        </div>
+      </section>
+
+      <!-- CONFIG PANEL -->
+      <section class="panel panel-config">
+        <div class="panel-header">
+          <div>
+            <h2>System Configuration</h2>
+            <p>Thiết lập API, shop và kết nối extension.</p>
+          </div>
+          <span class="panel-icon">⚙️</span>
+        </div>
+
+        <div class="field-grid">
+          <div class="field">
             <label>API Base URL</label>
             <input id="ingestUrl" placeholder="https://api.lngmerch.co" />
           </div>
-          <div class="input-group">
+
+          <div class="field">
             <label>Shop ID</label>
             <input id="shopId" placeholder="6881aba9c1bbdfc541b5cd4d" />
           </div>
         </div>
-        <div class="btn-group" style="margin-top:10px;">
-          <button id="saveBtn" class="btn btn-green" style="flex:1;">💾 Save</button>
-          <button id="btnSocketConnect" class="btn btn-blue" style="flex:1;">🔌 Connect Socket</button>
-          <button id="btnAutoConfig" class="btn btn-orange" style="flex:1;">⚙️ Auto Config</button>
+
+        <div class="action-grid">
+          <button id="saveBtn" class="btn btn-primary">
+            <span>💾</span>
+            Save Config
+          </button>
+
+          <button id="btnSocketConnect" class="btn btn-dark">
+            <span>🔌</span>
+            Connect Socket
+          </button>
+
+          <button id="btnAutoConfig" class="btn btn-outline">
+            <span>⚙️</span>
+            Auto Config
+          </button>
         </div>
-        <div class="input-group" style="margin-top:10px;">
-          <label>⏰ Auto Connect Socket (phút) — 0 = tắt</label>
-          <div style="display:flex; gap:6px;">
-            <input id="socketAutoInterval" type="number" min="0" step="1" placeholder="60" style="flex:1;" />
-            <button id="btnSaveSocketAutoInterval" class="btn btn-green" style="flex:0 0 auto;">💾 Lưu</button>
+
+        <div class="divider"></div>
+
+        <div class="field auto-field">
+          <label>Auto Connect Socket</label>
+          <div class="inline-control">
+            <input
+              id="socketAutoInterval"
+              type="number"
+              min="0"
+              step="1"
+              placeholder="60"
+            />
+            <button id="btnSaveSocketAutoInterval" class="btn btn-primary small">
+              Lưu
+            </button>
           </div>
+          <p class="hint">Nhập số phút tự động kết nối lại socket. Đặt 0 để tắt.</p>
         </div>
-      </div>
+      </section>
 
       <!-- AUTO CONFIG MODAL -->
       <div id="autoConfigOverlay" class="modal-overlay">
         <div class="modal-box">
           <div class="modal-header">
-            <span class="modal-title">⚙️ Auto Config</span>
+            <div>
+              <span class="modal-kicker">Configuration Center</span>
+              <h3>Auto Config</h3>
+            </div>
             <button id="closeAutoConfig" class="modal-close">✕</button>
           </div>
+
           <div id="autoConfigList" class="modal-list">
-            <div class="modal-loading">Đang tải...</div>
+            <div class="modal-loading">Đang tải cấu hình...</div>
           </div>
-          <button id="reloadAutoConfig" class="btn btn-blue" style="width:100%; margin-top:4px;">🔄 Reload</button>
+
+          <button id="reloadAutoConfig" class="btn btn-primary modal-action">
+            🔄 Reload Config
+          </button>
         </div>
       </div>
 
-      <!-- IMPORT
-      <div class="card">
-        <div class="card-title">▶️ Import</div>
-        <div class="row" style="margin-bottom:10px;">
-          <div class="input-group">
-            <label for="adsDate">Ads Date (YYYY-MM-DD)</label>
-            <input id="adsDate" placeholder="2025-10-17" />
+      <!-- LOG PANEL -->
+      <section class="panel panel-uploadfeed-debug">
+        <div class="panel-header compact">
+          <div>
+            <h2>UploadFeed Debug</h2>
+            <p>Seller Central uploadFeed CSRF sniffer tools.</p>
           </div>
-          <div class="input-group" style="display:flex; align-items:flex-end;">
-            <button id="testAds" class="btn btn-purple" style="width:100%;">📈 Export Ads Spend</button>
-          </div>
+          <span class="panel-icon">UF</span>
         </div>
-        <button id="btnAutoRunNow" class="btn btn-default" style="width:100%;">▶️ Import order from Amazon</button>
-      </div> -->
 
-      <!-- LOG -->
-      <div class="card">
-        <div class="card-title">📜 Log</div>
+        <div class="action-grid">
+          <button id="btnCheckUploadFeedReadiness" class="btn btn-outline">
+            Check Readiness
+          </button>
+
+          <button id="btnInstallUploadFeedSniffer" class="btn btn-outline">
+            Install Sniffer
+          </button>
+
+          <button id="btnVerifyUploadFeedSniffer" class="btn btn-outline">
+            Verify Sniffer
+          </button>
+
+          <button id="btnCheckUploadFeedCache" class="btn btn-outline">
+            Check Cache
+          </button>
+
+          <button id="btnClearUploadFeedCache" class="btn btn-outline">
+            Clear Cache
+          </button>
+
+          <button id="btnSocketResetBusy" class="btn btn-outline">
+            Socket Reset Busy
+          </button>
+
+          <button id="btnDownloadFinalTsv" class="btn btn-outline">
+            Download Final TSV
+          </button>
+        </div>
+
+        <div class="field" id="finalTsvFallbackBox" style="display:none;margin-top:12px;">
+          <label>Final upload tracking TSV fallback</label>
+          <textarea id="finalTsvFallbackText" rows="8" style="width:100%;font-family:monospace;font-size:11px;"></textarea>
+          <button id="btnCopyFinalTsv" class="btn btn-primary small" style="margin-top:8px;">
+            Copy TSV
+          </button>
+        </div>
+      </section>
+
+      <section class="panel panel-log">
+        <div class="panel-header compact">
+          <div>
+            <h2>Runtime Log</h2>
+            <p>Theo dõi trạng thái extension theo thời gian thực.</p>
+          </div>
+          <span class="panel-icon">📜</span>
+        </div>
+
         <pre id="log"></pre>
-      </div>
+      </section>
 
     </div>
+
     <script type="module" src="options.js"></script>
   </body>
 </html>

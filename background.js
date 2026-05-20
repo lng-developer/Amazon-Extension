@@ -8,6 +8,14 @@
 
 import { io } from "./lib/socket.io.esm.min.js";
 
+const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
+const adsApiLock = {
+  running: false,
+  taskName: "",
+  runId: "",
+  startedAt: 0,
+};
+
 // Global logger instance
 let extensionLogger = null;
 
@@ -189,6 +197,16 @@ const log = (...args) => {
 };
 
 const SC_BASE = "https://sellercentral.amazon.com";
+const SC_FEEDS_URL = `${SC_BASE}/order-reports-and-feeds/feeds`;
+const AMAZON_UPLOADFEED_URL_PATH = "/order-reports-and-feeds/api/uploadFeed";
+const AMAZON_UPLOADFEED_PAGE_URL = "https://sellercentral.amazon.com/order-reports-and-feeds/feeds";
+const AMAZON_UPLOADFEED_MIN_CSRF_LENGTH = 80;
+const AMAZON_UPLOADFEED_BUILD_ID = "uploadfeed-page-context-csrf-formdata-v1";
+const AMAZON_UPLOADFEED_CSRF_CACHE_KEY = "amazonUploadFeedCsrfCache";
+const AMAZON_UPLOADFEED_CSRF_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const AMAZON_UPLOADFEED_SNIFFER_FLAG = "__APO_UPLOADFEED_SNIFFER_INSTALLED__";
+globalThis.__UPLOADFEED_HELPER_BUILD__ = "uploadfeed-helper-v2026-05-12-01";
+console.log("[UPLOAD_TRACKING] HELPER BUILD LOADED", globalThis.__UPLOADFEED_HELPER_BUILD__);
 const ADS_BASE = "https://advertising.amazon.com";
 const ADS_RETRIEVE_URL =
   "https://advertising.amazon.com/a9g-api-gateway/cm/dds/retrieveReport";
@@ -224,10 +242,114 @@ async function readAdsHeaderState() {
   return chrome.storage.local.get(ADS_HEADER_STORAGE_KEYS);
 }
 
-async function clearAdsHeaders(reason = "unknown") {
+function makeAdsRunId(taskName) {
+  return `${taskName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function isAdsApiLocked() {
+  if (!adsApiLock.running) return false;
+  const age = Date.now() - Number(adsApiLock.startedAt || 0);
+  if (age > ADS_LOCK_STALE_MS) {
+    debugLog(`[ADS-LOCK] Stale lock expired ${adsApiLock.taskName} runId=${adsApiLock.runId}`, "error");
+    adsApiLock.running = false;
+    adsApiLock.taskName = "";
+    adsApiLock.runId = "";
+    adsApiLock.startedAt = 0;
+    chrome.storage.local.set({ adsApiLockState: { ...adsApiLock } }).catch(() => { });
+    return false;
+  }
+  return true;
+}
+
+function isAdsLockOwner(runId) {
+  return !!runId && isAdsApiLocked() && adsApiLock.runId === runId;
+}
+
+async function persistAdsLockState() {
+  await chrome.storage.local.set({ adsApiLockState: { ...adsApiLock } });
+}
+
+function createAdsLockSkipped(taskName) {
+  return {
+    ok: false,
+    skipped: true,
+    reason: "ADS_TASK_ALREADY_RUNNING",
+    runningTaskName: adsApiLock.taskName,
+    runningRunId: adsApiLock.runId,
+  };
+}
+
+async function withAdsApiLock(taskName, fn, options = {}) {
+  if (isAdsApiLocked()) {
+    const message = `[ADS-LOCK] Skip ${taskName}, another Ads task is running: ${adsApiLock.taskName}`;
+    debugLog(message, "info");
+    log(message);
+    extensionLogger?.logInfo(message, {
+      requestedTaskName: taskName,
+      runningTaskName: adsApiLock.taskName,
+      runningRunId: adsApiLock.runId,
+      runningStartedAt: adsApiLock.startedAt,
+    });
+    if (options.throwOnSkip) {
+      const err = new Error(message);
+      err.code = "ADS_TASK_ALREADY_RUNNING";
+      throw err;
+    }
+    return createAdsLockSkipped(taskName);
+  }
+
+  const runId = options.runId || makeAdsRunId(taskName);
+  adsApiLock.running = true;
+  adsApiLock.taskName = taskName;
+  adsApiLock.runId = runId;
+  adsApiLock.startedAt = Date.now();
+  await persistAdsLockState();
+
+  debugLog(`[ADS-LOCK] Acquired ${taskName} runId=${runId}`, "success");
+  log(`[ADS-LOCK] Acquired ${taskName} runId=${runId}`);
+  extensionLogger?.logInfo(`[ADS-LOCK] Acquired ${taskName}`, { runId, taskName, startedAt: adsApiLock.startedAt });
+
+  try {
+    const result = await fn({ runId, taskName, lockOwner: true });
+    debugLog(`[ADS-LOCK] Released success ${taskName} runId=${runId}`, "success");
+    extensionLogger?.logInfo(`[ADS-LOCK] Released success ${taskName}`, { runId, taskName });
+    return result;
+  } catch (error) {
+    debugLog(`[ADS-LOCK] Released error ${taskName} runId=${runId}: ${error?.message || error}`, "error");
+    extensionLogger?.logError(error, { runId, taskName }, `[ADS-LOCK] Released error ${taskName}`);
+    throw error;
+  } finally {
+    if (adsApiLock.runId === runId) {
+      adsApiLock.running = false;
+      adsApiLock.taskName = "";
+      adsApiLock.runId = "";
+      adsApiLock.startedAt = 0;
+      await persistAdsLockState();
+    }
+  }
+}
+
+function canMutateAdsHeaders(options = {}) {
+  if (!isAdsApiLocked()) return true;
+  return !!options.lockOwner && isAdsLockOwner(options.runId);
+}
+
+async function clearAdsHeaders(reason = "unknown", options = {}) {
+  if (!canMutateAdsHeaders(options)) {
+    debugLog("[ADS-AUTH] clear blocked: not lock owner", "error");
+    extensionLogger?.logInfo("[ADS-AUTH] clear blocked: not lock owner", {
+      reason,
+      callerRunId: options.runId,
+      callerTaskName: options.taskName,
+      lock: { ...adsApiLock },
+    });
+    return false;
+  }
+
   await chrome.storage.local.remove(ADS_HEADER_STORAGE_KEYS);
   debugLog(`🧹 [ADS-AUTH] Cleared cached Ads headers: ${reason}`, "info");
-  extensionLogger?.logInfo("[ADS-AUTH] Cleared cached Ads headers", { reason });
+  extensionLogger?.logInfo("[ADS-AUTH] Cleared cached Ads headers", { reason, runId: options.runId, taskName: options.taskName });
+  return true;
 }
 
 function isAdsSignInText(text = "") {
@@ -296,6 +418,11 @@ async function waitForAdsHeaderCapture({ since = 0, timeoutMs = ADS_HEADER_REFRE
   if (isAdsHeaderComplete(initial) && (!since || Number(initial.adsHeaderLastSeen || 0) >= since - 1000)) {
     return true;
   }
+  const initialCandidate = await chrome.storage.local.get(["adsCandidateHeaders"]);
+  if (isAdsHeaderComplete(initialCandidate.adsCandidateHeaders || {}) &&
+    (!since || Number(initialCandidate.adsCandidateHeaders.adsHeaderLastSeen || 0) >= since - 1000)) {
+    return true;
+  }
 
   return new Promise((resolve) => {
     let done = false;
@@ -307,17 +434,25 @@ async function waitForAdsHeaderCapture({ since = 0, timeoutMs = ADS_HEADER_REFRE
       if (!ok) {
         const latest = await readAdsHeaderState();
         ok = isAdsHeaderComplete(latest) && (!since || Number(latest.adsHeaderLastSeen || 0) >= since - 1000);
+        if (!ok) {
+          const candidate = await chrome.storage.local.get(["adsCandidateHeaders"]);
+          ok = isAdsHeaderComplete(candidate.adsCandidateHeaders || {}) &&
+            (!since || Number(candidate.adsCandidateHeaders.adsHeaderLastSeen || 0) >= since - 1000);
+        }
       }
       resolve(!!ok);
     };
 
     const timer = setTimeout(() => finish(false), timeoutMs);
-    const watched = new Set(ADS_HEADER_STORAGE_KEYS);
+    const watched = new Set([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
     const listener = async (changes, areaName) => {
       if (areaName !== "local") return;
       if (!Object.keys(changes || {}).some((k) => watched.has(k))) return;
       const latest = await readAdsHeaderState();
-      if (isAdsHeaderComplete(latest) && (!since || Number(latest.adsHeaderLastSeen || 0) >= since - 1000)) {
+      const candidate = await chrome.storage.local.get(["adsCandidateHeaders"]);
+      const candidateOk = isAdsHeaderComplete(candidate.adsCandidateHeaders || {}) &&
+        (!since || Number(candidate.adsCandidateHeaders.adsHeaderLastSeen || 0) >= since - 1000);
+      if ((isAdsHeaderComplete(latest) && (!since || Number(latest.adsHeaderLastSeen || 0) >= since - 1000)) || candidateOk) {
         finish(true);
       }
     };
@@ -334,6 +469,1274 @@ async function getCookie(url, name) {
   } catch {
     return "";
   }
+}
+
+function createAmazonUploadError(code, message, details = {}) {
+  const error = new Error(message);
+  error.code = code;
+  Object.assign(error, details);
+  return error;
+}
+
+function logUploadTrackingDiagnostic(message, fields = {}, level = "info") {
+  const safeFields = {};
+  for (const [key, value] of Object.entries(fields || {})) {
+    const lowerKey = String(key).toLowerCase();
+    if (lowerKey.includes("csrf") && typeof value === "string" && !lowerKey.includes("included") && !lowerKey.includes("source") && !lowerKey.includes("length")) {
+      safeFields[key] = value ? "[redacted]" : value;
+    } else if (lowerKey.includes("cookie") && typeof value === "string") {
+      safeFields[key] = value ? "[redacted]" : value;
+    } else {
+      safeFields[key] = value;
+    }
+  }
+
+  const inlineFields = Object.entries(safeFields)
+    .map(([key, value]) => `${key}=${typeof value === "object" ? JSON.stringify(value) : String(value)}`)
+    .join(" ");
+  const fullMessage = inlineFields ? `${message} ${inlineFields}` : message;
+  debugLog(fullMessage, level);
+  extensionLogger?.logInfo(fullMessage, safeFields);
+}
+
+function isValidUploadFeedCsrfToken(value) {
+  const token = String(value || "").trim();
+  if (!token) return false;
+  if (token.length < AMAZON_UPLOADFEED_MIN_CSRF_LENGTH) return false;
+  if (/^(undefined|null|true|false)$/i.test(token)) return false;
+  return /^[A-Za-z0-9+/=_-]+$/.test(token);
+}
+
+const uploadFeedCaptureLogDedupe = { lastKey: "", lastAt: 0 };
+
+function shouldLogUploadFeedCapture(source, tokenLength) {
+  const key = `${source}:${tokenLength}`;
+  const now = Date.now();
+  if (uploadFeedCaptureLogDedupe.lastKey === key && now - uploadFeedCaptureLogDedupe.lastAt < 5000) return false;
+  uploadFeedCaptureLogDedupe.lastKey = key;
+  uploadFeedCaptureLogDedupe.lastAt = now;
+  return true;
+}
+
+async function getUploadFeedCsrfCacheStatus() {
+  const data = await chrome.storage.local.get([AMAZON_UPLOADFEED_CSRF_CACHE_KEY]);
+  const cache = data[AMAZON_UPLOADFEED_CSRF_CACHE_KEY] || null;
+  const token = String(cache?.token || "");
+  const ageMs = cache?.capturedAt ? Date.now() - Number(cache.capturedAt || 0) : null;
+  const expired = ageMs !== null && ageMs > AMAZON_UPLOADFEED_CSRF_CACHE_TTL_MS;
+  const tokenValid = isValidUploadFeedCsrfToken(token);
+  const isTestToken = !!cache?.isTestToken;
+  const valid = !!cache?.token && tokenValid && !expired && !isTestToken;
+  return {
+    cache,
+    valid,
+    tokenFound: !!cache?.token,
+    tokenLength: cache?.tokenLength || token.length || 0,
+    source: cache?.source || null,
+    ageMs,
+    ageMin: ageMs === null ? null : Math.floor(ageMs / 60000),
+    expired,
+    tokenValid,
+    isTestToken,
+  };
+}
+
+async function getCachedUploadFeedCsrfToken() {
+  const status = await getUploadFeedCsrfCacheStatus();
+  return status.valid ? status.cache : null;
+}
+
+async function clearUploadFeedCsrfCache(reason = "unknown", metadata = {}) {
+  await chrome.storage.local.remove([AMAZON_UPLOADFEED_CSRF_CACHE_KEY]);
+  logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrf cache cleared", {
+    reason,
+    code: metadata?.code || "",
+    status: metadata?.status || 0,
+  }, "info");
+  return { ok: true, cleared: true, reason };
+}
+
+async function saveUploadFeedCsrfTokenCapture(capture = {}) {
+  const token = String(capture.token || "").trim();
+  if (!isValidUploadFeedCsrfToken(token)) {
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrfToken capture ignored", {
+      source: capture.source || "unknown",
+      tokenLength: token.length,
+      valid: false,
+      url: capture.url || "",
+      pageTitle: capture.pageTitle || "",
+    }, "error");
+    return { ok: false, reason: "invalid_token" };
+  }
+
+  const cache = {
+    token,
+    tokenLength: token.length,
+    source: ["formDataAppend", "formDataSet", "fetchFormData", "requestFormData", "xhrFormData", "consoleLog", "webRequestFormData"].includes(capture.source) ? capture.source : "formDataAppend",
+    capturedAt: Number(capture.capturedAt || Date.now()),
+    url: String(capture.url || ""),
+    pageTitle: String(capture.pageTitle || ""),
+    isTestToken: !!capture.isTestToken,
+  };
+  await chrome.storage.local.set({ [AMAZON_UPLOADFEED_CSRF_CACHE_KEY]: cache });
+  if (shouldLogUploadFeedCapture(cache.source, cache.tokenLength)) {
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrfToken captured", {
+      source: cache.source,
+      tokenLength: cache.tokenLength,
+      capturedAt: cache.capturedAt,
+      url: cache.url,
+      pageTitle: cache.pageTitle,
+      isTestToken: cache.isTestToken,
+    }, cache.source === "webRequestFormData" ? "success" : "info");
+  }
+  return { ok: true, tokenLength: cache.tokenLength, source: cache.source, capturedAt: cache.capturedAt };
+}
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    try {
+      const formData = details?.requestBody?.formData || {};
+      const rawToken = Array.isArray(formData.csrfToken) ? formData.csrfToken[0] : formData.csrfToken;
+      const token = String(rawToken || "").trim();
+      const fieldNames = Object.keys(formData);
+      if (!isValidUploadFeedCsrfToken(token)) return;
+
+      if (shouldLogUploadFeedCapture("webRequestFormData", token.length)) {
+        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrfToken captured by webRequest", {
+          source: "webRequestFormData",
+          tokenLength: token.length,
+          fieldNames,
+          url: details.url || "",
+        }, "success");
+      }
+
+      Promise.resolve(saveUploadFeedCsrfTokenCapture({
+        token,
+        source: "webRequestFormData",
+        url: details.url,
+        pageTitle: "Captured by webRequest",
+        capturedAt: Date.now(),
+        isTestToken: false
+      })).catch((error) => {
+        console.warn("[UPLOAD_TRACKING] webRequest csrfToken capture failed:", error?.message || error);
+      });
+    } catch (error) {
+      console.warn("[UPLOAD_TRACKING] webRequest uploadFeed capture exception:", error?.message || error);
+    }
+  },
+  { urls: [`${SC_BASE}${AMAZON_UPLOADFEED_URL_PATH}*`] },
+  ["requestBody"]
+);
+
+function extractUploadFeedCsrfTokenInPage() {
+  const MIN_CSRF_LENGTH = 80;
+  const isValid = (value) => {
+    const token = String(value || "").trim();
+    if (!token) return false;
+    if (token.length < MIN_CSRF_LENGTH) return false;
+    if (/^(undefined|null|true|false)$/i.test(token)) return false;
+    return /^[A-Za-z0-9+/=_-]+$/.test(token);
+  };
+  const candidates = [];
+  const addCandidate = (value, source) => {
+    const token = String(value || "").trim();
+    if (isValid(token)) candidates.push({ csrfToken: token, csrfSource: source });
+  };
+
+  const selectors = [
+    'input[name="csrfToken"]',
+    'input[name="csrf-token"]',
+    'input[name="_csrf"]',
+    'input[name="csrf"]',
+    'meta[name="csrf-token"]',
+    'meta[name="csrfToken"]',
+    "[data-csrf-token]",
+    "[data-csrf]",
+  ];
+  for (const selector of selectors) {
+    try {
+      for (const el of Array.from(document.querySelectorAll(selector))) {
+        addCandidate(el.value || el.content || el.getAttribute("content") || el.getAttribute("data-csrf-token") || el.getAttribute("data-csrf"), "selector");
+      }
+    } catch { }
+  }
+
+  const keyLooksRelevant = (key) => /csrf|csrftoken|antiCsrf|anti-csrf|token/i.test(String(key || ""));
+  try {
+    for (const key of Object.keys(window)) {
+      if (keyLooksRelevant(key)) addCandidate(window[key], "window");
+      const value = window[key];
+      if (value && typeof value === "object") {
+        for (const nestedKey of Object.keys(value).slice(0, 200)) {
+          if (keyLooksRelevant(nestedKey)) addCandidate(value[nestedKey], "window");
+        }
+      }
+    }
+  } catch { }
+
+  const scriptText = Array.from(document.scripts || [])
+    .map((script) => script.textContent || "")
+    .join("\n")
+    .slice(0, 2000000);
+  const pageText = `${document.documentElement?.innerHTML || ""}\n${scriptText}`;
+  const regexes = [
+    /csrfToken["']?\s*[:=]\s*["']([^"']+)["']/gi,
+    /csrf-token["']?\s*[:=]\s*["']([^"']+)["']/gi,
+    /csrf_token["']?\s*[:=]\s*["']([^"']+)["']/gi,
+    /["']csrfToken["']\s*:\s*["']([^"']+)["']/gi,
+    /'csrfToken'\s*:\s*'([^']+)'/gi,
+  ];
+  for (const regex of regexes) {
+    let match;
+    while ((match = regex.exec(pageText))) addCandidate(match[1], "scriptRegex");
+  }
+
+  const best = candidates.sort((a, b) => b.csrfToken.length - a.csrfToken.length)[0];
+  return {
+    csrfToken: best?.csrfToken || "",
+    csrfSource: best?.csrfSource || "none",
+    csrfTokenLength: best?.csrfToken?.length || 0,
+  };
+}
+
+function extractAmazonCsrfFromText(text = "") {
+  const csrfMatches = [
+    /csrfToken['"]\s*:\s*['"]([^'"]+)['"]/i,
+    /name=['"]csrfToken['"][^>]*value=['"]([^'"]+)['"]/i,
+    /anti-csrftoken-a2z['"]\s*:\s*['"]([^'"]+)['"]/i,
+    /"csrfToken"\s*:\s*"([^"]+)"/i,
+    /window\.csrfToken\s*=\s*['"]([^'"]+)['"]/i,
+    /data-csrf-token=['"]([^'"]+)['"]/i,
+    /<meta[^>]+name=['"]csrf-token['"][^>]+content=['"]([^'"]+)['"]/i,
+  ];
+
+  for (const regex of csrfMatches) {
+    const match = String(text || "").match(regex);
+    if (match?.[1]) return match[1];
+  }
+  return "";
+}
+
+async function waitForSellerCentralTabComplete(tabId, timeoutMs = 35000) {
+  const existing = await chrome.tabs.get(tabId).catch(() => null);
+  if (existing?.status === "complete") return true;
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const onUpdated = (tid, info) => {
+      if (tid === tabId && info.status === "complete") finish(true);
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+}
+
+async function findOrOpenSellerCentralFeedsTab() {
+  const tabs = await chrome.tabs.query({ url: `${SC_BASE}/*` }).catch(() => []);
+  const feedsTab = tabs.find((tab) => (tab.url || "").startsWith(SC_FEEDS_URL));
+  const tab = feedsTab || tabs[0];
+
+  if (tab?.id) {
+    return chrome.tabs.update(tab.id, { url: SC_FEEDS_URL, active: true });
+  }
+
+  return chrome.tabs.create({ url: SC_FEEDS_URL, active: true });
+}
+
+async function installUploadFeedCsrfSniffer(tabId) {
+  if (!tabId) return { ok: false, error: "missing_tab_id" };
+
+  const bridge = () => {
+    if (window.__APO_UPLOADFEED_CSRF_BRIDGE_INSTALLED__) return true;
+    window.__APO_UPLOADFEED_CSRF_BRIDGE_INSTALLED__ = true;
+    window.addEventListener("message", (event) => {
+      try {
+        if (event.source !== window) return;
+        const data = event.data || {};
+        if (data.__apoUploadFeedDebug === true) {
+          chrome.runtime.sendMessage({
+            type: "UPLOADFEED_SNIFFER_DEBUG",
+            payload: {
+              event: String(data.event || ""),
+              href: String(data.href || location.href),
+              title: String(data.title || document.title),
+              installedAt: Number(data.installedAt || 0),
+            },
+          }).catch(() => { });
+          return;
+        }
+        if (data.__apoUploadFeedCsrfCaptured === true) {
+          chrome.runtime.sendMessage({
+            type: "UPLOADFEED_CSRF_CAPTURED",
+            payload: {
+              token: String(data.token || ""),
+              source: String(data.source || ""),
+              url: String(data.url || location.href),
+              pageTitle: String(data.pageTitle || document.title),
+              capturedAt: Number(data.capturedAt || Date.now()),
+              isTestToken: !!data.isTestToken,
+            },
+          }).catch(() => { });
+        }
+      } catch { }
+    });
+    return true;
+  };
+
+  const sniffer = (flagName, uploadPath) => {
+    const installedAt = Date.now();
+    window[flagName] = true;
+    window.__APO_UPLOADFEED_SNIFFER_INSTALLED__ = true;
+    window.__APO_UPLOADFEED_SNIFFER_INSTALLED_AT__ = installedAt;
+
+    const originalConsoleLog = window.__APO_UPLOADFEED_NATIVE_CONSOLE_LOG__ || console.log.bind(console);
+    window.__APO_UPLOADFEED_NATIVE_CONSOLE_LOG__ = originalConsoleLog;
+
+    const isValidToken = (value) => {
+      const token = String(value || "").trim();
+      if (!token) return false;
+      if (token.length < 80) return false;
+      if (/^(undefined|null|true|false)$/i.test(token)) return false;
+      return /^[A-Za-z0-9+/=_-]+$/.test(token);
+    };
+
+    const isUploadFeedUrl = (url) => String(url || "").includes(uploadPath);
+    const fieldNamesOf = (body) => {
+      try {
+        if (!(body instanceof FormData)) return [];
+        return Array.from(body.keys());
+      } catch {
+        return [];
+      }
+    };
+
+    const postDebug = (event, fields = {}) => {
+      try {
+        window.postMessage({
+          __apoUploadFeedDebug: true,
+          event,
+          href: location.href,
+          title: document.title,
+          installedAt,
+          ...fields,
+        }, "*");
+      } catch { }
+    };
+
+    const publish = (token, source, extra = {}) => {
+      try {
+        const value = String(token || "").trim();
+        if (!isValidToken(value)) return false;
+        originalConsoleLog(`[APO_UPLOADFEED_SNIFFER] csrfToken captured from ${source}`, {
+          source,
+          tokenLength: value.length,
+          isTestToken: !!extra.isTestToken,
+        });
+        window.postMessage({
+          __apoUploadFeedCsrfCaptured: true,
+          token: value,
+          source,
+          url: location.href,
+          pageTitle: document.title,
+          capturedAt: Date.now(),
+          isTestToken: !!extra.isTestToken,
+        }, "*");
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const findTokenDeep = (value, seen = new WeakSet()) => {
+      try {
+        if (isValidToken(value)) return String(value).trim();
+        if (!value || typeof value !== "object") return "";
+        if (seen.has(value)) return "";
+        seen.add(value);
+        if (value instanceof FormData) {
+          const token = value.get("csrfToken");
+          return isValidToken(token) ? String(token).trim() : "";
+        }
+        if (isValidToken(value.csrfToken)) return String(value.csrfToken).trim();
+        for (const key of Object.keys(value).slice(0, 100)) {
+          const found = findTokenDeep(value[key], seen);
+          if (found) return found;
+        }
+      } catch { }
+      return "";
+    };
+
+    const inspectConsoleArgs = (args) => {
+      try {
+        for (const arg of args) {
+          if (!arg || typeof arg !== "object") continue;
+          const relevant = arg.type === "UPLOAD_ACTION" || arg.feedTypeName === "confirmShipment";
+          if (!relevant) continue;
+          const token = findTokenDeep(arg);
+          if (token) publish(token, "consoleLog", { isTestToken: !!arg.__apoTestToken });
+        }
+      } catch { }
+    };
+
+    const inspectFormData = (body, source) => {
+      let csrf = "";
+      let names = [];
+      try {
+        names = fieldNamesOf(body);
+        if (body instanceof FormData) csrf = body.get("csrfToken");
+      } catch { }
+      const csrfIncluded = isValidToken(csrf);
+      originalConsoleLog("[APO_UPLOADFEED_SNIFFER] uploadFeed request detected", {
+        source,
+        hasFormData: body instanceof FormData,
+        fieldNames: names,
+        csrfIncluded,
+        csrfTokenLength: csrfIncluded ? String(csrf).trim().length : 0,
+      });
+      if (csrfIncluded) publish(csrf, source);
+    };
+
+    try {
+      const nativeAppend = FormData.prototype.append;
+      if (typeof nativeAppend === "function" && !nativeAppend.__apoUploadFeedPatched) {
+        const patchedAppend = function (name, value, filename) {
+          try {
+            if (String(name) === "csrfToken") publish(value, "formDataAppend");
+          } catch { }
+          return nativeAppend.apply(this, arguments);
+        };
+        patchedAppend.__apoUploadFeedPatched = true;
+        FormData.prototype.append = patchedAppend;
+      }
+    } catch { }
+
+    try {
+      const nativeSet = FormData.prototype.set;
+      if (typeof nativeSet === "function" && !nativeSet.__apoUploadFeedPatched) {
+        const patchedSet = function (name, value, filename) {
+          try {
+            if (String(name) === "csrfToken") publish(value, "formDataSet");
+          } catch { }
+          return nativeSet.apply(this, arguments);
+        };
+        patchedSet.__apoUploadFeedPatched = true;
+        FormData.prototype.set = patchedSet;
+      }
+    } catch { }
+
+    try {
+      const nativeConsoleLog = console.log;
+      if (!nativeConsoleLog.__apoUploadFeedPatched) {
+        const patchedConsoleLog = function (...args) {
+          try {
+            inspectConsoleArgs(args);
+          } catch { }
+          return originalConsoleLog(...args);
+        };
+        patchedConsoleLog.__apoUploadFeedPatched = true;
+        console.log = patchedConsoleLog;
+      }
+    } catch { }
+
+    try {
+      const NativeRequest = window.Request;
+      if (typeof NativeRequest === "function" && !NativeRequest.__apoUploadFeedPatched) {
+        const PatchedRequest = function (input, init = {}) {
+          try {
+            const url = typeof input === "string" ? input : input?.url;
+            const body = init?.body || input?.body;
+            if (isUploadFeedUrl(url)) inspectFormData(body, "requestFormData");
+          } catch { }
+          return new NativeRequest(input, init);
+        };
+        Object.setPrototypeOf(PatchedRequest, NativeRequest);
+        PatchedRequest.prototype = NativeRequest.prototype;
+        PatchedRequest.__apoUploadFeedPatched = true;
+        window.Request = PatchedRequest;
+      }
+    } catch { }
+
+    try {
+      const nativeFetch = window.fetch;
+      if (typeof nativeFetch === "function" && !nativeFetch.__apoUploadFeedPatched) {
+        const patchedFetch = function (input, init = {}) {
+          try {
+            const url = typeof input === "string" ? input : input?.url;
+            const body = init?.body;
+            if (isUploadFeedUrl(url)) inspectFormData(body, "fetchFormData");
+          } catch { }
+          return nativeFetch.apply(this, arguments);
+        };
+        patchedFetch.__apoUploadFeedPatched = true;
+        window.fetch = patchedFetch;
+      }
+    } catch { }
+
+    try {
+      const nativeOpen = XMLHttpRequest.prototype.open;
+      const nativeSend = XMLHttpRequest.prototype.send;
+      if (typeof nativeOpen === "function" && typeof nativeSend === "function" && !nativeSend.__apoUploadFeedPatched) {
+        XMLHttpRequest.prototype.open = function (method, url) {
+          try {
+            this.__apoUploadFeedUrl = url;
+          } catch { }
+          return nativeOpen.apply(this, arguments);
+        };
+        const patchedSend = function (body) {
+          try {
+            if (isUploadFeedUrl(this.__apoUploadFeedUrl)) inspectFormData(body, "xhrFormData");
+          } catch { }
+          return nativeSend.apply(this, arguments);
+        };
+        patchedSend.__apoUploadFeedPatched = true;
+        XMLHttpRequest.prototype.send = patchedSend;
+      }
+    } catch { }
+
+    const status = {
+      href: location.href,
+      title: document.title,
+      installedAt,
+      fetchPatched: !!window.fetch?.__apoUploadFeedPatched,
+      requestPatched: !!window.Request?.__apoUploadFeedPatched,
+      xhrPatched: !!XMLHttpRequest.prototype.send?.__apoUploadFeedPatched,
+      formDataAppendPatched: !!FormData.prototype.append?.__apoUploadFeedPatched,
+      formDataSetPatched: !!FormData.prototype.set?.__apoUploadFeedPatched,
+      consoleLogPatched: !!console.log?.__apoUploadFeedPatched,
+    };
+    originalConsoleLog("[APO_UPLOADFEED_SNIFFER] MAIN sniffer installed", status);
+    postDebug("snifferInstalled", status);
+    return true;
+  };
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: bridge,
+    world: "ISOLATED",
+  });
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: sniffer,
+    args: [AMAZON_UPLOADFEED_SNIFFER_FLAG, AMAZON_UPLOADFEED_URL_PATH],
+    world: "MAIN",
+  });
+
+  return { ok: true, tabId };
+}
+
+globalThis.installUploadFeedSnifferNow = async function () {
+  const tab = await findOrOpenSellerCentralFeedsTab();
+  if (!tab?.id) {
+    return { ok: false, error: "Unable to open Seller Central feeds tab" };
+  }
+
+  await waitForSellerCentralTabComplete(tab.id);
+  await delayMs(1000);
+
+  const result = await installUploadFeedCsrfSniffer(tab.id);
+
+  return {
+    ok: true,
+    tabId: tab.id,
+    result
+  };
+};
+
+globalThis.verifyUploadFeedSnifferNow = async function () {
+  const tab = await findOrOpenSellerCentralFeedsTab();
+  if (!tab?.id) {
+    return { ok: false, error: "Unable to open Seller Central feeds tab" };
+  }
+
+  await waitForSellerCentralTabComplete(tab.id);
+
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    func: () => ({
+      mainWorldFlag: !!window.__APO_UPLOADFEED_SNIFFER_INSTALLED__,
+      installedAt: window.__APO_UPLOADFEED_SNIFFER_INSTALLED_AT__ || 0,
+      href: location.href,
+      title: document.title,
+      fetchPatched: !!window.fetch?.__apoUploadFeedPatched,
+      requestPatched: !!window.Request?.__apoUploadFeedPatched,
+      xhrPatched: !!XMLHttpRequest.prototype.send?.__apoUploadFeedPatched,
+      formDataAppendPatched: !!FormData.prototype.append?.__apoUploadFeedPatched,
+      formDataSetPatched: !!FormData.prototype.set?.__apoUploadFeedPatched,
+      consoleLogPatched: !!console.log?.__apoUploadFeedPatched,
+    }),
+  });
+
+  return {
+    ok: true,
+    tabId: tab.id,
+    ...(res?.result || {})
+  };
+};
+
+globalThis.checkUploadFeedCsrfCacheNow = async function () {
+  const cache = await getCachedUploadFeedCsrfToken();
+
+  return {
+    ok: true,
+    tokenFound: !!cache,
+    tokenLength: cache?.tokenLength || 0,
+    source: cache?.source || "none",
+    ageMs: cache?.capturedAt ? Date.now() - cache.capturedAt : null,
+    valid: !!cache,
+    isTestToken: !!cache?.isTestToken
+  };
+};
+
+globalThis.clearUploadFeedCsrfCacheNow = async function () {
+  return clearUploadFeedCsrfCache("manual_service_worker_console");
+};
+
+globalThis.testUploadFeedSnifferCaptureNow = async function () {
+  const tab = await findOrOpenSellerCentralFeedsTab();
+  if (!tab?.id) {
+    return { ok: false, error: "Unable to open Seller Central feeds tab" };
+  }
+
+  await waitForSellerCentralTabComplete(tab.id);
+  await installUploadFeedCsrfSniffer(tab.id);
+
+  const fakeToken =
+    "TEST" +
+    "A".repeat(120) +
+    "==";
+
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    func: (token) => {
+      console.log("dispatching", {
+        type: "UPLOAD_ACTION",
+        feedTypeName: "confirmShipment",
+        payload: {
+          csrfToken: token
+        },
+        __apoTestToken: true
+      });
+
+      return {
+        ok: true,
+        href: location.href,
+        title: document.title,
+        tokenLength: token.length
+      };
+    },
+    args: [fakeToken],
+  });
+
+  return {
+    ok: true,
+    tabId: tab.id,
+    result: res?.result || null
+  };
+};
+
+console.log("[UPLOAD_TRACKING] Service Worker uploadFeed debug helpers exposed", {
+  installUploadFeedSnifferNow: typeof globalThis.installUploadFeedSnifferNow,
+  verifyUploadFeedSnifferNow: typeof globalThis.verifyUploadFeedSnifferNow,
+  checkUploadFeedCsrfCacheNow: typeof globalThis.checkUploadFeedCsrfCacheNow,
+  clearUploadFeedCsrfCacheNow: typeof globalThis.clearUploadFeedCsrfCacheNow,
+  testUploadFeedSnifferCaptureNow: typeof globalThis.testUploadFeedSnifferCaptureNow
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  try {
+    if (changeInfo.status !== "complete") return;
+    const url = tab?.url || "";
+    if (!url.startsWith(SC_FEEDS_URL)) return;
+    Promise.resolve(installUploadFeedCsrfSniffer(tabId))
+      .then((result) => {
+        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer auto-installed on feeds tab", {
+          tabId,
+          url,
+          ok: !!result?.ok,
+        }, result?.ok ? "success" : "error");
+      })
+      .catch((error) => {
+        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer auto-install failed on feeds tab", {
+          tabId,
+          url,
+          error: error?.message || String(error),
+        }, "error");
+      });
+  } catch (error) {
+    console.warn("[UPLOAD_TRACKING] feeds tab sniffer auto-install exception:", error?.message || error);
+  }
+});
+
+async function getSellerCentralPageCsrfFromTab(tabId) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const inputs = Array.from(document.querySelectorAll(
+          'input[name="csrfToken"], input[name="anti-csrftoken-a2z"], meta[name="csrf-token"], [data-csrf-token]'
+        ));
+        const tokenFromDom = inputs
+          .map((el) => el.value || el.content || el.getAttribute("data-csrf-token") || "")
+          .find(Boolean) || "";
+
+        let initialState = "";
+        try {
+          initialState = JSON.stringify(window.__INITIAL_STATE__ || {});
+        } catch {
+          initialState = "";
+        }
+        const pageText = [
+          document.documentElement?.innerHTML || "",
+          initialState,
+        ].join("\n");
+
+        return {
+          href: location.href,
+          title: document.title,
+          tokenFromDom,
+          tokenFromHtml: (() => {
+            const patterns = [
+              /csrfToken['"]\s*:\s*['"]([^'"]+)['"]/i,
+              /anti-csrftoken-a2z['"]\s*:\s*['"]([^'"]+)['"]/i,
+              /"csrfToken"\s*:\s*"([^"]+)"/i,
+              /window\.csrfToken\s*=\s*['"]([^'"]+)['"]/i,
+              /data-csrf-token=['"]([^'"]+)['"]/i,
+            ];
+            for (const pattern of patterns) {
+              const match = pageText.match(pattern);
+              if (match?.[1]) return match[1];
+            }
+            return "";
+          })(),
+          bodyText: (document.body?.innerText || "").slice(0, 1200),
+        };
+      },
+    });
+
+    const result = res?.result || {};
+    return {
+      token: result.tokenFromDom || result.tokenFromHtml || "",
+      pageHint: result,
+    };
+  } catch (error) {
+    return {
+      token: "",
+      pageHint: { error: error?.message || String(error) },
+    };
+  }
+}
+
+async function refreshSellerCentralUploadAuth() {
+  debugLog("[UPLOAD_TRACKING] Refreshing Seller Central auth in tab", "info");
+  const tab = await findOrOpenSellerCentralFeedsTab();
+  if (!tab?.id) {
+    throw createAmazonUploadError(
+      "AMAZON_CSRF_MISSING",
+      "Cannot open Seller Central feeds tab to refresh authentication. Open Seller Central, log in, then retry."
+    );
+  }
+
+  await waitForSellerCentralTabComplete(tab.id);
+  await delayMs(1500);
+
+  const cookieToken = await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z");
+  const { token: pageToken, pageHint } = await getSellerCentralPageCsrfFromTab(tab.id);
+  const csrfToken = cookieToken || pageToken || "";
+
+  extensionLogger?.logInfo("[UPLOAD_TRACKING] Seller Central auth refresh completed", {
+    tabId: tab.id,
+    url: pageHint?.href,
+    title: pageHint?.title,
+    cookieTokenFound: !!cookieToken,
+    pageTokenFound: !!pageToken,
+  });
+
+  if (!csrfToken) {
+    throw createAmazonUploadError(
+      "AMAZON_CSRF_MISSING",
+      "Amazon Seller Central CSRF token is missing. Log in to Seller Central, refresh the feeds page, then retry the tracking upload.",
+      { pageHint }
+    );
+  }
+
+  return csrfToken;
+}
+
+const AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE = "America/Los_Angeles";
+
+function formatDateYmdInTimeZone(date = new Date(), timeZone = AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE) {
+  const d = date instanceof Date ? date : new Date(date);
+  const safeDate = Number.isNaN(d.getTime()) ? new Date() : d;
+
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(safeDate);
+
+  const byType = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return `${byType.year}-${byType.month}-${byType.day}`;
+}
+
+function compareYmd(a = "", b = "") {
+  return String(a || "").localeCompare(String(b || ""));
+}
+
+function normalizeShipDateForAmazonConfirmShipment(value = new Date(), options = {}) {
+  const now = options.now instanceof Date ? options.now : new Date();
+  const marketplaceToday = formatDateYmdInTimeZone(
+    now,
+    AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE
+  );
+
+  const raw = String(value || "").trim();
+  let candidate = "";
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    candidate = raw;
+  } else {
+    const parsed = value instanceof Date ? value : new Date(raw || now);
+    candidate = Number.isNaN(parsed.getTime())
+      ? marketplaceToday
+      : formatDateYmdInTimeZone(parsed, AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE);
+  }
+
+  if (compareYmd(candidate, marketplaceToday) > 0) {
+    return marketplaceToday;
+  }
+
+  return candidate || marketplaceToday;
+}
+
+function isHtmlResponse(contentType = "", text = "") {
+  const ct = String(contentType || "").toLowerCase();
+  const body = String(text || "").trimStart().toLowerCase();
+  return ct.includes("text/html") || body.startsWith("<!doctype html") || body.startsWith("<html") || body.includes("<html");
+}
+
+function classifyAmazonUploadFailure(response, responseText = "") {
+  const contentType = response.headers.get("content-type") || "";
+  const bodyAndUrl = `${response?.url || ""}\n${responseText || ""}`;
+  const authLike = /signin|sign-in|login|authentication|captcha|session expired|unauthorized|forbidden/i.test(bodyAndUrl);
+  if (response.status === 0) return "AMAZON_UPLOAD_CONTEXT_BLOCKED";
+  if (response.status === 401 || response.status === 403) return "AMAZON_AUTH_REQUIRED";
+  if (isHtmlResponse(contentType, responseText) && authLike) return "AMAZON_AUTH_REQUIRED";
+  if (response.status === 400 && isHtmlResponse(contentType, responseText)) return "AMAZON_UPLOAD_BAD_REQUEST_HTML";
+  if (response.status === 400) return "AMAZON_UPLOAD_BAD_REQUEST";
+  if (response.status === 500) return "AMAZON_UPLOAD_SERVER_ERROR";
+  return "AMAZON_UPLOAD_FAILED";
+}
+
+function isUploadFeedAuthOrCsrfError(error = {}) {
+  const code = error?.code || "";
+  const status = Number(error?.status || 0);
+  if (["AMAZON_AUTH_REQUIRED", "AMAZON_UPLOAD_CSRF_FORM_FIELD_MISSING", "AMAZON_UPLOAD_CSRF_SEED_REQUIRED"].includes(code)) return true;
+  if (status === 401 || status === 403) return true;
+  const responseText = String(error?.responseText || "");
+  if (responseText && /signin|sign-in|login|authentication|captcha|session expired|unauthorized|forbidden|csrf|token/i.test(responseText)) return true;
+  return false;
+}
+
+async function getSellerCentralUploadPagePreflight(context = {}) {
+  const tab = await findOrOpenSellerCentralFeedsTab();
+  if (!tab?.id) {
+    return {
+      ok: false,
+      tabId: null,
+      finalUrl: "",
+      pageTitle: "",
+      tabStatus: "",
+      feedsPage: false,
+      isLoginPage: false,
+      isOtpPage: false,
+      isCaptchaPage: false,
+      isMarketplaceSelector: false,
+      isSellerCentralPage: false,
+      allowUpload: false,
+      error: "Unable to open Seller Central feeds tab",
+      context,
+    };
+  }
+
+  await waitForSellerCentralTabComplete(tab.id);
+  await delayMs(1500);
+  const currentTab = await chrome.tabs.get(tab.id).catch(() => tab);
+
+  let pageInfo = {};
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => ({
+        href: location.href,
+        title: document.title,
+        readyState: document.readyState,
+        bodyText: (document.body?.innerText || "").slice(0, 1200),
+      }),
+    });
+    pageInfo = res?.result || {};
+  } catch (error) {
+    pageInfo = { error: error?.message || String(error) };
+  }
+
+  const finalUrl = pageInfo.href || currentTab?.url || "";
+  const pageTitle = pageInfo.title || currentTab?.title || "";
+  let snifferInstalled = false;
+  try {
+    const snifferResult = await installUploadFeedCsrfSniffer(tab.id);
+    snifferInstalled = !!snifferResult?.ok;
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer installed", {
+      tabId: tab.id,
+      finalUrl,
+      pageTitle,
+      snifferInstalled,
+    }, snifferInstalled ? "success" : "error");
+  } catch (error) {
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer install failed", {
+      tabId: tab.id,
+      finalUrl,
+      pageTitle,
+      error: error?.message || String(error),
+    }, "error");
+  }
+  const bodyText = String(pageInfo.bodyText || "");
+  const haystack = `${finalUrl}\n${pageTitle}\n${bodyText}`.toLowerCase();
+  const feedsPage = finalUrl.includes(AMAZON_UPLOADFEED_PAGE_URL);
+  const isLoginPage = /signin|sign-in|ap\/signin|login|password|passkey|authentication/.test(haystack);
+  const isOtpPage = /otp|one time password|one-time password|two-step|two step|verification code/.test(haystack);
+  const isCaptchaPage = /captcha|enter the characters|type the characters/.test(haystack);
+  const isMarketplaceSelector = /marketplace|select.*marketplace|choose.*marketplace|seller central.*country/.test(haystack) && !feedsPage;
+  const isSellerCentralPage = finalUrl.includes("sellercentral.amazon.com");
+  const allowUpload = feedsPage && isSellerCentralPage && !isLoginPage && !isOtpPage && !isCaptchaPage && !isMarketplaceSelector;
+
+  return {
+    ok: allowUpload,
+    tabId: tab.id,
+    finalUrl,
+    pageTitle,
+    tabStatus: currentTab?.status || pageInfo.readyState || "",
+    feedsPage,
+    isLoginPage,
+    isOtpPage,
+    isCaptchaPage,
+    isMarketplaceSelector,
+    isSellerCentralPage,
+    allowUpload,
+    snifferInstalled,
+  };
+}
+
+async function getUploadFeedReadinessStatus(options = {}) {
+  const requireSocket = !!options.requireSocket;
+  const socketConnected = !!socket?.connected;
+  let preflight = options.preflight || null;
+
+  if (!options.skipSellerCentralPreflight && !preflight) {
+    preflight = await getSellerCentralUploadPagePreflight({ reason: "readiness_status" });
+  }
+
+  const sellerCentralReady = options.skipSellerCentralPreflight && !preflight ? true : !!preflight?.allowUpload;
+  const sellerCentralTabId = preflight?.tabId || null;
+  const sellerCentralUrl = preflight?.finalUrl || "";
+  const sellerCentralTitle = preflight?.pageTitle || "";
+  const needLogin = !!(preflight && (
+    preflight.isLoginPage ||
+    preflight.isOtpPage ||
+    preflight.isCaptchaPage ||
+    preflight.isMarketplaceSelector ||
+    !preflight.allowUpload
+  ));
+
+  const cacheStatus = await getUploadFeedCsrfCacheStatus();
+  const csrfCacheValid = !!cacheStatus.valid;
+  const needCsrfSeed = sellerCentralReady && !csrfCacheValid;
+  const socketOk = !requireSocket || socketConnected;
+  const ok = socketOk && sellerCentralReady && csrfCacheValid && !cacheStatus.isTestToken;
+
+  let message = "UploadFeed is ready.";
+  if (!socketOk) {
+    message = "Socket is disconnected.";
+  } else if (needLogin) {
+    message = "Seller Central feeds page is not ready. Log in and clear any OTP, captcha, or marketplace selector.";
+  } else if (needCsrfSeed) {
+    message = "Open Seller Central feeds page and perform one manual upload to seed uploadFeed csrfToken.";
+  }
+
+  return {
+    ok,
+    socketConnected,
+    sellerCentralReady,
+    sellerCentralTabId,
+    sellerCentralUrl,
+    sellerCentralTitle,
+    csrfCacheValid,
+    csrfTokenFound: cacheStatus.tokenFound,
+    csrfTokenLength: cacheStatus.tokenLength,
+    csrfSource: cacheStatus.source,
+    csrfAgeMs: cacheStatus.ageMs,
+    csrfAgeMin: cacheStatus.ageMin,
+    isTestToken: cacheStatus.isTestToken,
+    needLogin,
+    needCsrfSeed,
+    message,
+  };
+}
+
+// TODO Phase 2: add throttled uploadFeed session warm-up, identity-scoped CSRF cache metadata,
+// an upload tracking lock, and Amazon uploadFeed batchId persistence after Phase 1 runs cleanly.
+
+/*
+ * Expected manual request contract:
+ * POST /order-reports-and-feeds/api/uploadFeed
+ * FormData:
+ * - feedFile
+ * - feedName=confirmShipment
+ * - feedVersion=new
+ * - csrfToken=<long token>
+  */
+async function uploadToAmazonFromSellerCentralTab(stableFileObj, uploadParams = {}) {
+  const tab = await findOrOpenSellerCentralFeedsTab();
+  if (!tab?.id) {
+    return {
+      ok: false,
+      status: 0,
+      code: "AMAZON_UPLOAD_CONTEXT_BLOCKED",
+      statusText: "Seller Central feeds tab is unavailable",
+      csrfIncluded: false,
+      csrfSource: "none",
+      csrfTokenLength: 0,
+      url: "",
+      contentType: "",
+      textPreview: "Unable to open Seller Central feeds tab",
+      jsonParseOk: false,
+      json: null,
+      world: "",
+    };
+  }
+
+  await waitForSellerCentralTabComplete(tab.id);
+  await delayMs(1000);
+  let snifferInstalled = false;
+  try {
+    const snifferResult = await installUploadFeedCsrfSniffer(tab.id);
+    snifferInstalled = !!snifferResult?.ok;
+  } catch (error) {
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer install failed before upload", {
+      tabId: tab.id,
+      error: error?.message || String(error),
+    }, "error");
+  }
+  const cachedCsrf = await getCachedUploadFeedCsrfToken();
+
+  const fileText = await stableFileObj.text();
+  const filename = stableFileObj.name || uploadParams.filename || "confirmShipment.txt";
+  const contentType = stableFileObj.type || uploadParams.contentType || "text/tab-separated-values; charset=utf-8";
+
+  const injectedUpload = async (fileTextArg, filenameArg, contentTypeArg, pathArg, cachedTokenArg, snifferInstalledArg) => {
+    const extractUploadFeedCsrfTokenInPage = () => {
+      const MIN_CSRF_LENGTH = 80;
+      const isValid = (value) => {
+        const token = String(value || "").trim();
+        if (!token) return false;
+        if (token.length < MIN_CSRF_LENGTH) return false;
+        if (/^(undefined|null|true|false)$/i.test(token)) return false;
+        return /^[A-Za-z0-9+/=_-]+$/.test(token);
+      };
+      const candidates = [];
+      const addCandidate = (value, source) => {
+        const token = String(value || "").trim();
+        if (isValid(token)) candidates.push({ csrfToken: token, csrfSource: source });
+      };
+      const selectors = [
+        'input[name="csrfToken"]',
+        'input[name="csrf-token"]',
+        'input[name="_csrf"]',
+        'input[name="csrf"]',
+        'meta[name="csrf-token"]',
+        'meta[name="csrfToken"]',
+        "[data-csrf-token]",
+        "[data-csrf]",
+      ];
+      for (const selector of selectors) {
+        try {
+          for (const el of Array.from(document.querySelectorAll(selector))) {
+            addCandidate(el.value || el.content || el.getAttribute("content") || el.getAttribute("data-csrf-token") || el.getAttribute("data-csrf"), "selector");
+          }
+        } catch { }
+      }
+      const keyLooksRelevant = (key) => /csrf|csrftoken|antiCsrf|anti-csrf|token/i.test(String(key || ""));
+      try {
+        for (const key of Object.keys(window)) {
+          if (keyLooksRelevant(key)) addCandidate(window[key], "window");
+          const value = window[key];
+          if (value && typeof value === "object") {
+            for (const nestedKey of Object.keys(value).slice(0, 200)) {
+              if (keyLooksRelevant(nestedKey)) addCandidate(value[nestedKey], "window");
+            }
+          }
+        }
+      } catch { }
+      const scriptText = Array.from(document.scripts || []).map((script) => script.textContent || "").join("\n").slice(0, 2000000);
+      const pageText = `${document.documentElement?.innerHTML || ""}\n${scriptText}`;
+      const regexes = [
+        /csrfToken["']?\s*[:=]\s*["']([^"']+)["']/gi,
+        /csrf-token["']?\s*[:=]\s*["']([^"']+)["']/gi,
+        /csrf_token["']?\s*[:=]\s*["']([^"']+)["']/gi,
+        /["']csrfToken["']\s*:\s*["']([^"']+)["']/gi,
+        /'csrfToken'\s*:\s*'([^']+)'/gi,
+      ];
+      for (const regex of regexes) {
+        let match;
+        while ((match = regex.exec(pageText))) addCandidate(match[1], "scriptRegex");
+      }
+      const best = candidates.sort((a, b) => b.csrfToken.length - a.csrfToken.length)[0];
+      return {
+        csrfToken: best?.csrfToken || "",
+        csrfSource: best?.csrfSource || "none",
+        csrfTokenLength: best?.csrfToken?.length || 0,
+      };
+    };
+    const tokenResult = extractUploadFeedCsrfTokenInPage();
+    const isValidUploadFeedToken = (value) => {
+      const token = String(value || "").trim();
+      if (!token) return false;
+      if (token.length < 80) return false;
+      if (/^(undefined|null|true|false)$/i.test(token)) return false;
+      return /^[A-Za-z0-9+/=_-]+$/.test(token);
+    };
+    const liveToken = tokenResult.csrfToken || "";
+    const cachedToken = String(cachedTokenArg || "").trim();
+    const liveExtractionFound = isValidUploadFeedToken(liveToken);
+    const cachedTokenFound = isValidUploadFeedToken(cachedToken);
+    const csrfToken = liveExtractionFound ? liveToken : cachedTokenFound ? cachedToken : "";
+    const csrfSource = liveExtractionFound ? (tokenResult.csrfSource || "none") : cachedTokenFound ? "cachedSnifferToken" : "none";
+    const csrfTokenLength = csrfToken.length;
+    if (!csrfToken || csrfTokenLength < 80) {
+      return {
+        ok: false,
+        status: 0,
+        code: "AMAZON_UPLOAD_CSRF_FORM_FIELD_MISSING",
+        statusText: "Valid uploadFeed csrfToken FormData field is missing",
+        csrfIncluded: false,
+        csrfSource: "none",
+        csrfTokenLength: 0,
+        url: location.href,
+        finalUrl: location.href,
+        pageTitle: document.title,
+        readyState: document.readyState,
+        isSellerCentralPage: location.href.includes("sellercentral.amazon.com"),
+        isFeedsPage: location.href.includes("/order-reports-and-feeds/feeds"),
+        liveExtractionFound,
+        cachedTokenFound,
+        snifferInstalled: !!snifferInstalledArg,
+        instruction: "Open Seller Central feeds page and perform one manual upload to let the extension capture uploadFeed csrfToken.",
+        contentType: "",
+        textPreview: "No valid csrfToken found in Seller Central page context",
+        jsonParseOk: false,
+        json: null,
+      };
+    }
+
+    const uploadFile = new File([fileTextArg], filenameArg, { type: contentTypeArg || "text/tab-separated-values; charset=utf-8" });
+    const formData = new FormData();
+    formData.append("feedFile", uploadFile);
+    formData.append("feedName", "confirmShipment");
+    formData.append("feedVersion", "new");
+    formData.append("csrfToken", csrfToken);
+
+    const res = await fetch(pathArg, {
+      method: "POST",
+      credentials: "include",
+      headers: { accept: "*/*" },
+      body: formData,
+    });
+
+    const responseContentType = res.headers.get("content-type") || "";
+    const textBody = await res.text().catch(() => "");
+    let json = null;
+    let jsonParseOk = false;
+    try {
+      json = JSON.parse(textBody);
+      jsonParseOk = true;
+    } catch { }
+
+    return {
+      ok: res.ok,
+      status: res.status,
+      statusText: res.statusText,
+      url: res.url,
+      redirected: res.redirected,
+      type: res.type,
+      contentType: responseContentType,
+      textPreview: textBody.slice(0, 1000),
+      jsonParseOk,
+      json,
+      csrfIncluded: true,
+      csrfSource,
+      csrfTokenLength,
+      liveExtractionFound,
+      cachedTokenFound,
+      snifferInstalled: !!snifferInstalledArg,
+    };
+  };
+
+  const runInjection = async (world) => {
+    const options = {
+      target: { tabId: tab.id },
+      func: injectedUpload,
+      args: [fileText, filename, contentType, AMAZON_UPLOADFEED_URL_PATH, cachedCsrf?.token || "", snifferInstalled],
+    };
+    if (world) options.world = world;
+    const [res] = await chrome.scripting.executeScript(options);
+    return { ...(res?.result || {}), world: world || "ISOLATED" };
+  };
+
+  try {
+    return await runInjection("MAIN");
+  } catch (error) {
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] MAIN world injection failed; using fallback isolated world", {
+      error: error?.message || String(error),
+      filename,
+    }, "error");
+    return await runInjection();
+  }
+}
+
+function sellerCentralTabUploadResultToResponse(result = {}) {
+  const contentType = result.contentType || "";
+  const textBody = result.textPreview || "";
+  return {
+    ok: !!result.ok,
+    status: Number(result.status || 0),
+    statusText: result.statusText || "",
+    url: result.url || "",
+    redirected: !!result.redirected,
+    type: result.type || "",
+    headers: {
+      get(name) {
+        return String(name || "").toLowerCase() === "content-type" ? contentType : "";
+      },
+      entries() {
+        return contentType ? [["content-type", contentType]][Symbol.iterator]() : [][Symbol.iterator]();
+      },
+    },
+    async json() {
+      if (result.jsonParseOk) return result.json;
+      return JSON.parse(textBody || "null");
+    },
+    async text() {
+      return textBody;
+    },
+  };
 }
 async function amazonHeaders() {
   const a2z = await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z");
@@ -375,6 +1778,19 @@ function isTsvish(res) {
   );
 }
 async function requestOnce(url, init = {}) {
+  if (String(url || "").includes(AMAZON_UPLOADFEED_URL_PATH)) {
+    const message = "uploadFeed must be called from Seller Central page context, not requestOnce/background fetch.";
+    logUploadTrackingDiagnostic(
+      "[UPLOAD_TRACKING] Blocked background uploadFeed request; use sellerCentralTabPageContext",
+      { url: String(url || ""), method: init?.method || "GET" },
+      "error"
+    );
+    throw createAmazonUploadError(
+      "AMAZON_UPLOADFEED_BACKGROUND_FORBIDDEN",
+      message,
+      { url: String(url || ""), retryable: false }
+    );
+  }
   const headers = { ...(await amazonHeaders()), ...(init.headers || {}) };
   return fetch(url, {
     credentials: "include",
@@ -420,18 +1836,140 @@ function deriveApiUrls(ingestUrl) {
 }
 
 function resolveCarrierInfo(tracking = "") {
+  const normalized = String(tracking || "").trim().toUpperCase();
 
-  if (tracking.startsWith("4PX")) {
+  if (normalized.startsWith("4PX")) {
     return { carrierCode: "4PX", shipMethod: "4PX-Global Express" };
   }
 
-  if (tracking.startsWith("UK") || tracking.startsWith("UL")) {
+  if (normalized.startsWith("UK") || normalized.startsWith("UL")) {
     return { carrierCode: "Yanwen", shipMethod: "Yanwen Air Economy Mail General" };
   }
-  if (tracking.startsWith("YT")) {
-    return { carrierCode: "Yun Express", shipMethod: "YunExpress Global Direct line (standard )-Tracked" };
+  if (normalized.startsWith("YT")) {
+    return { carrierCode: "YunExpress", shipMethod: "YunExpress Global Direct line (standard)-Tracked" };
   }
   return { carrierCode: "USPS", shipMethod: "USPS First Class" };
+}
+
+const CONFIRM_SHIPMENT_TSV_EOL = "\r\n";
+
+function joinConfirmShipmentTsvLines(lines = []) {
+  return lines.map(line => String(line || "").replace(/\r?\n/g, "")).join(CONFIRM_SHIPMENT_TSV_EOL) + CONFIRM_SHIPMENT_TSV_EOL;
+}
+
+function auditTsvLineBreaks(tsvContent = "") {
+  const text = String(tsvContent || "");
+  const lines = text.split(/\r?\n/);
+  return {
+    hasCRLF: /\r\n/.test(text),
+    crlfCount: (text.match(/\r\n/g) || []).length,
+    lfCount: (text.match(/(?<!\r)\n/g) || []).length,
+    lineCount: lines.filter(Boolean).length,
+    headerLine: lines[0] || "",
+    firstDataLine: lines[1] || "",
+    headerEndsWithShipMethod: (lines[0] || "").endsWith("\tship-method") || (lines[0] || "").endsWith("ship-method"),
+    headerDataConcatenated: /ship-method\d{3}-\d{7}-\d{7}/.test(text)
+  };
+}
+
+function validateConfirmShipmentTsv(tsvContent = "") {
+  const requiredHeaders = ["order-id", "ship-date", "carrier-code", "tracking-number", "ship-method"];
+  const trimmedLines = String(tsvContent || "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\r$/, ""))
+    .filter((line) => line.trim());
+
+  if (trimmedLines.length < 2) {
+    throw createAmazonUploadError(
+      "AMAZON_TSV_VALIDATION_FAILED",
+      "Confirm shipment TSV must include a header row and at least one tracking row."
+    );
+  }
+
+  const headers = trimmedLines[0].split("\t").map((header) => header.trim());
+  const missingHeaders = requiredHeaders.filter((header) => !headers.includes(header));
+  if (missingHeaders.length) {
+    throw createAmazonUploadError(
+      "AMAZON_TSV_VALIDATION_FAILED",
+      `Confirm shipment TSV is missing required headers: ${missingHeaders.join(", ")}.`
+    );
+  }
+
+  const indexByHeader = Object.fromEntries(headers.map((header, index) => [header, index]));
+  const carrierBreakdown = {};
+  const invalidRows = [];
+  const normalizedShipDateRows = [];
+  const shipDateNormalizationDetails = [];
+  const marketplaceToday = formatDateYmdInTimeZone(new Date(), AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE);
+  const shipDateIndex = indexByHeader["ship-date"];
+
+  const normalizedRows = trimmedLines.slice(1).map((line, rowIndex) => {
+    const cols = line.split("\t").map((col) => col.trim());
+    const orderId = cols[indexByHeader["order-id"]] || "";
+    const trackingNumber = cols[indexByHeader["tracking-number"]] || "";
+    const carrierCode = cols[indexByHeader["carrier-code"]] || "UNKNOWN";
+    const originalShipDate = cols[shipDateIndex] || "";
+    let normalizedShipDate = normalizeShipDateForAmazonConfirmShipment(originalShipDate);
+    if (!originalShipDate || !/^\d{4}-\d{2}-\d{2}$/.test(originalShipDate) || originalShipDate !== normalizedShipDate) {
+      normalizedShipDateRows.push(rowIndex + 2);
+      shipDateNormalizationDetails.push({
+        rowNumber: rowIndex + 2,
+        originalShipDate,
+        normalizedShipDate,
+        clampedToMarketplaceToday: compareYmd(originalShipDate, marketplaceToday) > 0 && normalizedShipDate === marketplaceToday,
+      });
+    }
+    cols[shipDateIndex] = normalizedShipDate;
+
+    if (!orderId || !trackingNumber) {
+      invalidRows.push(rowIndex + 2);
+    }
+
+    carrierBreakdown[carrierCode] = (carrierBreakdown[carrierCode] || 0) + 1;
+    return headers.map((_, index) => cols[index] || "").join("\t");
+  });
+
+  if (invalidRows.length) {
+    throw createAmazonUploadError(
+      "AMAZON_TSV_VALIDATION_FAILED",
+      `Confirm shipment TSV has empty order-id or tracking-number on row(s): ${invalidRows.slice(0, 20).join(", ")}.`
+    );
+  }
+
+  extensionLogger?.logInfo("[UPLOAD_TRACKING] TSV validation passed", {
+    rows: normalizedRows.length,
+    carrierBreakdown,
+    shipDateNormalizedRows: normalizedShipDateRows.length,
+  });
+  debugLog(`[UPLOAD_TRACKING] Carrier breakdown: ${JSON.stringify(carrierBreakdown)}`, "info");
+  if (normalizedShipDateRows.length) {
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] ship-date normalized for Amazon marketplace timezone", {
+      rowsNormalized: normalizedShipDateRows.length,
+      rowNumbers: normalizedShipDateRows.slice(0, 20).join(","),
+      marketplaceTimeZone: AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE,
+      marketplaceToday,
+      examples: shipDateNormalizationDetails.slice(0, 5),
+    });
+  }
+
+  const outputLines = [
+    headers.join("\t"),
+    ...normalizedRows
+  ];
+
+  return {
+    content: joinConfirmShipmentTsvLines(outputLines),
+    rows: normalizedRows.length,
+    carrierBreakdown,
+    shipDateNormalizedRows: normalizedShipDateRows,
+    shipDateNormalizationDetails,
+    shipDateFutureClampedRows: shipDateNormalizationDetails
+      .filter((row) => row.clampedToMarketplaceToday)
+      .map((row) => row.rowNumber),
+    marketplaceToday,
+    marketplaceTimeZone: AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE,
+    lineEnding: "CRLF"
+  };
 }
 
 async function uploadtracking() {
@@ -506,16 +2044,20 @@ async function uploadtracking() {
 
     // Build TSV content
     const tsvLines = pendingOrders.map((o) => {
-      const tracking = o.tracking || "";
-      const shipDate = new Date().toISOString();
+      const tracking = String(o.tracking || "").trim();
+      const shipDate = normalizeShipDateForAmazonConfirmShipment(new Date());
       const { carrierCode, shipMethod } = resolveCarrierInfo(tracking);
 
       return `${o.orderId}\t${shipDate}\t${carrierCode}\t${tracking}\t${shipMethod}`;
     });
 
-    const tsvContent =
-      "order-id\tship-date\tcarrier-code\ttracking-number\tship-method\n" +
-      tsvLines.join("\n");
+    const rawTsvContent =
+      joinConfirmShipmentTsvLines([
+        "order-id\tship-date\tcarrier-code\ttracking-number\tship-method",
+        ...tsvLines
+      ]);
+    const validatedTsv = validateConfirmShipmentTsv(rawTsvContent);
+    const tsvContent = validatedTsv.content;
 
     const filename = `tracking-auto-${Date.now()}.txt`;
     const fileObj = new File(
@@ -529,7 +2071,7 @@ async function uploadtracking() {
       filename,
       ordersCount: pendingOrders.length,
       fileSize: tsvContent.length,
-
+      carrierBreakdown: validatedTsv.carrierBreakdown,
     });
 
     await uploadToAmazon(fileObj, {
@@ -537,7 +2079,7 @@ async function uploadtracking() {
       ordersCount: pendingOrders.length,
       carrierCode: "Mixed",
       shipMethod: "Mixed",
-      shipDate: new Date().toISOString(),
+      shipDate: normalizeShipDateForAmazonConfirmShipment(new Date()),
     });
 
     const batchRes = await fetch(`${base}/api/shipping-batch/create-from-orders`, {
@@ -1167,7 +2709,7 @@ async function injectAdsMainWorldSniffer(tabId) {
             } else {
               Object.entries(headers).forEach(([k, v]) => (out[String(k).toLowerCase()] = String(v)));
             }
-          } catch (_) {}
+          } catch (_) { }
           return out;
         }
 
@@ -1205,7 +2747,7 @@ async function injectAdsMainWorldSniffer(tabId) {
               };
               publish(merged);
             }
-          } catch (_) {}
+          } catch (_) { }
           return nativeFetch.apply(this, arguments);
         };
 
@@ -1222,7 +2764,7 @@ async function injectAdsMainWorldSniffer(tabId) {
         XMLHttpRequest.prototype.setRequestHeader = function patchedSetRequestHeader(name, value) {
           try {
             this.__apoAdsHeaders[String(name).toLowerCase()] = String(value);
-          } catch (_) {}
+          } catch (_) { }
           return nativeSetRequestHeader.apply(this, arguments);
         };
 
@@ -1231,7 +2773,7 @@ async function injectAdsMainWorldSniffer(tabId) {
             if (this.__apoAdsUrl && shouldCapture(this.__apoAdsUrl)) {
               publish(this.__apoAdsHeaders || {});
             }
-          } catch (_) {}
+          } catch (_) { }
           return nativeSend.apply(this, arguments);
         };
       },
@@ -1257,7 +2799,7 @@ async function ensureAdsBridgeInjected(tabId) {
   await injectAdsMainWorldSniffer(tabId);
 }
 
-async function adsRetrieveViaContentScript(payload) {
+async function adsRetrieveViaContentScript(payload, options = {}) {
   const tabId = await ensureAdsTab();
   await ensureAdsBridgeInjected(tabId);
 
@@ -1266,6 +2808,7 @@ async function adsRetrieveViaContentScript(payload) {
       type: "ADS_FETCH_REPORT",
       url: ADS_RETRIEVE_URL,
       payload,
+      options,
     });
 
   let lastError = null;
@@ -1288,42 +2831,64 @@ async function fetchAdsJsonCS(payload, options = {}) {
 
   const maxAttempts = Number(options.maxAttempts || 2);
   let lastError = null;
+  const reportConfig = payload?.reportConfig || {};
+  const pagination = reportConfig?.offsetPagination || {};
+  const requestMeta = {
+    startDate: reportConfig.startDate,
+    endDate: reportConfig.endDate,
+    offset: pagination.offset,
+    size: pagination.size,
+    isCheckCampain: !!options.isCheckCampain,
+    runId: options.runId,
+    lockOwner: !!options.lockOwner,
+    taskName: options.taskName,
+  };
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       if (attempt > 1) {
         debugLog(`🔁 [ADS-AUTH] Retrying retrieveReport after auth refresh (${attempt}/${maxAttempts})`, "info");
-        await ensureFreshAdsHeaders({ force: true, reason: `retry-${attempt}` });
+        // Headers were refreshed by the lock owner before this retry.
       }
 
       extensionLogger?.logInfo("[IMPORT_ADS_SPEND] Making Amazon Ads API call via content script", {
         attempt,
         maxAttempts,
         payloadKeys: Object.keys(payload || {}),
-        startDate: payload?.startDate,
-        endDate: payload?.endDate,
-        offset: payload?.offset,
-        size: payload?.size,
+        ...requestMeta,
         timestamp: new Date().toISOString(),
       });
 
-      const r = await adsRetrieveViaContentScript(payload);
+      const r = await adsRetrieveViaContentScript(payload, { ...options, ...requestMeta, attempt, maxAttempts });
       if (!r) throw createAdsError("retrieveReport no response", 0, "");
 
       const sample = typeof r.text === "string" ? r.text : JSON.stringify(r.text || "");
+      extensionLogger?.logInfo("[IMPORT_ADS_SPEND] Amazon Ads API HTTP response", {
+        ...requestMeta,
+        attempt,
+        status: r.status,
+        ok: r.ok,
+      });
 
       if (!r.ok) {
         const error = createAdsError(`retrieveReport ${r.status} — ${sample.slice(0, 200)}`, r.status, sample);
         extensionLogger?.logError(error, {
           status: r.status,
           attempt,
+          ...requestMeta,
           responseText: sample.slice(0, 500),
           payload,
           endpoint: "Amazon Ads API",
         }, "[IMPORT_ADS_SPEND] Amazon Ads API request failed");
 
         if (isAdsAuthError(error) && attempt < maxAttempts) {
-          await clearAdsHeaders(`retrieveReport-${r.status}`);
+          if (!isAdsLockOwner(options.runId)) {
+            const ownerError = createAdsError("ADS_LOCK_NOT_OWNER: cannot refresh Ads headers while another Ads task owns the lock", r.status, sample);
+            ownerError.code = "ADS_LOCK_NOT_OWNER";
+            throw ownerError;
+          }
+          await clearAdsHeaders(`retrieveReport-${r.status}`, options);
+          await forceRefreshAdsHeaders({ ...options, reason: `retrieveReport-${r.status}` });
           lastError = error;
           continue;
         }
@@ -1336,6 +2901,7 @@ async function fetchAdsJsonCS(payload, options = {}) {
         extensionLogger?.logInfo("[IMPORT_ADS_SPEND] Amazon Ads API response received", {
           status: r.status,
           attempt,
+          ...requestMeta,
           responseSize: r.text?.length || 0,
           numberOfRecords: report?.numberOfRecords || 0,
           dataRows: Array.isArray(report?.data) ? report.data.length : 0,
@@ -1348,6 +2914,7 @@ async function fetchAdsJsonCS(payload, options = {}) {
         error.parseError = parseError.message;
         extensionLogger?.logError(error, {
           attempt,
+          ...requestMeta,
           responseText: sample.slice(0, 500),
           parseError: parseError.message,
           payload,
@@ -1355,7 +2922,13 @@ async function fetchAdsJsonCS(payload, options = {}) {
         }, "[IMPORT_ADS_SPEND] Amazon Ads API returned non-JSON response");
 
         if (isAdsAuthError(error) && attempt < maxAttempts) {
-          await clearAdsHeaders("retrieveReport-non-json-auth-page");
+          if (!isAdsLockOwner(options.runId)) {
+            const ownerError = createAdsError("ADS_LOCK_NOT_OWNER: cannot refresh Ads headers while another Ads task owns the lock", r.status || 0, sample);
+            ownerError.code = "ADS_LOCK_NOT_OWNER";
+            throw ownerError;
+          }
+          await clearAdsHeaders("retrieveReport-non-json-auth-page", options);
+          await forceRefreshAdsHeaders({ ...options, reason: "retrieveReport-non-json-auth-page" });
           lastError = error;
           continue;
         }
@@ -1364,7 +2937,13 @@ async function fetchAdsJsonCS(payload, options = {}) {
     } catch (error) {
       lastError = error;
       if (isAdsAuthError(error) && attempt < maxAttempts) {
-        await clearAdsHeaders(`catch-${error.status || error.code || "auth"}`);
+        if (!isAdsLockOwner(options.runId)) {
+          const ownerError = createAdsError("ADS_LOCK_NOT_OWNER: cannot refresh Ads headers while another Ads task owns the lock", error.status || 0, error.responseText || error.message || "");
+          ownerError.code = "ADS_LOCK_NOT_OWNER";
+          throw ownerError;
+        }
+        await clearAdsHeaders(`catch-${error.status || error.code || "auth"}`, options);
+        await forceRefreshAdsHeaders({ ...options, reason: `catch-${error.status || error.code || "auth"}` });
         continue;
       }
       throw error;
@@ -1412,7 +2991,8 @@ async function fetchAllCampaignSpend(
   startDate,
   endDate,
   pageSize = 300,
-  isCheckCampain = false
+  isCheckCampain = false,
+  options = {}
 ) {
   // Initialize logger if not exists
   if (!extensionLogger) {
@@ -1439,7 +3019,8 @@ async function fetchAllCampaignSpend(
         size: Math.max(1, Math.min(pageSize, 300)),
         offset: 0,
         isCheckCampain,
-      })
+      }),
+      { ...options, isCheckCampain, pageOffset: 0, pageSize: Math.max(1, Math.min(pageSize, 300)) }
     );
 
     const report0 = firstJson?.report || firstJson?.data?.report || {};
@@ -1493,7 +3074,8 @@ async function fetchAllCampaignSpend(
           size: pageSize,
           offset: page * pageSize,
           isCheckCampain,
-        })
+        }),
+        { ...options, isCheckCampain, pageOffset: page * pageSize, pageSize }
       );
       const report = js?.report || js?.data?.report || {};
       const more = Array.isArray(report?.data) ? report.data : [];
@@ -1561,6 +3143,10 @@ function campaignRowsToTxt(rows) {
 }
 
 async function runExportAdsSpend(date) {
+  return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked(date, lock));
+}
+
+async function runExportAdsSpendLocked(date, lock = {}) {
   const startTime = Date.now();
 
   // Initialize logger if not exists
@@ -1595,7 +3181,7 @@ async function runExportAdsSpend(date) {
   const { adsSpendUrl } = deriveApiUrls(ingestUrl);
 
   // Đảm bảo Ads headers còn hạn trước khi gọi Ads API
-  await ensureFreshAdsHeaders({ reason: "runExportAdsSpend" });
+  await ensureFreshAdsHeaders({ ...lock, reason: "runExportAdsSpend" });
 
   if (!date) {
     const error = new Error("date (YYYY-MM-DD) required");
@@ -1618,7 +3204,7 @@ async function runExportAdsSpend(date) {
       });
     }
 
-    const rows = await fetchAllCampaignSpend(date, date, 300);
+    const rows = await fetchAllCampaignSpend(date, date, 300, false, lock);
 
     // Log data processing
     if (extensionLogger) {
@@ -1686,36 +3272,117 @@ async function runExportAdsSpend(date) {
    UPLOAD TRACKING - Upload file TXT lên Amazon
    =============================== */
 
-async function uploadToAmazon(fileObj, uploadParams) {
+function computeUploadTrackingChecksum(text = "") {
+  let hash = 5381;
+  const str = String(text || "");
+  for (let i = 0; i < str.length; i += 1) {
+    hash = ((hash << 5) + hash + str.charCodeAt(i)) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+async function uploadToAmazon(fileObj, uploadParams = {}) {
   const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
   const startTime = Date.now();
+  const uploadTaskId = uploadParams?.taskId || uploadParams?.batchId || `upload_${startTime}`;
+  const uploadBatchId = uploadParams?.batchId || uploadTaskId;
+  let stableFileObj = fileObj;
+  let finalTsvHeader = "";
+  let finalTsvFirstDataLine = "";
+  let finalTsvLineCount = 0;
+  let finalTsvChecksum = "";
+  let finalTsvLength = 0;
+  let preflight = null;
+  let pageUploadResult = null;
 
-  // Initialize logger if not exists
-  if (!extensionLogger) {
-    await initializeLogger();
-  }
+  if (!extensionLogger) await initializeLogger();
 
   try {
-    console.log(`[UPLOAD_TRACKING] Starting upload for file: ${fileObj.name}`);
-    debugLog(`🚀 [UPLOAD_TRACKING] Starting upload for: ${fileObj.name}`, 'info');
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 00 uploadToAmazon entered", {
+      buildId: AMAZON_UPLOADFEED_BUILD_ID,
+      taskId: uploadTaskId,
+      batchId: uploadBatchId,
+      filename: stableFileObj?.name,
+      fileSize: stableFileObj?.size,
+    });
 
-    // Log upload start with extension logger
+    const originalTsv = typeof stableFileObj?.text === "function" ? await stableFileObj.text() : "";
+    const validatedTsv = validateConfirmShipmentTsv(originalTsv);
+    stableFileObj = new File([validatedTsv.content], stableFileObj.name, {
+      type: stableFileObj.type || "text/tab-separated-values; charset=utf-8",
+    });
+    const lineBreakAudit = auditTsvLineBreaks(validatedTsv.content);
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] ConfirmShipment TSV line break audit", {
+      hasCRLF: lineBreakAudit.hasCRLF,
+      crlfCount: lineBreakAudit.crlfCount,
+      lfCount: lineBreakAudit.lfCount,
+      lineCount: lineBreakAudit.lineCount,
+      headerLine: lineBreakAudit.headerLine,
+      firstDataLine: lineBreakAudit.firstDataLine,
+      headerDataConcatenated: lineBreakAudit.headerDataConcatenated,
+    }, lineBreakAudit.headerDataConcatenated ? "error" : "success");
+    if (lineBreakAudit.headerDataConcatenated) {
+      throw createAmazonUploadError(
+        "AMAZON_TSV_VALIDATION_FAILED",
+        "Confirm shipment TSV header and first data row are concatenated; missing newline after header.",
+        { lineBreakAudit }
+      );
+    }
+    await chrome.storage.local.set({
+      lastUploadTrackingFinalTsv: {
+        batchId: uploadBatchId,
+        taskId: uploadTaskId,
+        filename: stableFileObj.name,
+        content: validatedTsv.content,
+        contentJsonPreview: JSON.stringify(validatedTsv.content.slice(0, 500)),
+        lineBreakAudit,
+        rows: validatedTsv.rows,
+        tsvLength: validatedTsv.content.length,
+        tsvChecksum: computeUploadTrackingChecksum(validatedTsv.content),
+        createdAt: new Date().toISOString()
+      }
+    });
+    const finalLines = validatedTsv.content.replace(/\n$/, "").split(/\r?\n/);
+    finalTsvHeader = finalLines[0] || "";
+    finalTsvFirstDataLine = finalLines[1] || "";
+    finalTsvLineCount = finalLines.filter((line) => line.trim()).length;
+    finalTsvChecksum = computeUploadTrackingChecksum(validatedTsv.content);
+    finalTsvLength = validatedTsv.content.length;
+
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] ConfirmShipment ship-date audit", {
+      marketplaceTimeZone: AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE,
+      marketplaceToday: validatedTsv.marketplaceToday || formatDateYmdInTimeZone(new Date()),
+      finalTsvFirstDataLine,
+      shipDateFutureClampedRows: (validatedTsv.shipDateFutureClampedRows || []).join(","),
+    }, "info");
+
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 02 TSV validation complete", {
+      rows: validatedTsv.rows,
+      tsvLength: finalTsvLength,
+      tsvChecksum: finalTsvChecksum,
+      finalTsvHeader,
+      finalTsvFirstDataLine,
+    }, "success");
+
     if (extensionLogger) {
-      await extensionLogger.logUploadStarted({
-        filename: fileObj.name,
-        fileSize: fileObj.size,
-        progress: 0,
-        carrier: uploadParams?.carrierCode,
-        shipMethod: uploadParams?.shipMethod,
-        ordersUploaded: 0
-      }, {
-        taskId: `upload_${Date.now()}`,
-        taskType: 'UPLOAD_TRACKING',
-        batchId: uploadParams?.batchId || `upload_${Date.now()}`
-      }, 'Starting upload to Amazon Seller Central');
+      await extensionLogger.logUploadStarted(
+        {
+          filename: stableFileObj.name,
+          fileSize: stableFileObj.size,
+          progress: 0,
+          carrier: uploadParams?.carrierCode,
+          shipMethod: uploadParams?.shipMethod,
+          ordersUploaded: 0,
+        },
+        {
+          taskId: uploadTaskId,
+          taskType: "UPLOAD_TRACKING",
+          batchId: uploadBatchId,
+        },
+        "Starting upload to Amazon Seller Central"
+      );
     }
 
-    // Log upload start
     await postLogSingle({
       base,
       token: (await getCfg()).ingestToken,
@@ -1724,365 +3391,233 @@ async function uploadToAmazon(fileObj, uploadParams) {
       label: clientLabel,
       action: "auto",
       level: "info",
-      message: `🚀 Starting upload to Amazon: ${fileObj.name}`
+      message: `Starting upload to Amazon: ${stableFileObj.name}`,
     });
 
-    // First, get CSRF token by visiting the feeds page
-    let csrfToken = uploadParams?.csrfToken;
+    preflight = await getSellerCentralUploadPagePreflight({ taskId: uploadTaskId, batchId: uploadBatchId });
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 07B Seller Central page preflight result", {
+      ok: preflight.ok,
+      tabId: preflight.tabId,
+      finalUrl: preflight.finalUrl,
+      pageTitle: preflight.pageTitle,
+      tabStatus: preflight.tabStatus,
+      feedsPage: preflight.feedsPage,
+      isLoginPage: preflight.isLoginPage,
+      isOtpPage: preflight.isOtpPage,
+      isCaptchaPage: preflight.isCaptchaPage,
+      isMarketplaceSelector: preflight.isMarketplaceSelector,
+      isSellerCentralPage: preflight.isSellerCentralPage,
+      allowUpload: preflight.allowUpload,
+      snifferInstalled: preflight.snifferInstalled,
+    }, preflight.allowUpload ? "success" : "error");
 
-    // Log initial CSRF token status
-    debugLog(`🔍 [UPLOAD_TRACKING] Initial CSRF token: ${csrfToken ? 'Provided' : 'Not provided'}`, 'info');
-    if (csrfToken) {
-      debugLog(`🔑 [UPLOAD_TRACKING] Provided CSRF token preview: ${csrfToken.slice(0, 20)}...`, 'info');
+    if (!preflight.allowUpload) {
+      throw createAmazonUploadError(
+        "AMAZON_AUTH_REQUIRED",
+        "Amazon Seller Central feeds page is not ready for upload. Log in, clear any OTP/captcha/marketplace selector, then retry.",
+        { preflight, retryable: true, userActionRequired: true }
+      );
     }
 
-    if (!csrfToken) {
-      debugLog(`🔍 [UPLOAD_TRACKING] Getting CSRF token from feeds page...`, 'info');
+    const readiness = await getUploadFeedReadinessStatus({
+      skipSellerCentralPreflight: true,
+      preflight,
+    });
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed readiness before request", {
+      ok: readiness.ok,
+      sellerCentralReady: readiness.sellerCentralReady,
+      csrfCacheValid: readiness.csrfCacheValid,
+      csrfTokenFound: readiness.csrfTokenFound,
+      csrfTokenLength: readiness.csrfTokenLength,
+      csrfSource: readiness.csrfSource || "none",
+      csrfAgeMin: readiness.csrfAgeMin,
+      isTestToken: readiness.isTestToken,
+      needLogin: readiness.needLogin,
+      needCsrfSeed: readiness.needCsrfSeed,
+    }, readiness.ok ? "success" : "error");
 
-      // Log CSRF token retrieval
-      if (extensionLogger) {
-        await extensionLogger.logInfo('Retrieving CSRF token from Amazon feeds page', {
-          endpoint: '/order-reports-and-feeds/feeds',
-          timestamp: new Date().toISOString()
+    if (!readiness.sellerCentralReady) {
+      throw createAmazonUploadError(
+        "AMAZON_AUTH_REQUIRED",
+        "Amazon Seller Central feeds page is not ready for upload. Log in, clear any OTP/captcha/marketplace selector, then retry.",
+        { preflight, retryable: true, userActionRequired: true }
+      );
+    }
+
+    if (!readiness.csrfCacheValid) {
+      if (readiness.csrfTokenFound) {
+        await clearUploadFeedCsrfCache("csrf_cache_invalid_before_upload", {
+          code: "AMAZON_UPLOAD_CSRF_SEED_REQUIRED",
+          status: 0,
         });
       }
-
-      try {
-        // Visit the feeds page to get CSRF token
-        const feedsPageUrl = "https://sellercentral.amazon.com/order-reports-and-feeds/feeds";
-        debugLog(`📄 [UPLOAD_TRACKING] Fetching feeds page: ${feedsPageUrl}`, 'info');
-
-        const feedsResponse = await requestOnce(feedsPageUrl, {
-          method: 'GET'
-        });
-
-        debugLog(`📄 [UPLOAD_TRACKING] Feeds page response: ${feedsResponse.status} ${feedsResponse.statusText}`,
-          feedsResponse.ok ? 'success' : 'error');
-
-        if (feedsResponse.ok) {
-          const feedsHtml = await feedsResponse.text();
-          debugLog(`📄 [UPLOAD_TRACKING] Feeds page loaded, size: ${feedsHtml.length} chars`, 'info');
-
-          // Extract CSRF token from the page HTML
-          // Look for patterns like: csrfToken":"TOKEN_VALUE" or name="csrfToken" value="TOKEN_VALUE"
-          const csrfMatches = [
-            /csrfToken['"]\s*:\s*['"]([^'"]+)['"]/i,
-            /name=['"]csrfToken['"][^>]*value=['"]([^'"]+)['"]/i,
-            /anti-csrftoken-a2z['"]\s*:\s*['"]([^'"]+)['"]/i,
-            /"csrfToken"\s*:\s*"([^"]+)"/i,
-            /window\.csrfToken\s*=\s*['"]([^'"]+)['"]/i,
-            /data-csrf-token=['"]([^'"]+)['"]/i
-          ];
-
-          debugLog(`� [UPLOAD_TRACKINxG] Trying ${csrfMatches.length} CSRF token patterns...`, 'info');
-
-          for (const [index, regex] of csrfMatches.entries()) {
-            const match = feedsHtml.match(regex);
-            if (match && match[1]) {
-              csrfToken = match[1];
-              debugLog(`🔑 [UPLOAD_TRACKING] CSRF Token extracted with pattern ${index + 1}: ${csrfToken.slice(0, 20)}...`, 'success');
-
-              // Log successful CSRF extraction
-              if (extensionLogger) {
-                await extensionLogger.logInfo('CSRF token extracted successfully', {
-                  source: 'feeds_page',
-                  pattern: index + 1,
-                  tokenLength: csrfToken.length,
-                  tokenPreview: csrfToken.slice(0, 20) + '...',
-                  timestamp: new Date().toISOString()
-                });
-              }
-              break;
-            } else {
-              debugLog(`❌ [UPLOAD_TRACKING] Pattern ${index + 1} failed`, 'info');
-            }
-          }
-        } else {
-          debugLog(`❌ [UPLOAD_TRACKING] Failed to fetch feeds page: ${feedsResponse.status}`, 'error');
+      throw createAmazonUploadError(
+        "AMAZON_UPLOAD_CSRF_SEED_REQUIRED",
+        "Open Seller Central feeds page and perform one manual upload to seed uploadFeed csrfToken.",
+        {
+          retryable: true,
+          userActionRequired: true,
+          event: "csrf_seed_required",
         }
-      } catch (error) {
-        debugLog(`⚠️ [UPLOAD_TRACKING] Failed to get CSRF from page: ${error.message}`, 'error');
-
-        // Log CSRF extraction error
-        if (extensionLogger) {
-          await extensionLogger.logError(error, {
-            source: 'feeds_page',
-            endpoint: '/order-reports-and-feeds/feeds'
-          }, 'Failed to extract CSRF token from feeds page');
-        }
-      }
+      );
     }
 
-    // Fallback: try to get from cookie
-    if (!csrfToken) {
-      debugLog(`🍪 [UPLOAD_TRACKING] Trying to get CSRF token from cookie...`, 'info');
-      csrfToken = await getCookie("https://sellercentral.amazon.com/", "anti-csrftoken-a2z");
-      if (csrfToken) {
-        debugLog(`🔑 [UPLOAD_TRACKING] CSRF Token from cookie: ${csrfToken.slice(0, 20)}...`, 'info');
-
-        // Log cookie CSRF retrieval
-        if (extensionLogger) {
-          await extensionLogger.logInfo('CSRF token retrieved from cookie', {
-            source: 'cookie',
-            tokenLength: csrfToken.length,
-            tokenPreview: csrfToken.slice(0, 20) + '...',
-            timestamp: new Date().toISOString()
-          });
-        }
-      } else {
-        debugLog(`❌ [UPLOAD_TRACKING] No CSRF token found in cookie`, 'error');
-      }
-    }
-
-    debugLog(`🔑 [UPLOAD_TRACKING] Final CSRF Token: ${csrfToken ? 'Found' : 'Missing'}`, csrfToken ? 'success' : 'error');
-
-    // Debug: Check critical cookies before upload
-    debugLog(`🍪 [UPLOAD_TRACKING] Checking authentication cookies...`, 'info');
-    log(`🍪 Checking authentication cookies...`);
-    const criticalCookies = {
-      'session-id': await getCookie("https://sellercentral.amazon.com/", "session-id"),
-      'session-token': await getCookie("https://sellercentral.amazon.com/", "session-token"),
-      'ubid-main': await getCookie("https://sellercentral.amazon.com/", "ubid-main"),
-      'anti-csrftoken-a2z': await getCookie("https://sellercentral.amazon.com/", "anti-csrftoken-a2z")
+    const cookieFlags = {
+      sessionId: !!(await getCookie(`${SC_BASE}/`, "session-id")),
+      sessionToken: !!(await getCookie(`${SC_BASE}/`, "session-token")),
+      ubidMain: !!(await getCookie(`${SC_BASE}/`, "ubid-main")),
+      csrfCookieFound: !!(await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z")),
     };
-
-    for (const [name, value] of Object.entries(criticalCookies)) {
-      debugLog(`  - ${name}: ${value ? 'Found' : 'Missing'}`, value ? 'success' : 'error');
-      log(`  - ${name}: ${value ? 'Found' : 'Missing'}`);
+    if (!cookieFlags.sessionId || !cookieFlags.sessionToken) {
+      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] Seller Central tab preflight passed; continuing despite missing cookie API session flags", cookieFlags);
     }
 
-    if (!criticalCookies['session-id'] || !criticalCookies['session-token']) {
-      debugLog(`⚠️ [UPLOAD_TRACKING] Critical session cookies missing - upload likely to fail`, 'error');
-      log(`⚠️ Critical session cookies missing - upload likely to fail`);
-    }
-
-    // Amazon Seller Central upload endpoint
-    const uploadEndpoints = [
-      "https://sellercentral.amazon.com/order-reports-and-feeds/api/uploadFeed",
-      "https://sellercentral.amazon.com/feeds/api/uploadFeed",
-      "https://sellercentral.amazon.com/api/feeds/upload",
-      "https://sellercentral.amazon.com/order-reports-and-feeds/feeds/api/upload"
-    ];
-
-    let uploadUrl = uploadEndpoints[0]; // Default
-    debugLog(`📡 [UPLOAD_TRACKING] Upload endpoint: ${uploadUrl}`, 'info');
-    log(`📡 Trying upload endpoint: ${uploadUrl}`);
-
-    // Prepare FormData for Amazon upload (exactly like DevTools)
-    const formData = new FormData();
-    formData.append('feedFile', fileObj); // Binary file
-    formData.append('feedName', 'confirmShipment');
-    formData.append('feedVersion', 'new');
-
-    debugLog(`📦 [UPLOAD_TRACKING] FormData prepared:`, 'info');
-    debugLog(`  - feedFile: ${fileObj.name} (${fileObj.size} bytes)`, 'info');
-    debugLog(`  - feedName: confirmShipment`, 'info');
-    debugLog(`  - feedVersion: new`, 'info');
-
-    if (csrfToken) {
-      formData.append('csrfToken', csrfToken);
-      debugLog(`🔑 [UPLOAD_TRACKING] CSRF Token added to FormData: ${csrfToken.slice(0, 30)}...`, 'info');
-    } else {
-      debugLog(`⚠️ [UPLOAD_TRACKING] No CSRF Token - upload will likely fail`, 'error');
-
-      // Log missing CSRF token
-      if (extensionLogger) {
-        await extensionLogger.logError(new Error('No CSRF token available'), {
-          uploadUrl: uploadUrl,
-          filename: fileObj.name
-        }, 'Upload proceeding without CSRF token - likely to fail');
-      }
-    }
-
-    console.log(`[UPLOAD_TRACKING] Uploading to: ${uploadUrl}`);
-    debugLog(`🚀 [UPLOAD_TRACKING] Starting upload request...`, 'info');
-
-    // Log upload attempt with extension logger
-    if (extensionLogger) {
-      await extensionLogger.logInfo('Sending file to Amazon Seller Central', {
-        filename: fileObj.name,
-        progress: 50,
-        ordersUploaded: 0
-      });
-    }
-
-    // Log upload attempt
-    await postLogSingle({
-      base,
-      token: (await getCfg()).ingestToken,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: "auto",
-      level: "info",
-      message: `📡 Uploading to Amazon Seller Central...`
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 08 FormData contract expected", {
+      fields: "feedFile|feedName|feedVersion|csrfToken",
+      csrfExpected: true,
+      csrfHeaderIncluded: false,
+      finalTsvHeader,
+      finalTsvFirstDataLine,
+      finalTsvLineCount,
+      finalTsvChecksum,
+      finalTsvLength,
+      filename: stableFileObj.name,
+      fileSize: stableFileObj.size,
     });
 
-    // Upload using requestOnce (same pattern as requestReferenceIdNew)
-    debugLog(`📤 [UPLOAD_TRACKING] Sending request to Amazon...`, 'info');
     const requestStartTime = Date.now();
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 09 strategy selected", {
+      strategy: "sellerCentralTabPageContext",
+      csrfHeaderIncluded: false,
+      filename: stableFileObj.name,
+      fileSize: stableFileObj.size,
+      tsvChecksum: finalTsvChecksum,
+    });
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 10 request sending", {
+      strategy: "sellerCentralTabPageContext",
+      uploadPath: AMAZON_UPLOADFEED_URL_PATH,
+      filename: stableFileObj.name,
+    });
 
-    let response;
-    let currentEndpointIndex = 0;
+    pageUploadResult = await uploadToAmazonFromSellerCentralTab(stableFileObj, uploadParams);
+    const requestDuration = Date.now() - requestStartTime;
+    const response = sellerCentralTabUploadResultToResponse(pageUploadResult);
+    const contentType = response.headers.get("content-type") || "";
+    const responseText = pageUploadResult?.textPreview || "";
 
-    // Try multiple endpoints if first one fails with 404
-    while (currentEndpointIndex < uploadEndpoints.length) {
-      uploadUrl = uploadEndpoints[currentEndpointIndex];
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed FormData runtime result", {
+      fields: "feedFile|feedName|feedVersion|csrfToken",
+      csrfIncluded: !!pageUploadResult?.csrfIncluded,
+      csrfSource: pageUploadResult?.csrfSource || "none",
+      csrfTokenLength: pageUploadResult?.csrfTokenLength || 0,
+      liveExtractionFound: !!pageUploadResult?.liveExtractionFound,
+      cachedTokenFound: !!pageUploadResult?.cachedTokenFound,
+      snifferInstalled: !!pageUploadResult?.snifferInstalled,
+      world: pageUploadResult?.world,
+      status: response.status,
+    }, pageUploadResult?.csrfIncluded ? "success" : "error");
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 11 response received", {
+      status: response.status,
+      statusText: response.statusText,
+      contentType,
+      url: response.url,
+      requestDuration,
+      world: pageUploadResult?.world,
+      csrfHeaderIncluded: false,
+    }, response.ok ? "success" : "error");
 
-      if (currentEndpointIndex > 0) {
-        debugLog(`🔄 [UPLOAD_TRACKING] Trying alternative endpoint ${currentEndpointIndex + 1}: ${uploadUrl}`, 'info');
-        log(`🔄 Trying alternative endpoint ${currentEndpointIndex + 1}: ${uploadUrl}`);
-      }
-
-      response = await requestOnce(uploadUrl, {
-        method: 'POST',
-        body: formData
-      });
-
-      // If not 404, break (either success or other error)
-      if (response.status !== 404) {
-        break;
-      }
-
-      debugLog(`❌ [UPLOAD_TRACKING] Endpoint ${currentEndpointIndex + 1} returned 404, trying next...`, 'error');
-      log(`❌ Endpoint ${currentEndpointIndex + 1} returned 404, trying next...`);
-      currentEndpointIndex++;
-      return;
+    if (pageUploadResult?.code === "AMAZON_UPLOAD_CSRF_FORM_FIELD_MISSING") {
+      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrfToken FormData field missing", {
+        world: pageUploadResult?.world,
+        finalUrl: pageUploadResult?.finalUrl || pageUploadResult?.url || "",
+        pageTitle: pageUploadResult?.pageTitle || "",
+        readyState: pageUploadResult?.readyState || "",
+        isSellerCentralPage: !!pageUploadResult?.isSellerCentralPage,
+        isFeedsPage: !!pageUploadResult?.isFeedsPage,
+        csrfSource: pageUploadResult?.csrfSource || "none",
+        csrfTokenLength: pageUploadResult?.csrfTokenLength || 0,
+        liveExtractionFound: !!pageUploadResult?.liveExtractionFound,
+        cachedTokenFound: !!pageUploadResult?.cachedTokenFound,
+        snifferInstalled: !!pageUploadResult?.snifferInstalled,
+        instruction: pageUploadResult?.instruction || "Open Seller Central feeds page and perform one manual upload to let the extension capture uploadFeed csrfToken.",
+      }, "error");
+      throw createAmazonUploadError(
+        "AMAZON_UPLOAD_CSRF_FORM_FIELD_MISSING",
+        "Valid uploadFeed csrfToken FormData field is missing in Seller Central page context.",
+        {
+          status: 0,
+          preflight,
+          retryable: !preflight?.allowUpload,
+          userActionRequired: !preflight?.allowUpload,
+          uploadResult: pageUploadResult,
+        }
+      );
     }
 
-    const requestEndTime = Date.now();
-    const requestDuration = requestEndTime - requestStartTime;
-
-    console.log(`[UPLOAD_TRACKING] Response status: ${response.status}`);
-    debugLog(`📡 [UPLOAD_TRACKING] Amazon Response: ${response.status} ${response.statusText} (${requestDuration}ms)`,
-      response.ok ? 'success' : 'error');
-    debugLog(`📡 [UPLOAD_TRACKING] Final endpoint used: ${uploadUrl}`, 'info');
-    log(`📡 Final endpoint used: ${uploadUrl} - Status: ${response.status}`);
-
-    // Log response headers for debugging
-    debugLog(`📋 [UPLOAD_TRACKING] Response headers:`, 'info');
-    for (const [key, value] of response.headers.entries()) {
-      debugLog(`  - ${key}: ${value}`, 'info');
+    let result;
+    if (isJson(response)) {
+      result = pageUploadResult?.jsonParseOk ? pageUploadResult.json : await response.json();
+      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 12 response parsed", {
+        jsonParseOk: true,
+        keys: result && typeof result === "object" ? Object.keys(result).join(",") : "",
+        success: result?.success,
+        message: result?.message || "",
+      }, result?.success === false ? "error" : "success");
+    } else {
+      result = responseText;
+      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 12 response parsed", {
+        jsonParseOk: false,
+        textPreview: responseText.slice(0, 500),
+      }, response.ok ? "info" : "error");
     }
 
     if (!response.ok) {
-      const errorText = await response.text().catch(() => "");
-      debugLog(`❌ [UPLOAD_TRACKING] Error Response Body: ${errorText.slice(0, 500)}`, 'error');
-      log(`❌ [UPLOAD_TRACKING] Error Response Body: ${errorText.slice(0, 500)}`);
-      debugLog(`❌ [UPLOAD_TRACKING] Full Error Details:`, 'error');
-      debugLog(`  - Status: ${response.status}`, 'error');
-      debugLog(`  - Status Text: ${response.statusText}`, 'error');
-      debugLog(`  - URL: ${response.url}`, 'error');
-      debugLog(`  - Response Size: ${errorText.length} chars`, 'error');
-      log(`❌ Upload failed: ${response.status} ${response.statusText}`);
+      const errorCode = classifyAmazonUploadFailure(response, responseText);
 
-      // Debug: Check if response is HTML (indicates redirect/login page)
-      if (errorText.includes('<!doctype html>') || errorText.includes('<html')) {
-        debugLog(`🔍 [UPLOAD_TRACKING] Response is HTML - likely redirect to login page`, 'error');
-        log(`🔍 Response is HTML - likely redirect to login page`);
-        debugLog(`🔍 [UPLOAD_TRACKING] HTML title check...`, 'error');
-
-        const titleMatch = errorText.match(/<title[^>]*>([^<]+)<\/title>/i);
-        if (titleMatch) {
-          debugLog(`📄 [UPLOAD_TRACKING] Page title: ${titleMatch[1]}`, 'error');
-          log(`📄 Page title: ${titleMatch[1]}`);
+      throw createAmazonUploadError(
+        errorCode,
+        `Amazon upload failed [${errorCode}] with status ${response.status}: ${responseText.slice(0, 200)}`,
+        {
+          status: response.status,
+          statusText: response.statusText,
+          responseText,
+          uploadUrl: response.url,
+          retryable: errorCode === "AMAZON_AUTH_REQUIRED",
+          userActionRequired: errorCode === "AMAZON_AUTH_REQUIRED",
         }
-
-        // Check for login indicators
-        if (errorText.includes('sign-in') || errorText.includes('login') || errorText.includes('authentication')) {
-          debugLog(`🔐 [UPLOAD_TRACKING] Login required - session expired`, 'error');
-          log(`🔐 Login required - session expired`);
-        }
-      }
-
-      // Check for specific error types
-      let errorType = 'UNKNOWN_ERROR';
-      if (response.status === 403) {
-        errorType = 'CSRF_TOKEN_ERROR';
-        debugLog(`� [UPLOAD_TRACKING] CSRF Token error detected - may need to refresh session`, 'error');
-      } else if (response.status === 401) {
-        errorType = 'AUTHENTICATION_ERROR';
-        debugLog(`� [UPLOAD_TRACKING] Authentication error - session may have expired`, 'error');
-      } else if (response.status === 400) {
-        errorType = 'BAD_REQUEST';
-        debugLog(`📝 [UPLOAD_TRACKING] Bad request - check file format or parameters`, 'error');
-      } else if (response.status === 500) {
-        errorType = 'SERVER_ERROR';
-        debugLog(`🔥 [UPLOAD_TRACKING] Amazon server error`, 'error');
-      }
-
-      const error = new Error(`Amazon upload failed with status ${response.status}: ${errorText.slice(0, 200)}`);
-      error.code = errorType;
-      error.status = response.status;
-      error.responseText = errorText;
-
-      // Log upload failed with extension logger
-      if (extensionLogger) {
-        await extensionLogger.logUploadFailed({
-          filename: fileObj.name,
-          fileSize: fileObj.size,
-          progress: 0,
-          ordersUploaded: 0
-        }, {
-          taskId: `upload_${startTime}`,
-          taskType: 'UPLOAD_TRACKING',
-          batchId: uploadParams?.batchId || `upload_${startTime}`
-        }, error, 'Amazon upload failed');
-      }
-
-      throw error;
+      );
     }
 
-    // Parse response (same pattern as requestReferenceIdNew)
-    let result;
-    const contentType = response.headers.get('content-type') || '';
-    debugLog(`📄 [UPLOAD_TRACKING] Response content-type: ${contentType}`, 'info');
-
-    if (isJson(response)) {
-      result = await response.json();
-      debugLog(`📄 [UPLOAD_TRACKING] Response parsed as JSON:`, 'info');
-      debugLog(`  - Keys: ${Object.keys(result).join(', ')}`, 'info');
-      if (result.success !== undefined) {
-        debugLog(`  - Success: ${result.success}`, result.success ? 'success' : 'error');
-      }
-      if (result.message) {
-        debugLog(`  - Message: ${result.message}`, 'info');
-      }
-    } else {
-      result = await response.text();
-      debugLog(`📄 [UPLOAD_TRACKING] Response parsed as text (${result.length} chars):`, 'info');
-      debugLog(`  - Preview: ${result.slice(0, 200)}${result.length > 200 ? '...' : ''}`, 'info');
+    if (response.status === 200 && isJson(response) && result?.success === false) {
+      throw createAmazonUploadError(
+        "AMAZON_UPLOAD_REJECTED",
+        result?.message || "Amazon uploadFeed rejected the confirmShipment feed.",
+        { status: response.status, statusText: response.statusText, response: result, retryable: false }
+      );
     }
 
-    console.log(`[UPLOAD_TRACKING] Upload successful:`, result);
-    debugLog(`✅ [UPLOAD_TRACKING] Upload successful!`, 'success');
-    debugLog(`📊 [UPLOAD_TRACKING] Upload summary:`, 'success');
-    debugLog(`  - File: ${fileObj.name}`, 'success');
-    debugLog(`  - Size: ${fileObj.size} bytes`, 'success');
-    debugLog(`  - Duration: ${Date.now() - startTime}ms`, 'success');
-    debugLog(`  - Response type: ${typeof result}`, 'success');
-
-    const endTime = Date.now();
-
-    // Log upload completed with extension logger
+    const duration = Date.now() - startTime;
     if (extensionLogger) {
-      await extensionLogger.logUploadCompleted({
-        filename: fileObj.name,
-        fileSize: fileObj.size,
-        progress: 100,
-        ordersUploaded: uploadParams?.ordersCount || 0
-      }, {
-        taskId: `upload_${startTime}`,
-        taskType: 'UPLOAD_TRACKING',
-        batchId: uploadParams?.batchId || `upload_${startTime}`
-      }, {
-        duration: endTime - startTime,
-        memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
-        cpuUsage: 0
-      }, 'Amazon upload completed successfully');
+      await extensionLogger.logUploadCompleted(
+        {
+          filename: stableFileObj.name,
+          fileSize: stableFileObj.size,
+          progress: 100,
+          ordersUploaded: uploadParams?.ordersCount || 0,
+          response: result,
+        },
+        { taskId: uploadTaskId, taskType: "UPLOAD_TRACKING", batchId: uploadBatchId },
+        {
+          duration,
+          requestDuration,
+          endpoint: response.url || `${SC_BASE}${AMAZON_UPLOADFEED_URL_PATH}`,
+          strategy: "sellerCentralTabPageContext",
+          world: pageUploadResult?.world,
+        },
+        "Amazon upload completed successfully"
+      );
     }
 
-    // Log success
     await postLogSingle({
       base,
       token: (await getCfg()).ingestToken,
@@ -2091,37 +3626,62 @@ async function uploadToAmazon(fileObj, uploadParams) {
       label: clientLabel,
       action: "auto",
       level: "success",
-      message: `✅ Upload tracking file ${fileObj.name} to Amazon success!`
+      message: `Amazon upload completed: ${stableFileObj.name}`,
     });
 
-    return { success: true, result };
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 13 success", {
+      status: response.status,
+      contentType,
+      strategy: "sellerCentralTabPageContext",
+      world: pageUploadResult?.world,
+      csrfFormFieldIncluded: !!pageUploadResult?.csrfIncluded,
+      csrfHeaderIncluded: false,
+      taskId: uploadTaskId,
+      batchId: uploadBatchId,
+    }, "success");
 
+    return {
+      ok: true,
+      result,
+      status: response.status,
+      endpoint: response.url || `${SC_BASE}${AMAZON_UPLOADFEED_URL_PATH}`,
+      duration,
+      requestDuration,
+      strategy: "sellerCentralTabPageContext",
+      world: pageUploadResult?.world,
+    };
   } catch (error) {
-    console.error(`[UPLOAD_TRACKING] Upload error:`, error);
-    debugLog(`❌ [UPLOAD_TRACKING] Upload failed with error:`, 'error');
-    debugLog(`  - Error type: ${error.constructor.name}`, 'error');
-    debugLog(`  - Error message: ${error.message}`, 'error');
-    debugLog(`  - Error code: ${error.code || 'N/A'}`, 'error');
-    debugLog(`  - HTTP status: ${error.status || 'N/A'}`, 'error');
-    if (error.stack) {
-      debugLog(`  - Stack trace: ${error.stack.split('\n')[0]}`, 'error');
+    if (isUploadFeedAuthOrCsrfError(error)) {
+      await clearUploadFeedCsrfCache("auth_or_csrf_failure", {
+        code: error?.code || "UNKNOWN_ERROR",
+        status: error?.status || 0,
+      }).catch(() => { });
     }
 
-    // Log error with extension logger
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 99 exception", {
+      code: error?.code || "UNKNOWN_ERROR",
+      message: error?.message || String(error),
+      status: error?.status || 0,
+      taskId: uploadTaskId,
+      batchId: uploadBatchId,
+      retryable: !!error?.retryable,
+      userActionRequired: !!error?.userActionRequired,
+    }, "error");
+
     if (extensionLogger) {
-      await extensionLogger.logUploadFailed({
-        filename: fileObj.name,
-        fileSize: fileObj.size,
-        progress: 0,
-        ordersUploaded: 0
-      }, {
-        taskId: `upload_${startTime}`,
-        taskType: 'UPLOAD_TRACKING',
-        batchId: uploadParams?.batchId || `upload_${startTime}`
-      }, error, 'Amazon upload failed with error');
+      await extensionLogger.logUploadFailed(
+        {
+          filename: stableFileObj?.name,
+          fileSize: stableFileObj?.size,
+          progress: 0,
+          ordersUploaded: 0,
+        },
+        { taskId: uploadTaskId, taskType: "UPLOAD_TRACKING", batchId: uploadBatchId },
+        error,
+        "Amazon upload failed"
+      );
     }
 
-    // Log error
     await postLogSingle({
       base,
       token: (await getCfg()).ingestToken,
@@ -2130,13 +3690,16 @@ async function uploadToAmazon(fileObj, uploadParams) {
       label: clientLabel,
       action: "auto",
       level: "error",
-      message: `❌ Upload tracking file ${fileObj.name} to Amazon failed: ${error.message}`
-    });
+      message: `Amazon upload failed: ${error.code || "UNKNOWN_ERROR"} - ${error.message}`,
+    }).catch(() => { });
 
     throw error;
   }
 }
 
+async function DO_NOT_USE_uploadToAmazonLegacyBackgroundUpload() {
+  throw new Error("Deprecated: uploadFeed must use Seller Central page-context upload. Do not use background upload.");
+}
 
 async function reportUploadResult(batchId, status, errorMessage = null) {
   const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
@@ -2374,12 +3937,30 @@ async function saveAdsHeadersIfAny(found) {
   );
   const keys = Object.keys(clean);
   if (!keys.length) return;
+  const now = Date.now();
+
+  if (isAdsApiLocked()) {
+    await chrome.storage.local.set({
+      adsCandidateHeaders: {
+        ...clean,
+        adsHeaderLastSeen: now,
+        source: "webRequest",
+        capturedAt: now,
+      },
+    });
+    debugLog("[ADS-AUTH] Captured headers ignored while Ads API task is running", "info");
+    extensionLogger?.logInfo("[ADS-AUTH] Captured headers ignored while Ads API task is running", {
+      keys,
+      runId: adsApiLock.runId,
+      taskName: adsApiLock.taskName,
+    });
+    return;
+  }
 
   const current = await chrome.storage.local.get(ADS_HEADER_STORAGE_KEYS);
   const merged = { ...current, ...clean };
   const changed = keys.some((k) => clean[k] && clean[k] !== current[k]);
   const hasCoreHeaders = isAdsHeaderComplete(merged);
-  const now = Date.now();
 
   // Nếu Amazon vẫn gửi cùng token cũ, vẫn update lastSeen để chứng minh session còn sống.
   if (!changed && hasCoreHeaders && now - lastAdsHeaderWriteAt < 5000) return;
@@ -2405,12 +3986,36 @@ async function saveAdsHeadersIfAny(found) {
    =============================== */
 const ADS_HEADER_TTL_MS = 20 * 60 * 1000; // giảm TTL để hạn chế token cũ gây 401
 
-async function forceRefreshAdsHeaders(reason = "manual") {
+async function forceRefreshAdsHeaders(options = {}) {
+  const reason = typeof options === "string" ? options : options.reason || "manual";
+  options = typeof options === "string" ? {} : options;
+  if (isAdsApiLocked() && !isAdsLockOwner(options.runId)) {
+    debugLog("[ADS-AUTH] force refresh blocked: not lock owner", "error");
+    extensionLogger?.logInfo("[ADS-AUTH] force refresh blocked: not lock owner", {
+      reason,
+      callerRunId: options.runId,
+      callerTaskName: options.taskName,
+      lock: { ...adsApiLock },
+    });
+    const err = createAdsError("ADS_LOCK_NOT_OWNER: cannot force refresh Ads headers while another Ads task owns the lock", 0, "");
+    err.code = "ADS_LOCK_NOT_OWNER";
+    throw err;
+  }
+
+  if (isAdsApiLocked()) {
+    debugLog("[ADS-AUTH] force refresh allowed under lock", "info");
+    extensionLogger?.logInfo("[ADS-AUTH] force refresh allowed under lock", {
+      reason,
+      runId: options.runId,
+      taskName: options.taskName,
+    });
+  }
+
   const startedAt = Date.now();
   debugLog(`🔄 [ADS-AUTH] Force refresh Ads headers — reason: ${reason}`, "info");
   extensionLogger?.logInfo("[ADS-AUTH] Force refresh Ads headers", { reason });
 
-  await clearAdsHeaders(reason);
+  await clearAdsHeaders(reason, options);
 
   const tabId = await ensureAdsTab();
 
@@ -2436,7 +4041,26 @@ async function forceRefreshAdsHeaders(reason = "manual") {
     captured = await waitForAdsHeaderCapture({ since: startedAt, timeoutMs: ADS_HEADER_REFRESH_TIMEOUT_MS });
   }
 
-  const latest = await readAdsHeaderState();
+  let latest = await readAdsHeaderState();
+  if (captured && !isAdsHeaderComplete(latest)) {
+    const { adsCandidateHeaders } = await chrome.storage.local.get(["adsCandidateHeaders"]);
+    const candidateFresh = Number(adsCandidateHeaders?.adsHeaderLastSeen || 0) >= startedAt - 1000;
+    if (candidateFresh && isAdsHeaderComplete(adsCandidateHeaders || {}) && canMutateAdsHeaders(options)) {
+      const promoted = {};
+      for (const key of ADS_HEADER_STORAGE_KEYS) {
+        if (adsCandidateHeaders[key]) promoted[key] = adsCandidateHeaders[key];
+      }
+      await chrome.storage.local.set(promoted);
+      await chrome.storage.local.remove(["adsCandidateHeaders"]);
+      latest = await readAdsHeaderState();
+      debugLog("[ADS-AUTH] Promoted candidate Ads headers after owner refresh", "success");
+      extensionLogger?.logInfo("[ADS-AUTH] Promoted candidate Ads headers after owner refresh", {
+        reason,
+        runId: options.runId,
+        taskName: options.taskName,
+      });
+    }
+  }
   if (captured && isAdsHeaderComplete(latest)) {
     debugLog("✅ [ADS-AUTH] Fresh Ads headers ready", "success");
     extensionLogger?.logInfo("[ADS-AUTH] Fresh Ads headers ready", {
@@ -2456,7 +4080,8 @@ ${hint.bodyText || ""}`)
   throw createAdsError(`Không thể refresh Ads headers: ${reasonText}`, 401, JSON.stringify(hint).slice(0, 1000));
 }
 
-async function ensureFreshAdsHeaders({ force = false, reason = "preflight" } = {}) {
+async function ensureFreshAdsHeaders(options = {}) {
+  const { force = false, reason = "preflight" } = options;
   const st = await readAdsHeaderState();
   const age = st.adsHeaderLastSeen ? Date.now() - Number(st.adsHeaderLastSeen) : Infinity;
   const isValid = isAdsHeaderComplete(st) && age < ADS_HEADER_TTL_MS;
@@ -2476,7 +4101,7 @@ async function ensureFreshAdsHeaders({ force = false, reason = "preflight" } = {
   });
 
   if (!force && isValid) return true;
-  return forceRefreshAdsHeaders(reason);
+  return forceRefreshAdsHeaders({ ...options, reason });
 }
 
 
@@ -2573,9 +4198,14 @@ function checkInvalidCampaignNames(campaigns, employeeCodes) {
 }
 
 async function checkCampaign(date) {
+  return withAdsApiLock("CHECK_CAMPAIGN", (lock) => checkCampaignLocked(date, lock));
+}
+
+async function checkCampaignLocked(date, lock = {}) {
   if (!date) throw new Error("date (YYYY-MM-DD) required");
   const employeeCodes = await fetchEmployeeCodes();
-  const rows = await fetchAllCampaignSpend(date, date, 300, true);
+  await ensureFreshAdsHeaders({ ...lock, reason: "checkCampaign" });
+  const rows = await fetchAllCampaignSpend(date, date, 300, true, lock);
 
   const result = checkInvalidCampaignNames(rows, employeeCodes);
 
@@ -2594,10 +4224,43 @@ async function checkCampaign(date) {
 let socket = null;
 let hbTimer = null;
 let connectBusy = false;
-let heartbeatInterval = null;
 
 // Auto reconnect polling
 let autoReconnectInterval = null;
+
+function safeLogConnectionStatus(status, details = {}, message = "") {
+  try {
+    if (!extensionLogger) return;
+    Promise.resolve(
+      extensionLogger.logConnectionStatus(status, details, message)
+    ).catch((error) => {
+      console.warn("[SOCKET-LOG] safeLogConnectionStatus failed:", error?.message || error);
+    });
+  } catch (error) {
+    console.warn("[SOCKET-LOG] safeLogConnectionStatus exception:", error?.message || error);
+  }
+}
+
+function safeLogInfo(message, rawData = {}) {
+  try {
+    if (!extensionLogger) return;
+    Promise.resolve(extensionLogger.logInfo(message, rawData)).catch((error) => {
+      console.warn("[SOCKET-LOG] safeLogInfo failed:", error?.message || error);
+    });
+  } catch (error) {
+    console.warn("[SOCKET-LOG] safeLogInfo exception:", error?.message || error);
+  }
+}
+
+function safePostLogSingle(payload) {
+  try {
+    Promise.resolve(postLogSingle(payload)).catch((error) => {
+      console.warn("[SOCKET-LOG] safePostLogSingle failed:", error?.message || error);
+    });
+  } catch (error) {
+    console.warn("[SOCKET-LOG] safePostLogSingle exception:", error?.message || error);
+  }
+}
 
 function startHeartbeat() {
   if (hbTimer) clearInterval(hbTimer);
@@ -2748,11 +4411,16 @@ function stopHeartbeat() {
 // }
 
 export async function connectSocketIO(force = false) {
+  console.log("[SOCKET-LOG] connectSocketIO entered", {
+    force,
+    connectBusy,
+    socketExists: !!socket,
+    socketConnected: !!socket?.connected
+  });
+
   if (connectBusy) {
     console.log('[SOCKET-LOG] Connection already in progress, skipping...');
-    if (extensionLogger) {
-      await extensionLogger.logConnectionStatus('busy', { force }, 'Socket connection already in progress');
-    }
+    safeLogConnectionStatus('busy', { force }, 'Socket connection already in progress');
     return { ok: false, reason: "busy" };
   }
   connectBusy = true;
@@ -2761,46 +4429,36 @@ export async function connectSocketIO(force = false) {
     const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
 
     console.log('[SOCKET-LOG] Starting socket connection...', { base, shopId, clientId, clientLabel, force });
-    if (extensionLogger) {
-      await extensionLogger.logConnectionStatus('connecting', {
-        base, shopId, clientId, clientLabel, force
-      }, 'Initiating Socket.IO connection');
-    }
+    safeLogConnectionStatus('connecting', {
+      base, shopId, clientId, clientLabel, force
+    }, 'Initiating Socket.IO connection');
 
     if (!base) {
       console.error('[SOCKET-LOG] Missing base URL');
-      if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('failed', { reason: 'base_missing' }, 'Socket connection failed: Missing base URL');
-      }
+      safeLogConnectionStatus('failed', { reason: 'base_missing' }, 'Socket connection failed: Missing base URL');
       return { ok: false, reason: "base missing" };
     }
 
     if (!shopId) {
       console.error('[SOCKET-LOG] Missing shopId');
-      if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('failed', { reason: 'shopid_missing' }, 'Socket connection failed: Missing shopId');
-      }
+      safeLogConnectionStatus('failed', { reason: 'shopid_missing' }, 'Socket connection failed: Missing shopId');
       return { ok: false, reason: "shopId missing" };
     }
 
     // Nếu đã connected và không force → bỏ qua
     if (!force && socket?.connected) {
       console.log('[SOCKET-LOG] Already connected, skipping reconnection');
-      if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('already_connected', { socketId: socket.id }, 'Socket already connected');
-      }
+      safeLogConnectionStatus('already_connected', { socketId: socket?.id || null }, 'Socket already connected');
       return { ok: true, message: "already connected" };
     }
 
     // Ngắt socket cũ nếu có
     if (socket) {
       console.log('[SOCKET-LOG] Disconnecting existing socket...');
-      if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('disconnecting_old', {
-          oldSocketId: socket.id,
-          oldConnected: socket.connected
-        }, 'Disconnecting existing socket connection');
-      }
+      safeLogConnectionStatus('disconnecting_old', {
+        oldSocketId: socket?.id || null,
+        oldConnected: !!socket?.connected
+      }, 'Disconnecting existing socket connection');
       try { socket.disconnect(); } catch { }
       socket = null;
       stopHeartbeat();
@@ -2809,13 +4467,15 @@ export async function connectSocketIO(force = false) {
       stopTestConnectionPolling();
 
       // Dừng auto reconnect polling khi cleanup socket
-      stopAutoReconnectPolling();
+      if (force) stopAutoReconnectPolling();
     }
 
-    console.log('[SOCKET-LOG] Creating new socket connection...', {
+    console.log("[SOCKET-LOG] Creating new socket connection", {
       url: base,
-      path: '/ws',
-      auth: { shopId, machineId: clientId, label: clientLabel }
+      path: "/ws",
+      shopId,
+      machineId: clientId,
+      label: clientLabel
     });
 
     socket = io(base, {
@@ -2836,48 +4496,38 @@ export async function connectSocketIO(force = false) {
     });
 
     // Khi kết nối thành công
-    socket.on("connect", async () => {
-      console.log("[SOCKET-LOG] ✅ Connected successfully!", { socketId: socket.id, timestamp: new Date().toISOString() });
+    socket.on("connect", () => {
+      console.log("[SOCKET-LOG] Connected successfully", { socketId: socket?.id || null, timestamp: new Date().toISOString() });
+      startHeartbeat();
+      startTestConnectionPolling();
+      startAutoReconnectPolling();
+      startAutoConfigScheduler();
+      startAutoConfigSync();
 
-      if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('connected', {
-          socketId: socket.id,
-          timestamp: new Date().toISOString(),
-          reconnectionAttempts: socket.io.reconnectionAttempts || 0
-        }, 'Socket.IO connection established successfully');
-      }
+      safeLogConnectionStatus('connected', {
+        socketId: socket?.id || null,
+        timestamp: new Date().toISOString(),
+        reconnectionAttempts: socket?.io?.reconnectionAttempts || 0
+      }, 'Socket.IO connection established successfully');
 
-      await postLogSingle({
+      safePostLogSingle({
         base, shopId, machineId: clientId, label: clientLabel,
         action: "auto", level: "success",
         message: "✅ Extension connected to Socket.IO",
       });
-      startHeartbeat();
-
-      // Bắt đầu test connection polling khi socket kết nối
-      startTestConnectionPolling();
-
-      // Bắt đầu auto reconnect polling khi socket kết nối
-      startAutoReconnectPolling();
-
-      // Bắt đầu auto config scheduler
-      startAutoConfigScheduler();
-      startAutoConfigSync();
     });
 
     // Khi mất kết nối
-    socket.on("disconnect", async (reason) => {
+    socket.on("disconnect", (reason) => {
       console.log("[SOCKET-LOG] ❌ Disconnected:", { reason, timestamp: new Date().toISOString() });
 
-      if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('disconnected', {
-          reason,
-          timestamp: new Date().toISOString(),
-          wasConnected: true
-        }, `Socket disconnected: ${reason}`);
-      }
+      safeLogConnectionStatus('disconnected', {
+        reason,
+        timestamp: new Date().toISOString(),
+        wasConnected: true
+      }, `Socket disconnected: ${reason}`);
 
-      await postLogSingle({
+      safePostLogSingle({
         base, shopId, machineId: clientId, label: clientLabel,
         action: "auto", level: "error",
         message: `❌ Socket disconnected: ${reason}`,
@@ -2888,87 +4538,74 @@ export async function connectSocketIO(force = false) {
       stopTestConnectionPolling();
 
       // Dừng auto reconnect polling khi socket ngắt kết nối
-      stopAutoReconnectPolling();
+      // Keep auto reconnect polling alive during normal disconnects.
 
       // Nếu server ép disconnect → force reconnect ngay
       if (reason === "io server disconnect") {
         console.log("[SOCKET-LOG] Server forced disconnect, attempting reconnection...");
-        if (extensionLogger) {
-          await extensionLogger.logConnectionStatus('reconnecting', {
-            reason: 'server_disconnect'
-          }, 'Server forced disconnect, initiating reconnection');
-        }
+        safeLogConnectionStatus('reconnecting', {
+          reason: 'server_disconnect'
+        }, 'Server forced disconnect, initiating reconnection');
         connectSocketIO(true);
       }
     });
 
     // Connection error handling
-    socket.on("connect_error", async (error) => {
+    socket.on("connect_error", (error) => {
+      console.error("[SOCKET-LOG] connect_error", {
+        message: error?.message,
+        description: error?.description,
+        context: error?.context,
+        type: error?.type
+      });
       console.error("[SOCKET-LOG] ❌ Connection error:", error);
 
       if (extensionLogger) {
-        await extensionLogger.logError(error, {
+        Promise.resolve(extensionLogger.logError(error, {
           socketUrl: base,
           shopId,
           clientId,
           timestamp: new Date().toISOString()
-        }, 'Socket.IO connection error');
+        }, 'Socket.IO connection error')).catch((logError) => {
+          console.warn("[SOCKET-LOG] connect_error log failed:", logError?.message || logError);
+        });
       }
     });
 
     // Reconnection events
-    socket.on("reconnect", async (attemptNumber) => {
+    socket.on("reconnect", (attemptNumber) => {
       console.log("[SOCKET-LOG] ✅ Reconnected after", attemptNumber, "attempts");
 
       if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('reconnected', {
+        safeLogConnectionStatus('reconnected', {
           attemptNumber,
           timestamp: new Date().toISOString()
         }, `Successfully reconnected after ${attemptNumber} attempts`);
       }
     });
 
-    socket.on("reconnect_attempt", async (attemptNumber) => {
+    socket.on("reconnect_attempt", (attemptNumber) => {
       console.log("[SOCKET-LOG] 🔄 Reconnection attempt", attemptNumber);
 
       if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('reconnect_attempt', {
+        safeLogConnectionStatus('reconnect_attempt', {
           attemptNumber,
           timestamp: new Date().toISOString()
         }, `Reconnection attempt #${attemptNumber}`);
       }
     });
 
-    socket.on("reconnect_failed", async () => {
+    socket.on("reconnect_failed", () => {
       console.error("[SOCKET-LOG] ❌ Reconnection failed after all attempts");
 
       if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('reconnect_failed', {
+        safeLogConnectionStatus('reconnect_failed', {
           timestamp: new Date().toISOString()
         }, 'Socket reconnection failed after all attempts');
       }
     });
 
     // Heartbeat tự động
-    function startHeartbeat() {
-      stopHeartbeat();
-      console.log("[SOCKET-LOG] 💓 Starting heartbeat...");
-      heartbeatInterval = setInterval(() => {
-        if (socket?.connected) {
-          socket.emit("heartbeat", { ts: Date.now() });
-          console.log("[SOCKET-LOG] 💓 Heartbeat sent");
-        }
-      }, 30000); // 30s gửi 1 ping
-    }
-
-    function stopHeartbeat() {
-      if (heartbeatInterval) {
-        console.log("[SOCKET-LOG] 💔 Stopping heartbeat...");
-        clearInterval(heartbeatInterval);
-        heartbeatInterval = null;
-      }
-    }
-
     // Task từ server
     // socket.on("server:task", async (task) => {
     //   const { type, payload } = task || {};
@@ -3068,8 +4705,8 @@ async function handleServerTask(task) {
   console.log('🏷️ [EXT-DEBUG] Task type:', type);
   console.log('📦 [EXT-DEBUG] Payload keys:', Object.keys(payload || {}));
   log(`✅ [EXT-DEBUG] Connected to server`, payload);
-  log(`🆔 [EXT-DEBUG] Socket ID:`, socket.id);
-  log('🔗 [EXT-DEBUG] Socket connected:', socket.connected);
+  log(`🆔 [EXT-DEBUG] Socket ID:`, socket?.id || "NO_SOCKET");
+  log('🔗 [EXT-DEBUG] Socket connected:', !!socket?.connected);
 
   const authData = {
     shopId: "your_shop_id",
@@ -3257,8 +4894,13 @@ async function handleServerTask(task) {
           }, `[IMPORT_ADS_SPEND] Starting ads spend import for date: ${payload.date}`);
         }
 
+        let adsResult;
         try {
-          await runExportAdsSpend(payload.date);
+          adsResult = await runExportAdsSpend(payload.date);
+          if (adsResult?.skipped && adsResult?.reason === "ADS_TASK_ALREADY_RUNNING") {
+            extensionLogger?.logInfo("[ADS-LOCK] Skip IMPORT_ADS_SPEND, another Ads task is running", adsResult);
+            return adsResult;
+          }
 
           // Log task completed
           if (extensionLogger) {
@@ -3300,7 +4942,7 @@ async function handleServerTask(task) {
           level: "success",
           message: "✅ Import ads success!"
         });
-        break;
+        return adsResult;
 
       case "UPLOAD_TRACKING":
         console.log('📋 [EXT-DEBUG] ===== HANDLING UPLOAD_TRACKING =====');
@@ -3310,7 +4952,7 @@ async function handleServerTask(task) {
           await initializeLogger();
         }
 
-        const uploadTaskId = payload?.batchId || `upload_${Date.now()}`;
+        const uploadTaskId = payload?.batchId || payload?.taskId || `upload_${Date.now()}`;
         const uploadStartTime = Date.now();
 
         // Log task received with full details
@@ -3459,7 +5101,14 @@ async function handleServerTask(task) {
           console.log('🚀 [EXT-DEBUG] Starting upload to Amazon...');
           console.log('📤 [EXT-DEBUG] Upload params:', uploadParams);
 
-          uploadToAmazon(fileObj, uploadParams)
+          const trackingUploadParams = {
+            ...(uploadParams || {}),
+            taskId: payload?.batchId || payload?.taskId || `upload_${Date.now()}`,
+            batchId: payload?.batchId,
+            ordersCount: trackingData?.length || uploadParams?.ordersCount || 0
+          };
+
+          uploadToAmazon(fileObj, trackingUploadParams)
             .then(async () => {
               console.log(`✅ [EXT-DEBUG] Successfully uploaded ${file.filename}`);
               console.log('📝 [EXT-DEBUG] Reporting success to server...');
@@ -3670,7 +5319,7 @@ async function testCSRFTokenExtraction() {
       const match = feedsHtml.match(regex);
       if (match && match[1]) {
         csrfToken = match[1];
-        debugLog(`🔑 [CSRF-TEST] CSRF Token found with pattern ${i + 1}: ${csrfToken.slice(0, 20)}...`, 'success');
+        debugLog(`[CSRF-TEST] CSRF token found with pattern ${i + 1}: csrfIncluded=true csrfTokenLength=${csrfToken.length}`, 'success');
         break;
       } else {
         debugLog(`❌ [CSRF-TEST] Pattern ${i + 1} failed`, 'info');
@@ -3683,7 +5332,7 @@ async function testCSRFTokenExtraction() {
       // Try cookie fallback
       const cookieToken = await getCookie("https://sellercentral.amazon.com/", "anti-csrftoken-a2z");
       if (cookieToken) {
-        debugLog(`🍪 [CSRF-TEST] Found CSRF token in cookie: ${cookieToken.slice(0, 20)}...`, 'info');
+        debugLog(`[CSRF-TEST] Found CSRF token in cookie: cookieFound=true csrfTokenLength=${cookieToken.length}`, 'info');
         csrfToken = cookieToken;
       } else {
         debugLog(`❌ [CSRF-TEST] No CSRF token in cookie either`, 'error');
@@ -3692,14 +5341,14 @@ async function testCSRFTokenExtraction() {
 
     // Test with a sample upload (dry run)
     if (csrfToken) {
-      debugLog(`✅ [CSRF-TEST] CSRF Token ready for upload: ${csrfToken.slice(0, 30)}...`, 'success');
+      debugLog(`[CSRF-TEST] CSRF token ready for upload: csrfIncluded=true csrfTokenLength=${csrfToken.length}`, 'success');
 
       // Show what the FormData would look like
       debugLog(`📋 [CSRF-TEST] FormData would include:`, 'info');
       debugLog(`  - feedFile: [Binary File]`, 'info');
       debugLog(`  - feedName: confirmShipment`, 'info');
       debugLog(`  - feedVersion: new`, 'info');
-      debugLog(`  - csrfToken: ${csrfToken.slice(0, 30)}...`, 'info');
+      debugLog(`  - csrfToken: csrfIncluded=true csrfTokenLength=${csrfToken.length}`, 'info');
     }
 
     return csrfToken;
@@ -3749,8 +5398,8 @@ async function runExtensionDiagnostics() {
     debugLog('🔌 [EXT-DEBUG] Socket Connection Status:', 'info');
     debugLog(`  - Socket exists: ${!!socket}`, 'info');
     if (socket) {
-      debugLog(`  - Socket connected: ${socket.connected}`, socket.connected ? 'success' : 'error');
-      debugLog(`  - Socket ID: ${socket.id}`, 'info');
+      debugLog(`  - Socket connected: ${!!socket?.connected}`, socket?.connected ? 'success' : 'error');
+      debugLog(`  - Socket ID: ${socket?.id || "NO_SOCKET"}`, 'info');
       debugLog(`  - Socket URL: ${socket.io?.uri}`, 'info');
       debugLog(`  - Socket transport: ${socket.io?.engine?.transport?.name}`, 'info');
 
@@ -4028,7 +5677,11 @@ async function startAutoConfigScheduler() {
         const ts = new Date().toLocaleTimeString();
         debugLog(`🔄 [AUTO-CFG] IMPORT_ADS_SPEND tick — date: ${date} — ${ts}`, "info");
         try {
-          await handleServerTask({ type: "IMPORT_ADS_SPEND", payload: { date } });
+          const result = await handleServerTask({ type: "IMPORT_ADS_SPEND", payload: { date } });
+          if (result?.skipped && result?.reason === "ADS_TASK_ALREADY_RUNNING") {
+            debugLog("[ADS-LOCK] Skip IMPORT_ADS_SPEND, another Ads task is running", "info");
+            return;
+          }
           debugLog(`✅ [AUTO-CFG] IMPORT_ADS_SPEND completed for ${date}`, "success");
         } catch (e) {
           debugLog(`❌ [AUTO-CFG] IMPORT_ADS_SPEND error: ${e.message}`, "error");
@@ -4137,9 +5790,7 @@ function startTestConnectionPolling() {
 // Dừng polling connection status report
 function stopTestConnectionPolling() {
   if (testConnectionInterval) {
-    if (extensionLogger) {
-      extensionLogger.logInfo('Connection status polling stopped');
-    }
+    safeLogInfo('Connection status polling stopped');
     clearInterval(testConnectionInterval);
     testConnectionInterval = null;
   }
@@ -4150,9 +5801,7 @@ function startAutoReconnectPolling() {
   // Dừng polling cũ nếu có
   stopAutoReconnectPolling();
 
-  if (extensionLogger) {
-    extensionLogger.logInfo('Auto reconnect polling started', { interval: '30min' });
-  }
+  safeLogInfo('Auto reconnect polling started', { interval: '30min' });
 
   // Polling mỗi 30 phút
   autoReconnectInterval = setInterval(async () => {
@@ -4182,7 +5831,7 @@ function startAutoReconnectPolling() {
         } else {
           if (extensionLogger) {
             await extensionLogger.logInfo('Auto reconnect check - socket already connected', {
-              socketId: socket.id
+              socketId: socket?.id || null
             });
           }
         }
@@ -4204,9 +5853,7 @@ function startAutoReconnectPolling() {
 // Dừng auto reconnect polling
 function stopAutoReconnectPolling() {
   if (autoReconnectInterval) {
-    if (extensionLogger) {
-      extensionLogger.logInfo('Auto reconnect polling stopped');
-    }
+    safeLogInfo('Auto reconnect polling stopped');
     clearInterval(autoReconnectInterval);
     autoReconnectInterval = null;
   }
@@ -4223,6 +5870,188 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
       if (msg.type === "PING") return sendResponse({ ok: true });
+
+      if (msg?.type === "GET_LAST_UPLOAD_TRACKING_FINAL_TSV") {
+        const data = await chrome.storage.local.get(["lastUploadTrackingFinalTsv"]);
+        const item = data.lastUploadTrackingFinalTsv || {};
+        return sendResponse({
+          ok: !!item.content,
+          batchId: item.batchId || null,
+          filename: item.filename || "",
+          rows: item.rows || 0,
+          tsvLength: item.tsvLength || 0,
+          tsvChecksum: item.tsvChecksum || "",
+          contentJsonPreview: item.contentJsonPreview || "",
+          lineBreakAudit: item.lineBreakAudit || null,
+          content: item.content || ""
+        });
+      }
+
+      if (msg?.type === "DOWNLOAD_LAST_UPLOAD_TRACKING_FINAL_TSV") {
+        const data = await chrome.storage.local.get(["lastUploadTrackingFinalTsv"]);
+        const item = data.lastUploadTrackingFinalTsv || {};
+        if (!item.content) return sendResponse({ ok: false, error: "No final TSV snapshot found" });
+        if (!chrome.downloads?.download) {
+          return sendResponse({
+            ok: false,
+            error: "downloads permission is not enabled for this extension",
+            batchId: item.batchId || null,
+            filename: item.filename || "",
+            rows: item.rows || 0,
+            tsvLength: item.tsvLength || 0,
+            tsvChecksum: item.tsvChecksum || ""
+          });
+        }
+
+        const batchId = String(item.batchId || "unknown").replace(/[^A-Za-z0-9._-]/g, "_");
+        let method = "dataUrl";
+        let url = "data:text/plain;charset=utf-8," + encodeURIComponent(item.content);
+        if (typeof URL?.createObjectURL === "function" && typeof Blob !== "undefined") {
+          try {
+            url = URL.createObjectURL(new Blob([item.content], { type: "text/plain;charset=utf-8" }));
+            method = "blobUrl";
+          } catch {
+            url = "data:text/plain;charset=utf-8," + encodeURIComponent(item.content);
+            method = "dataUrl";
+          }
+        }
+        const downloadId = await chrome.downloads.download({
+          url,
+          filename: `debug-final-upload-tracking-${batchId}.txt`,
+          saveAs: true
+        });
+        if (method === "blobUrl") setTimeout(() => URL.revokeObjectURL(url), 30000);
+        return sendResponse({ ok: true, downloadId, method });
+      }
+
+      if (msg?.type === "UPLOADFEED_CSRF_CAPTURED") {
+        const result = await saveUploadFeedCsrfTokenCapture(msg.payload || {});
+        return sendResponse({ ok: true, saved: !!result?.ok, source: result?.source, tokenLength: result?.tokenLength });
+      }
+
+      if (msg?.type === "UPLOADFEED_SNIFFER_DEBUG") {
+        const payload = msg.payload || {};
+        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed sniffer debug", {
+          event: payload.event || "",
+          href: payload.href || "",
+          title: payload.title || "",
+          installedAt: payload.installedAt || 0,
+        }, "info");
+        return sendResponse({ ok: true });
+      }
+
+      if (msg?.type === "INSTALL_UPLOADFEED_CSRF_SNIFFER") {
+        const tab = await findOrOpenSellerCentralFeedsTab();
+        if (!tab?.id) return sendResponse({ ok: false, error: "Unable to open Seller Central feeds tab" });
+        await waitForSellerCentralTabComplete(tab.id);
+        await delayMs(1000);
+        await installUploadFeedCsrfSniffer(tab.id);
+        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer installed by debug command", {
+          tabId: tab.id,
+          message: "Sniffer installed. Perform one manual Seller Central upload to capture csrfToken.",
+        }, "success");
+        return sendResponse({
+          ok: true,
+          tabId: tab.id,
+          message: "Sniffer installed. Perform one manual Seller Central upload to capture csrfToken.",
+        });
+      }
+
+      if (msg?.type === "VERIFY_UPLOADFEED_SNIFFER") {
+        const tab = await findOrOpenSellerCentralFeedsTab();
+        if (!tab?.id) return sendResponse({ ok: false, error: "Unable to open Seller Central feeds tab" });
+        await waitForSellerCentralTabComplete(tab.id);
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: "MAIN",
+          func: () => ({
+            mainWorldFlag: !!window.__APO_UPLOADFEED_SNIFFER_INSTALLED__,
+            installedAt: window.__APO_UPLOADFEED_SNIFFER_INSTALLED_AT__ || 0,
+            href: location.href,
+            title: document.title,
+            fetchPatched: !!window.fetch?.__apoUploadFeedPatched,
+            requestPatched: !!window.Request?.__apoUploadFeedPatched,
+            xhrPatched: !!XMLHttpRequest.prototype.send?.__apoUploadFeedPatched,
+            formDataAppendPatched: !!FormData.prototype.append?.__apoUploadFeedPatched,
+            formDataSetPatched: !!FormData.prototype.set?.__apoUploadFeedPatched,
+            consoleLogPatched: !!console.log?.__apoUploadFeedPatched,
+          }),
+        });
+        return sendResponse({ ok: true, tabId: tab.id, ...(res?.result || {}) });
+      }
+
+      if (msg?.type === "TEST_UPLOADFEED_SNIFFER_CAPTURE") {
+        const tab = await findOrOpenSellerCentralFeedsTab();
+        if (!tab?.id) return sendResponse({ ok: false, error: "Unable to open Seller Central feeds tab" });
+        await waitForSellerCentralTabComplete(tab.id);
+        await installUploadFeedCsrfSniffer(tab.id);
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: "MAIN",
+          func: () => {
+            const fakeToken = "A".repeat(104);
+            console.log("dispatching", {
+              type: "UPLOAD_ACTION",
+              feedTypeName: "confirmShipment",
+              __apoTestToken: true,
+              payload: { csrfToken: fakeToken },
+            });
+            return {
+              ok: true,
+              tokenLength: fakeToken.length,
+              href: location.href,
+              title: document.title,
+            };
+          },
+        });
+        await delayMs(500);
+        const data = await chrome.storage.local.get([AMAZON_UPLOADFEED_CSRF_CACHE_KEY]);
+        const cache = data[AMAZON_UPLOADFEED_CSRF_CACHE_KEY] || null;
+        return sendResponse({
+          ok: true,
+          tabId: tab.id,
+          injected: res?.result || {},
+          cache: {
+            tokenFound: !!cache?.token,
+            tokenLength: cache?.tokenLength || 0,
+            source: cache?.source || null,
+            isTestToken: !!cache?.isTestToken,
+            valid: !!cache?.token && isValidUploadFeedCsrfToken(cache.token),
+          },
+        });
+      }
+
+      if (msg?.type === "GET_UPLOADFEED_READINESS_STATUS") {
+        return sendResponse(await getUploadFeedReadinessStatus(msg.options || {}));
+      }
+
+      if (msg?.type === "CHECK_UPLOADFEED_CSRF_CACHE") {
+        const cacheStatus = await getUploadFeedCsrfCacheStatus();
+        return sendResponse({
+          ok: true,
+          tokenFound: cacheStatus.tokenFound,
+          tokenLength: cacheStatus.tokenLength,
+          source: cacheStatus.source,
+          ageMs: cacheStatus.ageMs,
+          ageMin: cacheStatus.ageMin,
+          isTestToken: cacheStatus.isTestToken,
+          valid: cacheStatus.valid,
+        });
+      }
+
+      if (msg?.type === "CLEAR_UPLOADFEED_CSRF_CACHE") {
+        return sendResponse(await clearUploadFeedCsrfCache("manual_debug"));
+      }
+
+      if (msg?.type === "SOCKET_RESET_BUSY") {
+        connectBusy = false;
+        try {
+          if (socket) socket.disconnect();
+        } catch { }
+        socket = null;
+        stopHeartbeat();
+        return sendResponse({ ok: true });
+      }
 
       if (msg.type === "RELOAD_AUTO_CONFIG") {
         await startAutoConfigScheduler();
@@ -4313,7 +6142,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             debugLog('✅ [COOKIES] Amazon authentication looks good', 'success');
           }
 
-          return sendResponse({ ok: true, cookies });
+          return sendResponse({
+            ok: true,
+            cookies: Object.fromEntries(Object.entries(cookies).map(([key, value]) => [key, !!value]))
+          });
         } catch (error) {
           debugLog(`❌ [COOKIES] Error checking cookies: ${error.message}`, 'error');
           return sendResponse({ ok: false, error: error.message });
@@ -4328,7 +6160,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           const csrfToken = await testCSRFTokenExtraction();
           return sendResponse({
             ok: true,
-            csrfToken: csrfToken,
+            csrfIncluded: !!csrfToken,
+            csrfTokenLength: String(csrfToken || "").length,
             message: csrfToken ? 'CSRF token extracted successfully' : 'No CSRF token found'
           });
         } catch (error) {
@@ -4346,7 +6179,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           return sendResponse({ ok: false, error: "CSRF token required" });
         }
 
-        debugLog(`🧪 [TEST] Testing upload with manual CSRF token: ${csrfToken.slice(0, 20)}...`, 'info');
+        debugLog(`[TEST] Testing upload with manual CSRF token: csrfIncluded=true csrfTokenLength=${String(csrfToken || "").length}`, 'info');
 
         const testTask = {
           type: 'UPLOAD_TRACKING',
@@ -4360,7 +6193,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
               contentType: 'text/tab-separated-values; charset=utf-8'
             },
             uploadParams: {
-              csrfToken: csrfToken, // Use manual token
+              csrfToken: csrfToken,
               carrierCode: 'USPS',
               shipMethod: 'USPS First Class',
               shipDate: '2026-04-06T00:22:22+00:00'

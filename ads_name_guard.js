@@ -15,6 +15,18 @@
     return e;
   }
   function normReply(reply) {
+    if (reply?.skipped === true && reply?.reason === "ADS_TASK_ALREADY_RUNNING") {
+      return {
+        ok: false,
+        skipped: true,
+        reason: "ADS_TASK_ALREADY_RUNNING",
+        total: 0,
+        invalidCount: 0,
+        invalidList: [],
+        message: "Ads task đang chạy, tạm bỏ qua Campaign Guard để tránh lỗi 401.",
+      };
+    }
+
     const invalidList = Array.isArray(reply?.invalidList)
       ? reply.invalidList
       : Array.isArray(reply?.invalid)
@@ -143,6 +155,14 @@
 
     if (!res) {
       body.appendChild(el("div", { textContent: "Loading..." }));
+    } else if (!res.ok && res.skipped) {
+      body.appendChild(
+        el(
+          "div",
+          { style: "color:#cde3ff" },
+          res.message || "Ads task đang chạy, tạm bỏ qua Campaign Guard để tránh lỗi 401."
+        )
+      );
     } else if (!res.ok) {
       body.appendChild(
         el(

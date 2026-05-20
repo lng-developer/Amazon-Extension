@@ -16,7 +16,8 @@
     "scripting",
     "alarms",
     "webRequest",
-    "webRequestBlocking"
+    "webRequestBlocking",
+    "downloads"
   ],
   "host_permissions": [
     "https://sellercentral.amazon.com/*",

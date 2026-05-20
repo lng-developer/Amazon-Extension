@@ -148,12 +148,20 @@ on($("#testAds"), "click", async () => {
   const date = $("#adsDate")?.value?.trim();
   if (!date) return log("❌ Vui lòng nhập ngày (YYYY-MM-DD)");
   try {
-    await chrome.runtime.sendMessage({
+    const res = await chrome.runtime.sendMessage({
       type: "RUN_ADS_SPEND",
       payload: { date },
     });
+    if (res?.skipped && res?.reason === "ADS_TASK_ALREADY_RUNNING") {
+      log("Ads task đang chạy, bỏ qua request mới để tránh 401.");
+      return;
+    }
     log("RUN_ADS_SPEND sent:", date);
   } catch (e) {
+    if (e?.code === "ADS_TASK_ALREADY_RUNNING") {
+      log("Ads task đang chạy, bỏ qua request mới để tránh 401.");
+      return;
+    }
     log("RUN_ADS_SPEND error:", e?.message || e);
   }
 });
@@ -471,5 +479,79 @@ chrome.runtime.onMessage.addListener((msg) => {
         }
       }
     }
+  }
+});
+
+async function sendUploadFeedDebugCommand(type, label) {
+  try {
+    log(`${label}...`);
+    const res = await chrome.runtime.sendMessage({ type });
+    log(`${label} ->\n${JSON.stringify(res || {}, null, 2)}`);
+  } catch (e) {
+    log(`${label} error:`, e?.message || e);
+  }
+}
+
+on($("#btnCheckUploadFeedReadiness"), "click", () => {
+  sendUploadFeedDebugCommand("GET_UPLOADFEED_READINESS_STATUS", "Check uploadFeed readiness");
+});
+
+on($("#btnInstallUploadFeedSniffer"), "click", () => {
+  sendUploadFeedDebugCommand("INSTALL_UPLOADFEED_CSRF_SNIFFER", "Install uploadFeed sniffer");
+});
+
+on($("#btnVerifyUploadFeedSniffer"), "click", () => {
+  sendUploadFeedDebugCommand("VERIFY_UPLOADFEED_SNIFFER", "Verify uploadFeed sniffer");
+});
+
+on($("#btnCheckUploadFeedCache"), "click", () => {
+  sendUploadFeedDebugCommand("CHECK_UPLOADFEED_CSRF_CACHE", "Check uploadFeed CSRF cache");
+});
+
+on($("#btnClearUploadFeedCache"), "click", () => {
+  sendUploadFeedDebugCommand("CLEAR_UPLOADFEED_CSRF_CACHE", "Clear uploadFeed CSRF cache");
+});
+
+on($("#btnSocketResetBusy"), "click", () => {
+  sendUploadFeedDebugCommand("SOCKET_RESET_BUSY", "Socket reset busy");
+});
+
+async function showFinalTsvFallback() {
+  const res = await chrome.runtime.sendMessage({ type: "GET_LAST_UPLOAD_TRACKING_FINAL_TSV" });
+  const box = $("#finalTsvFallbackBox");
+  const text = $("#finalTsvFallbackText");
+  if (box) box.style.display = "block";
+  if (text) text.value = res?.content || "";
+  log("Final TSV fallback ->\n" + JSON.stringify({
+    ok: !!res?.ok,
+    batchId: res?.batchId,
+    filename: res?.filename,
+    rows: res?.rows,
+    tsvLength: res?.tsvLength,
+    tsvChecksum: res?.tsvChecksum
+  }, null, 2));
+}
+
+on($("#btnDownloadFinalTsv"), "click", async () => {
+  try {
+    log("Download final TSV...");
+    const res = await chrome.runtime.sendMessage({ type: "DOWNLOAD_LAST_UPLOAD_TRACKING_FINAL_TSV" });
+    log("Download final TSV ->\n" + JSON.stringify(res || {}, null, 2));
+    if (res?.error === "downloads permission is not enabled for this extension") {
+      await showFinalTsvFallback();
+    }
+  } catch (e) {
+    log("Download final TSV error:", e?.message || e);
+    await showFinalTsvFallback();
+  }
+});
+
+on($("#btnCopyFinalTsv"), "click", async () => {
+  const text = $("#finalTsvFallbackText")?.value || "";
+  try {
+    await navigator.clipboard.writeText(text);
+    log("Final TSV copied.");
+  } catch (e) {
+    log("Copy final TSV failed:", e?.message || e);
   }
 });

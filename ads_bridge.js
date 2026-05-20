@@ -41,6 +41,9 @@
           "adsMarketplaceId",
           "adsCsrfData",
           "adsCsrfToken",
+          "adsHeaderLastSeen",
+          "adsApiLockState",
+          "adsCandidateHeaders",
         ],
         (st) => resolve(st || {})
       );
@@ -50,6 +53,43 @@
     return new Promise((resolve) => {
       chrome.storage.local.set(obj, () => resolve());
     });
+  }
+
+  function isAdsApiLockedState(lockState) {
+    if (!lockState?.running) return false;
+    const age = Date.now() - Number(lockState.startedAt || 0);
+    return age < 5 * 60 * 1000;
+  }
+
+  async function saveCapturedAdsHeaders(data, source = "ads_bridge") {
+    const clean = Object.fromEntries(
+      Object.entries(data || {}).filter(([, value]) => value !== undefined && value !== null && String(value) !== "")
+    );
+    if (!Object.keys(clean).length) return false;
+
+    const now = Date.now();
+    const { adsApiLockState } = await getCfg(["adsApiLockState"]);
+    if (isAdsApiLockedState(adsApiLockState)) {
+      await setCfg({
+        adsCandidateHeaders: {
+          ...clean,
+          adsHeaderLastSeen: now,
+          source,
+          capturedAt: now,
+        },
+      });
+      bridgeLog("info", "[ADS_BRIDGE] Captured headers stored as candidate because Ads API is locked", {
+        keys: Object.keys(clean),
+        runningTaskName: adsApiLockState.taskName,
+        runningRunId: adsApiLockState.runId,
+      });
+      return false;
+    }
+
+    const toSave = { ...clean, adsHeaderLastSeen: now };
+    await setCfg(toSave);
+    bridgeLog("info", "[ADS_BRIDGE] Headers captured and saved to storage", { keys: Object.keys(toSave) });
+    return true;
   }
 
   // ---------- Build headers cho retrieveReport ----------
@@ -91,7 +131,9 @@
   }
 
   // ---------- Gọi retrieveReport bằng headers hiện tại ----------
-  async function callRetrieveReport(payload) {
+  async function callRetrieveReport(payload, options = {}) {
+    const reportConfig = payload?.reportConfig || {};
+    const pagination = reportConfig?.offsetPagination || {};
 
     const cfg = await getCfg();
     console.log("[ADS][DEBUG][cfg]", JSON.stringify(cfg, null, 2));
@@ -135,8 +177,19 @@
     console.log("[APO][ADS] retrieveReport ←", res.status, text.slice(0, 300));
     bridgeLog(
       res.ok ? "info" : "error",
-      `[ADS_BRIDGE] retrieveReport response: ${res.status}`,
-      { status: res.status, ok: res.ok, preview: text.slice(0, 300) }
+      `[ADS_BRIDGE] retrieveReport response: ${res.status} offset=${pagination.offset}`,
+      {
+        status: res.status,
+        ok: res.ok,
+        startDate: reportConfig.startDate,
+        endDate: reportConfig.endDate,
+        offset: pagination.offset,
+        size: pagination.size,
+        runId: options.runId,
+        lockOwner: !!options.lockOwner,
+        attempt: options.attempt,
+        preview: text.slice(0, 300),
+      }
     );
     return { status: res.status, ok: res.ok, text };
   }
@@ -186,8 +239,9 @@
         bridgeLog("info", "[ADS_SNIFFER] Headers extracted", { keys: Object.keys(data) });
         if (!Object.keys(data).length) return;
         // Lưu thẳng vào storage từ content-script (không cần postMessage)
-        setCfg({ ...data, adsHeaderLastSeen: Date.now() });
-        bridgeLog("info", "[ADS_BRIDGE] Headers captured and saved to storage", { keys: Object.keys(data) });
+        saveCapturedAdsHeaders(data, "ads_bridge_direct").catch((e) => {
+          bridgeLog("error", "[ADS_SNIFFER] save candidate error: " + e.message);
+        });
       } catch (e) {
         bridgeLog("error", "[ADS_SNIFFER] send error: " + e.message);
       }
@@ -211,10 +265,8 @@
       if (now - lastWrite < 300) return;
       lastWrite = now;
 
-      const toSave = { ...data, adsHeaderLastSeen: now };
-      await setCfg(toSave);
-      console.log("[APO][ADS] captured headers -> storage", toSave);
-      bridgeLog("info", "[ADS_BRIDGE] Headers captured and saved to storage", { keys: Object.keys(toSave) });
+      await saveCapturedAdsHeaders(data, "ads_bridge");
+      console.log("[APO][ADS] captured headers -> storage/candidate", data);
     } catch (e) {
       console.warn("[APO][ADS] save headers error:", e);
     }
@@ -228,7 +280,7 @@
     (async () => {
       if (msg?.type !== "ADS_FETCH_REPORT") return;
       try {
-        const r = await callRetrieveReport(msg.payload);
+        const r = await callRetrieveReport(msg.payload, msg.options || {});
         sendResponse(r);
       } catch (e) {
         console.error("[APO][ADS] retrieveReport error:", e);
