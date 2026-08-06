@@ -15,6 +15,13 @@ const adsApiLock = {
   runId: "",
   startedAt: 0,
 };
+const UPLOAD_TRACKING_LOCK_STALE_MS = 10 * 60 * 1000;
+const uploadTrackingLock = {
+  running: false,
+  taskName: "",
+  runId: "",
+  startedAt: 0,
+};
 
 // Global logger instance
 let extensionLogger = null;
@@ -327,6 +334,101 @@ async function withAdsApiLock(taskName, fn, options = {}) {
       await persistAdsLockState();
     }
   }
+}
+
+function makeUploadTrackingRunId(taskName) {
+  return `${taskName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function isUploadTrackingLocked() {
+  if (!uploadTrackingLock.running) return false;
+  const age = Date.now() - Number(uploadTrackingLock.startedAt || 0);
+  if (age > UPLOAD_TRACKING_LOCK_STALE_MS) {
+    const message = `[UPLOAD_TRACKING_LOCK] Stale lock expired ${uploadTrackingLock.taskName} runId=${uploadTrackingLock.runId}`;
+    debugLog(message, "error");
+    extensionLogger?.logInfo(message, { lock: { ...uploadTrackingLock }, age });
+    uploadTrackingLock.running = false;
+    uploadTrackingLock.taskName = "";
+    uploadTrackingLock.runId = "";
+    uploadTrackingLock.startedAt = 0;
+    chrome.storage.local.set({ uploadTrackingLockState: { ...uploadTrackingLock } }).catch(() => { });
+    return false;
+  }
+  return true;
+}
+
+async function persistUploadTrackingLockState() {
+  await chrome.storage.local.set({ uploadTrackingLockState: { ...uploadTrackingLock } });
+}
+
+function createUploadTrackingLockSkipped(taskName) {
+  return {
+    ok: false,
+    skipped: true,
+    reason: "UPLOAD_TRACKING_ALREADY_RUNNING",
+    runningTaskName: uploadTrackingLock.taskName,
+    runningRunId: uploadTrackingLock.runId,
+    requestedTaskName: taskName,
+  };
+}
+
+async function withUploadTrackingLock(taskName, fn, options = {}) {
+  if (isUploadTrackingLocked()) {
+    const skipped = createUploadTrackingLockSkipped(taskName);
+    const message = `[UPLOAD_TRACKING_LOCK] Skip ${taskName}, another upload is running: ${uploadTrackingLock.taskName}`;
+    debugLog(message, "info");
+    extensionLogger?.logInfo(message, {
+      requestedTaskName: taskName,
+      runningTaskName: uploadTrackingLock.taskName,
+      runningRunId: uploadTrackingLock.runId,
+      runningStartedAt: uploadTrackingLock.startedAt,
+    });
+    if (options.throwOnSkip) {
+      const err = new Error(message);
+      Object.assign(err, skipped);
+      throw err;
+    }
+    return skipped;
+  }
+
+  const runId = options.runId || makeUploadTrackingRunId(taskName);
+  uploadTrackingLock.running = true;
+  uploadTrackingLock.taskName = taskName;
+  uploadTrackingLock.runId = runId;
+  uploadTrackingLock.startedAt = Date.now();
+  await persistUploadTrackingLockState();
+
+  debugLog(`[UPLOAD_TRACKING_LOCK] Acquired ${taskName} runId=${runId}`, "success");
+  extensionLogger?.logInfo(`[UPLOAD_TRACKING_LOCK] Acquired ${taskName}`, {
+    runId,
+    taskName,
+    startedAt: uploadTrackingLock.startedAt,
+  });
+
+  try {
+    const result = await fn({ runId, taskName, lockOwner: true });
+    debugLog(`[UPLOAD_TRACKING_LOCK] Released success ${taskName} runId=${runId}`, "success");
+    extensionLogger?.logInfo(`[UPLOAD_TRACKING_LOCK] Released success ${taskName}`, { runId, taskName });
+    return result;
+  } catch (error) {
+    debugLog(`[UPLOAD_TRACKING_LOCK] Released error ${taskName} runId=${runId}: ${error?.message || error}`, "error");
+    extensionLogger?.logError(error, { runId, taskName }, `[UPLOAD_TRACKING_LOCK] Released error ${taskName}`);
+    throw error;
+  } finally {
+    if (uploadTrackingLock.runId === runId) {
+      uploadTrackingLock.running = false;
+      uploadTrackingLock.taskName = "";
+      uploadTrackingLock.runId = "";
+      uploadTrackingLock.startedAt = 0;
+      await persistUploadTrackingLockState();
+    }
+  }
+}
+
+async function runUploadTrackingWithLock(context = {}) {
+  return withUploadTrackingLock("UPLOAD_TRACKING", async (lock) => {
+    return uploadtracking({ ...context, lock });
+  });
 }
 
 function canMutateAdsHeaders(options = {}) {
@@ -1972,7 +2074,7 @@ function validateConfirmShipmentTsv(tsvContent = "") {
   };
 }
 
-async function uploadtracking() {
+async function uploadtracking(context = {}) {
   const startedAt = Date.now();
 
   if (!extensionLogger) await initializeLogger();
@@ -2246,13 +2348,14 @@ function parseTSV(tsv) {
 
 /* ===============================
    ORDERS: xin ref + kiểm tra + tải
-   =============================== */
+   ============================== */
 function buildNewOrdersPayload() {
   return {
     type: "newOrdersReport",
     reportVersion: "new",
     includeSalesChannel: false,
-    numDays: "1",
+    // Rolling 7 days avoids missed orders from Amazon/Pacific timezone and report delay; backend must upsert/dedupe by order id.
+    numDays: "7",
     numMonth: "0",
     numYear: "2015",
   };
@@ -2541,16 +2644,32 @@ async function postFileTo(url, fields) {
 }
 
 async function runImportNewOrders(referenceOverride) {
-  const { ingestUrl, shopId, ingestToken, refNewOrders } = await getCfg();
+  const { ingestUrl, shopId, ingestToken } = await getCfg();
   if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
   const { importNewUrl } = deriveApiUrls(ingestUrl);
 
   let referenceId = referenceOverride;
   if (!referenceId) {
+    const newOrdersPayload = buildNewOrdersPayload();
+    console.log("[IMPORT_ORDERS] Requesting New Orders report with rolling window: 7 days");
+    extensionLogger?.logInfo("[IMPORT_ORDERS] Requesting New Orders report with rolling window: 7 days", {
+      numDays: newOrdersPayload.numDays,
+    });
+
     try {
-      referenceId = await requestReferenceIdNew(buildNewOrdersPayload());
-    } catch (e) {
-      referenceId = refNewOrders;
+      referenceId = await requestReferenceIdNew(newOrdersPayload);
+    } catch (error) {
+      extensionLogger?.logError(
+        error,
+        {
+          function: "runImportNewOrders",
+          stage: "requestReferenceIdNew",
+          numDays: newOrdersPayload.numDays,
+          fallbackDisabled: true,
+        },
+        "[IMPORT_ORDERS] Failed to request fresh New Orders report; fallback refNewOrders disabled"
+      );
+      throw error;
     }
   }
   if (!referenceId) throw new Error("No referenceId found for NEW orders.");
@@ -2582,18 +2701,62 @@ async function runImportNewOrders(referenceOverride) {
   );
   fd.append("type", "New");
 
-  const resp = await fetch(importNewUrl, {
-    method: "POST",
-    headers: { "x-access-token": ingestToken || "" },
-    body: fd,
-  });
-  if (!resp.ok) throw new Error(`Backend ${resp.status}`);
-  const ingest = (resp.headers.get("content-type") || "")
-    .toLowerCase()
-    .includes("application/json")
-    ? await resp.json()
-    : { ok: true, raw: await resp.text() };
+  let importNewOrigin = "";
+  let hasImportNewHostPermission = null;
+  try {
+    importNewOrigin = new URL(importNewUrl).origin;
+    if (chrome?.permissions?.contains) {
+      hasImportNewHostPermission = await chrome.permissions.contains({
+        origins: [`${importNewOrigin}/*`],
+      });
+    }
+  } catch (_) { }
 
+  let resp;
+  try {
+    resp = await fetch(importNewUrl, {
+      method: "POST",
+      headers: { "x-access-token": ingestToken || "" },
+      body: fd,
+    });
+  } catch (error) {
+    const hint = importNewOrigin
+      ? ` Check API Base URL, backend availability, HTTPS certificate, and manifest host_permissions for ${importNewOrigin}/*`
+      : " Check API Base URL and backend availability.";
+    const wrapped = new Error(
+      `[IMPORT_ORDERS] Backend upload failed before HTTP response: ${error?.message || error}.${hint}`
+    );
+    wrapped.cause = error;
+    extensionLogger?.logError(
+      error,
+      {
+        function: "runImportNewOrders",
+        stage: "backendUploadFetch",
+        ingestUrl,
+        importNewUrl,
+        importNewOrigin,
+        hasImportNewHostPermission,
+        shopId,
+        hasIngestToken: !!ingestToken,
+      },
+      "[IMPORT_ORDERS] Backend upload fetch failed before HTTP response"
+    );
+    throw wrapped;
+  }
+  const responseText = await resp.text();
+  let responseBody = null;
+  try {
+    responseBody = responseText ? JSON.parse(responseText) : null;
+  } catch {
+    responseBody = { raw: responseText };
+  }
+
+  if (!resp.ok) {
+    const backendMessage = responseBody?.error || responseBody?.message || responseText;
+    throw new Error(`Backend ${resp.status}${backendMessage ? `: ${backendMessage}` : ""}`);
+  }
+
+  const ingest = responseBody || { ok: true, raw: responseText };
   return { ok: true, rows, documentId, referenceId, ingest };
 }
 
@@ -3794,6 +3957,7 @@ async function runFullFlowAndEmitLogs(trigger = "auto") {
     await getBaseShopAndIdentity();
   const phases = [];
   const startTime = Date.now();
+  const taskId = `import_orders_${startTime}`;
 
   // Initialize logger if not exists
   if (!extensionLogger) {
@@ -3803,45 +3967,36 @@ async function runFullFlowAndEmitLogs(trigger = "auto") {
   // Log task processing start
   if (extensionLogger) {
     await extensionLogger.logTaskProcessing({
-      taskId: `import_orders_${Date.now()}`,
+      taskId,
       taskType: 'IMPORT_ORDERS',
-      batchId: `import_orders_${Date.now()}`,
+      batchId: taskId,
       ordersCount: 0
     }, `Starting full import flow (trigger: ${trigger})`);
   }
 
   try {
-    try {
-      await runImportNewOrders(undefined);
-      phases.push({ type: "import", status: "success" });
+    const importResult = await runImportNewOrders(undefined);
+    phases.push({
+      type: "import",
+      status: "success",
+      rows: importResult?.rows || 0,
+      referenceId: importResult?.referenceId || null,
+      documentId: importResult?.documentId || null,
+    });
 
-      // Log task completed
-      if (extensionLogger) {
-        const endTime = Date.now();
-        await extensionLogger.logTaskCompleted({
-          taskId: `import_orders_${startTime}`,
-          taskType: 'IMPORT_ORDERS',
-          batchId: `import_orders_${startTime}`,
-          ordersCount: 0
-        }, {
-          duration: endTime - startTime,
-          memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
-          cpuUsage: 0
-        }, 'Import orders completed successfully');
-      }
-
-    } catch (error) {
-      phases.push({ type: "import", status: "fail" });
-
-      // Log task failed
-      if (extensionLogger) {
-        await extensionLogger.logTaskFailed({
-          taskId: `import_orders_${startTime}`,
-          taskType: 'IMPORT_ORDERS',
-          batchId: `import_orders_${startTime}`,
-          ordersCount: 0
-        }, error, 'Import orders failed');
-      }
+    // Log task completed
+    if (extensionLogger) {
+      const endTime = Date.now();
+      await extensionLogger.logTaskCompleted({
+        taskId,
+        taskType: 'IMPORT_ORDERS',
+        batchId: taskId,
+        ordersCount: importResult?.rows || 0
+      }, {
+        duration: endTime - startTime,
+        memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
+        cpuUsage: 0
+      }, 'Import orders completed successfully');
     }
 
     await postLogSingle({
@@ -3851,14 +4006,28 @@ async function runFullFlowAndEmitLogs(trigger = "auto") {
       label: clientLabel,
       action: trigger,
       level: "success",
-      message: "✅ Import order success!",
+      message: `\u2705 Import order success! rows=${importResult?.rows || 0}`,
     });
-  } catch (e) {
-    console.log(e);
+
+    return { ok: true, phases, result: importResult };
+  } catch (error) {
+    const errorMessage = error?.message || String(error);
+    phases.push({
+      type: "import",
+      status: "fail",
+      error: errorMessage,
+    });
 
     // Log general error
     if (extensionLogger) {
-      await extensionLogger.logError(e, {
+      await extensionLogger.logTaskFailed({
+        taskId,
+        taskType: 'IMPORT_ORDERS',
+        batchId: taskId,
+        ordersCount: 0
+      }, error, 'Import orders failed');
+
+      await extensionLogger.logError(error, {
         trigger: trigger,
         function: 'runFullFlowAndEmitLogs'
       }, 'Full import flow error');
@@ -3871,11 +4040,11 @@ async function runFullFlowAndEmitLogs(trigger = "auto") {
       label: clientLabel,
       action: trigger,
       level: "error",
-      message: "❌ Import order error!",
+      message: `\u274C Import order error: ${errorMessage}`,
     });
-  }
 
-  return { ok: true, phases };
+    throw error;
+  }
 }
 
 //  Handle Confirm Shipping
@@ -4501,8 +4670,14 @@ export async function connectSocketIO(force = false) {
       startHeartbeat();
       startTestConnectionPolling();
       startAutoReconnectPolling();
-      startAutoConfigScheduler();
-      startAutoConfigSync();
+      Promise.resolve(startAutoConfigScheduler()).catch((error) => {
+        debugLog(`[AUTO-CFG] Socket start error: ${error.message}`, "error");
+        extensionLogger?.logError(error, { source: "socket_connect" }, "[AUTO-CFG] Socket start error");
+      });
+      Promise.resolve(startAutoConfigSync()).catch((error) => {
+        debugLog(`[AUTO-CFG-SYNC] Socket start error: ${error.message}`, "error");
+        extensionLogger?.logError(error, { source: "socket_connect" }, "[AUTO-CFG-SYNC] Socket start error");
+      });
 
       safeLogConnectionStatus('connected', {
         socketId: socket?.id || null,
@@ -4667,15 +4842,7 @@ export async function connectSocketIO(force = false) {
     //             message: `📄 Prepared file: ${file.filename} (${file.content.length} bytes)`
     //           });
 
-    //           // 2. Upload lên platform ngay lập tức
-    //           uploadToAmazon(fileObj, uploadParams).then(() => {
-    //             console.log(`✅ Successfully uploaded ${file.filename}`);
-    //             // Optional: Báo cáo kết quả về server
-    //             reportUploadResult(payload.batchId, 'success');
-    //           }).catch(error => {
-    //             console.error(`❌ Failed to upload ${file.filename}:`, error);
-    //             reportUploadResult(payload.batchId, 'failed', error.message);
-    //           });
+    //           // Deprecated fire-and-forget upload removed; see handleServerTask.
     //         }
     //         break;
     //       default: 
@@ -5068,6 +5235,24 @@ async function handleServerTask(task) {
           }
 
           const { file, uploadParams, trackingData } = payload;
+          if (!file || typeof file.content !== "string" || !file.filename) {
+            const error = new Error("UPLOAD_TRACKING payload.file is required");
+            debugLog(`[UPLOAD_TRACKING] ${error.message}`, "error");
+            if (payload?.batchId) {
+              await reportUploadResult(payload.batchId, "failed", error.message);
+              error._uploadTrackingReported = true;
+            }
+            if (extensionLogger) {
+              await extensionLogger.logTaskFailed({
+                taskId: uploadTaskId,
+                taskType: type,
+                batchId: payload?.batchId,
+                ordersCount: payload?.trackingData?.length || 0,
+                filename: payload?.file?.filename
+              }, error, "[UPLOAD_TRACKING] Upload tracking payload validation failed");
+            }
+            throw error;
+          }
 
           // 1. File TXT đã sẵn sàng, không cần tạo
           console.log('📄 [EXT-DEBUG] Preparing file blob...');
@@ -5108,12 +5293,16 @@ async function handleServerTask(task) {
             ordersCount: trackingData?.length || uploadParams?.ordersCount || 0
           };
 
-          uploadToAmazon(fileObj, trackingUploadParams)
-            .then(async () => {
-              console.log(`✅ [EXT-DEBUG] Successfully uploaded ${file.filename}`);
-              console.log('📝 [EXT-DEBUG] Reporting success to server...');
+          try {
+            const result = await withUploadTrackingLock("UPLOAD_TRACKING_SOCKET", async () => {
+              const uploadResult = await uploadToAmazon(fileObj, trackingUploadParams);
+              console.log(`[EXT-DEBUG] Successfully uploaded ${file.filename}`);
+              console.log("[EXT-DEBUG] Reporting success to server...");
 
-              // Log task completed
+              if (payload?.batchId) {
+                await reportUploadResult(payload.batchId, "success");
+              }
+
               if (extensionLogger) {
                 const uploadEndTime = Date.now();
                 await extensionLogger.logTaskCompleted({
@@ -5129,28 +5318,37 @@ async function handleServerTask(task) {
                 }, `[UPLOAD_TRACKING] Upload tracking completed successfully: ${file.filename}`);
               }
 
-              // Optional: Báo cáo kết quả về server
-              reportUploadResult(payload.batchId, 'success');
-            })
-            .catch(async error => {
-              console.error(`❌ [EXT-DEBUG] Failed to upload ${file.filename}:`, error);
-              console.log('📝 [EXT-DEBUG] Reporting failure to server...');
-
-              // Log task failed
-              if (extensionLogger) {
-                await extensionLogger.logTaskFailed({
-                  taskId: uploadTaskId,
-                  taskType: type,
-                  batchId: payload?.batchId,
-                  ordersCount: payload?.trackingData?.length || 0,
-                  filename: payload?.file?.filename
-                }, error, `[UPLOAD_TRACKING] Upload tracking failed: ${file.filename}`);
-              }
-
-              reportUploadResult(payload.batchId, 'failed', error.message);
+              return uploadResult;
             });
 
-          console.log('🎯 [EXT-DEBUG] Upload initiated, waiting for result...');
+            if (result?.skipped) {
+              debugLog("[UPLOAD_TRACKING] skipped because another upload is running", "info");
+              return result;
+            }
+
+            console.log("[EXT-DEBUG] Upload completed");
+            return result;
+          } catch (error) {
+            console.error(`[EXT-DEBUG] Failed to upload ${file.filename}:`, error);
+            console.log("[EXT-DEBUG] Reporting failure to server...");
+
+            if (payload?.batchId) {
+              await reportUploadResult(payload.batchId, "failed", error.message);
+              error._uploadTrackingReported = true;
+            }
+
+            if (extensionLogger) {
+              await extensionLogger.logTaskFailed({
+                taskId: uploadTaskId,
+                taskType: type,
+                batchId: payload?.batchId,
+                ordersCount: payload?.trackingData?.length || 0,
+                filename: payload?.file?.filename
+              }, error, `[UPLOAD_TRACKING] Upload tracking failed: ${file.filename}`);
+            }
+
+            throw error;
+          }
         } else {
           console.log('⚠️ [EXT-DEBUG] Non-auto-generated UPLOAD_TRACKING task, skipping...');
         }
@@ -5169,7 +5367,7 @@ async function handleServerTask(task) {
     console.error("📦 [EXT-DEBUG] Task that caused error:", { type, payload });
 
     // Report error for UPLOAD_TRACKING tasks
-    if (type === "UPLOAD_TRACKING" && payload?.batchId) {
+    if (type === "UPLOAD_TRACKING" && payload?.batchId && !e?._uploadTrackingReported) {
       console.log('📝 [EXT-DEBUG] Reporting task error to server...');
       try {
         await reportUploadResult(payload.batchId, 'failed', e?.message || 'Unknown error');
@@ -5177,6 +5375,7 @@ async function handleServerTask(task) {
         console.error('❌ [EXT-DEBUG] Failed to report error:', reportError);
       }
     }
+    return { ok: false, error: e?.message || String(e) };
   }
 
   console.log('📨 [EXT-DEBUG] ===== END TASK PROCESSING =====\n');
@@ -5580,10 +5779,17 @@ async function testConnection() {
 
 /* ===============================
    AUTO CONFIG SCHEDULER
-   Đọc config từ storage, tạo interval cho từng task
+   Reads backend config and reconciles chrome.alarms for production auto tasks.
    =============================== */
 
-const autoConfigTimers = {};
+const autoConfigTimers = {}; // Legacy interval cleanup only; production scheduling uses chrome.alarms.
+const AUTO_CONFIG_TYPES = ["IMPORT_ORDER", "IMPORT_FBM", "IMPORT_ADS", "UPLOAD_TRACKING"];
+const AUTO_CONFIG_SYNC_ALARM = "AUTO_CFG_SYNC";
+const AUTO_CONFIG_DEBOUNCE_MS = 3000;
+let _autoConfigSyncTimer = null;
+let _lastAutoConfigSnapshot = null;
+let autoConfigSchedulerStarting = false;
+let autoConfigAlarmListenerRegistered = false;
 
 function yesterdayYMD() {
   const d = new Date();
@@ -5591,182 +5797,251 @@ function yesterdayYMD() {
   return d.toISOString().slice(0, 10);
 }
 
-async function startAutoConfigScheduler() {
-  stopAutoConfigScheduler();
-  if (!extensionLogger) await initializeLogger();
-
-  const { ingestUrl, shopId } = await getCfg();
-  if (!ingestUrl || !shopId) {
-    debugLog("⚙️ [AUTO-CFG] No ingestUrl or shopId, skipping scheduler", "info");
-    return;
-  }
-
-  // Debounce: tránh gọi liên tiếp trong 3 giây
-  const now = Date.now();
-  if (startAutoConfigScheduler._lastRun && now - startAutoConfigScheduler._lastRun < 3000) {
-    debugLog("⚙️ [AUTO-CFG] Debounced duplicate call, skipping", "info");
-    return;
-  }
-  startAutoConfigScheduler._lastRun = now;
-
-  let records = [];
-  try {
-    const res = await fetch(`${ingestUrl}/api/auto-config?shopId=${shopId}`);
-    const json = await res.json();
-    if (!json.success) throw new Error("API returned success=false");
-    records = (json.data || []).filter(r => r.shopId === shopId);
-    debugLog(`⚙️ [AUTO-CFG] Loaded ${records.length} configs from API`, "info");
-    extensionLogger?.logInfo("[AUTO-CFG] Scheduler starting", { total: records.length });
-    // Lưu snapshot để sync timer so sánh
-    _lastAutoConfigSnapshot = JSON.stringify(records.map(r => ({ type: r.type, status: r.status, time: r.time })));
-  } catch (e) {
-    debugLog(`❌ [AUTO-CFG] Failed to load config from API: ${e.message}`, "error");
-    return;
-  }
-
-  const ALL_TYPES = ["IMPORT_ORDER", "IMPORT_FBM", "IMPORT_ADS", "UPLOAD_TRACKING"];
-  const activeTypes = records.filter(r => r.status === true).map(r => r.type);
-
-  // Log tất cả types — cả enabled lẫn disabled
-  for (const type of ALL_TYPES) {
-    const record = records.find(r => r.type === type);
-    if (!record || record.status !== true) {
-      const time = record ? record.time : "N/A";
-      debugLog(`⏸️ [AUTO-CFG] ${type} — status: OFF — interval: ${time} min`, "info");
-      extensionLogger?.logInfo(`[AUTO-CFG] ${type} disabled`, { time });
-    }
-  }
-
-  for (const record of records.filter(r => r.status === true)) {
-    const mins = parseInt(record.time) || 60;
-    const ms = mins * 60 * 1000;
-
-    if (record.type === "IMPORT_ORDER") {
-      debugLog(`✅ [AUTO-CFG] IMPORT_ORDERS — status: ON — interval: ${mins} min`, "success");
-      extensionLogger?.logInfo("[AUTO-CFG] IMPORT_ORDERS enabled", { intervalMin: mins });
-      autoConfigTimers.orders = setInterval(async () => {
-        const ts = new Date().toLocaleTimeString();
-        debugLog(`🔄 [AUTO-CFG] IMPORT_ORDERS tick — ${ts}`, "info");
-        try {
-          await handleServerTask({ type: "IMPORT_ORDERS", payload: {} });
-          debugLog("✅ [AUTO-CFG] IMPORT_ORDERS completed", "success");
-        } catch (e) {
-          debugLog(`❌ [AUTO-CFG] IMPORT_ORDERS error: ${e.message}`, "error");
-        }
-      }, ms);
-
-    } else if (record.type === "IMPORT_FBM") {
-      debugLog(`✅ [AUTO-CFG] IMPORT_FBM_ORDERS — status: ON — interval: ${mins} min`, "success");
-      extensionLogger?.logInfo("[AUTO-CFG] IMPORT_FBM_ORDERS enabled", { intervalMin: mins });
-      autoConfigTimers.fbm = setInterval(async () => {
-        const ts = new Date().toLocaleTimeString();
-        debugLog(`🔄 [AUTO-CFG] IMPORT_FBM_ORDERS tick — ${ts}`, "info");
-        try {
-          await handleServerTask({ type: "IMPORT_FBM_ORDERS", payload: {} });
-          debugLog("✅ [AUTO-CFG] IMPORT_FBM_ORDERS completed", "success");
-        } catch (e) {
-          debugLog(`❌ [AUTO-CFG] IMPORT_FBM_ORDERS error: ${e.message}`, "error");
-        }
-      }, ms);
-
-    } else if (record.type === "IMPORT_ADS") {
-      debugLog(`✅ [AUTO-CFG] IMPORT_ADS_SPEND — status: ON — interval: ${mins} min`, "success");
-      extensionLogger?.logInfo("[AUTO-CFG] IMPORT_ADS_SPEND enabled", { intervalMin: mins });
-      autoConfigTimers.ads = setInterval(async () => {
-        const date = yesterdayYMD();
-        const ts = new Date().toLocaleTimeString();
-        debugLog(`🔄 [AUTO-CFG] IMPORT_ADS_SPEND tick — date: ${date} — ${ts}`, "info");
-        try {
-          const result = await handleServerTask({ type: "IMPORT_ADS_SPEND", payload: { date } });
-          if (result?.skipped && result?.reason === "ADS_TASK_ALREADY_RUNNING") {
-            debugLog("[ADS-LOCK] Skip IMPORT_ADS_SPEND, another Ads task is running", "info");
-            return;
-          }
-          debugLog(`✅ [AUTO-CFG] IMPORT_ADS_SPEND completed for ${date}`, "success");
-        } catch (e) {
-          debugLog(`❌ [AUTO-CFG] IMPORT_ADS_SPEND error: ${e.message}`, "error");
-        }
-      }, ms);
-
-    } else if (record.type === "UPLOAD_TRACKING") {
-      debugLog(`✅ [AUTO-CFG] UPLOAD_TRACKING — status: ON — interval: ${mins} min`, "success");
-      extensionLogger?.logInfo("[AUTO-CFG] UPLOAD_TRACKING enabled", { intervalMin: mins });
-      autoConfigTimers.upload = setInterval(async () => {
-        const ts = new Date().toLocaleTimeString();
-        debugLog(`🔄 [AUTO-CFG] UPLOAD_TRACKING tick — ${ts}`, "info");
-        try {
-          await uploadtracking();
-          debugLog("✅ [AUTO-CFG] UPLOAD_TRACKING completed", "success");
-        } catch (e) {
-          debugLog(`❌ [AUTO-CFG] UPLOAD_TRACKING error: ${e.message}`, "error");
-        }
-      }, ms);
-    }
-  }
-
-  debugLog("⚙️ [AUTO-CFG] Scheduler started", "success");
+function getAutoConfigAlarmName(type) {
+  const names = {
+    IMPORT_ORDER: "AUTO_CFG_IMPORT_ORDER",
+    IMPORT_FBM: "AUTO_CFG_IMPORT_FBM",
+    IMPORT_ADS: "AUTO_CFG_IMPORT_ADS",
+    UPLOAD_TRACKING: "AUTO_CFG_UPLOAD_TRACKING",
+  };
+  return names[type] || null;
 }
 
-function stopAutoConfigScheduler() {
+function isAutoConfigAlarmName(name) {
+  return name === AUTO_CONFIG_SYNC_ALARM || AUTO_CONFIG_TYPES.some((type) => getAutoConfigAlarmName(type) === name);
+}
+
+function autoConfigSnapshotForRecords(records = []) {
+  return JSON.stringify(
+    records
+      .map((r) => ({ type: r.type, status: r.status === true, time: Number.parseInt(r.time, 10) || 60 }))
+      .sort((a, b) => String(a.type).localeCompare(String(b.type)))
+  );
+}
+
+function getAutoConfigPeriodMinutes(record) {
+  return Math.max(1, Number.parseInt(record?.time, 10) || 60);
+}
+
+async function ensureAutoConfigSyncAlarm() {
+  await chrome.alarms.create(AUTO_CONFIG_SYNC_ALARM, { periodInMinutes: 10 });
+  debugLog("[AUTO-CFG] Alarm created AUTO_CFG_SYNC every 10 min", "info");
+}
+
+async function clearAutoConfigAlarms() {
+  const alarms = await chrome.alarms.getAll();
+  for (const alarm of alarms.filter((item) => isAutoConfigAlarmName(item.name))) {
+    await chrome.alarms.clear(alarm.name);
+    debugLog(`[AUTO-CFG] Alarm cleared ${alarm.name}`, "info");
+    extensionLogger?.logInfo("[AUTO-CFG] Alarm cleared", { name: alarm.name });
+  }
+}
+
+async function reconcileAutoConfigAlarms(records = []) {
+  const activeRecords = records.filter((record) => record.status === true && getAutoConfigAlarmName(record.type));
+  const desired = new Map();
+
+  for (const record of activeRecords) {
+    const name = getAutoConfigAlarmName(record.type);
+    const periodInMinutes = getAutoConfigPeriodMinutes(record);
+    desired.set(name, { record, periodInMinutes });
+  }
+  desired.set(AUTO_CONFIG_SYNC_ALARM, { periodInMinutes: 10 });
+
+  const existing = await chrome.alarms.getAll();
+  for (const alarm of existing.filter((item) => isAutoConfigAlarmName(item.name))) {
+    if (!desired.has(alarm.name)) {
+      await chrome.alarms.clear(alarm.name);
+      debugLog(`[AUTO-CFG] Alarm cleared ${alarm.name}`, "info");
+      extensionLogger?.logInfo("[AUTO-CFG] Alarm cleared", { name: alarm.name });
+    }
+  }
+
+  for (const [name, cfg] of desired.entries()) {
+    await chrome.alarms.create(name, { periodInMinutes: cfg.periodInMinutes });
+    debugLog(`[AUTO-CFG] Alarm created ${name} every ${cfg.periodInMinutes} min`, "success");
+    extensionLogger?.logInfo("[AUTO-CFG] Alarm created", { name, periodInMinutes: cfg.periodInMinutes, type: cfg.record?.type });
+  }
+
+  return { enabledCount: activeRecords.length, disabledCount: records.length - activeRecords.length, scheduler: "alarms" };
+}
+
+async function fetchAutoConfigRecords() {
+  const { ingestUrl, shopId } = await getCfg();
+  if (!ingestUrl || !shopId) {
+    throw new Error("Missing ingestUrl or shopId");
+  }
+
+  const res = await fetch(`${ingestUrl}/api/auto-config?shopId=${encodeURIComponent(shopId)}`);
+  const json = await res.json();
+  if (!json.success) throw new Error("API returned success=false");
+
+  return (json.data || []).filter((record) => record.shopId === shopId);
+}
+
+async function startAutoConfigScheduler(options = {}) {
+  const force = !!options.force;
+  const reason = options.reason || "manual";
+
+  if (autoConfigSchedulerStarting) {
+    debugLog(`[AUTO-CFG] Scheduler already starting; skipping duplicate call reason=${reason} force=${force}`, "info");
+    extensionLogger?.logInfo("[AUTO-CFG] Scheduler already starting; skipping duplicate call", { force, reason });
+    return { ok: true, skipped: true, reason: "AUTO_CONFIG_SCHEDULER_ALREADY_STARTING", force };
+  }
+
+  const now = Date.now();
+  if (!force && startAutoConfigScheduler._lastRun && now - startAutoConfigScheduler._lastRun < AUTO_CONFIG_DEBOUNCE_MS) {
+    debugLog(`[AUTO-CFG] Debounced duplicate call, keeping existing alarms reason=${reason} force=${force}`, "info");
+    extensionLogger?.logInfo("[AUTO-CFG] Debounced duplicate call, keeping existing alarms", { force, reason });
+    return { ok: true, skipped: true, reason: "AUTO_CONFIG_SCHEDULER_DEBOUNCED", force };
+  }
+  startAutoConfigScheduler._lastRun = now;
+  autoConfigSchedulerStarting = true;
+
+  try {
+    if (!extensionLogger) await initializeLogger();
+    const listenerReady = ensureAutoConfigAlarmListener();
+    if (!listenerReady) {
+      return {
+        ok: false,
+        error: "CHROME_ALARMS_UNAVAILABLE",
+        message: "chrome.alarms is unavailable. Check manifest permissions.",
+        force,
+        reason,
+      };
+    }
+
+    const records = await fetchAutoConfigRecords();
+    const snapshot = autoConfigSnapshotForRecords(records);
+    _lastAutoConfigSnapshot = snapshot;
+
+    await chrome.storage.local.set({
+      autoConfigRecordsSnapshot: records,
+      autoConfigLastLoadedAt: Date.now(),
+      autoConfigSnapshot: snapshot,
+    });
+
+    debugLog(`[AUTO-CFG] Loaded ${records.length} configs from API`, "info");
+    debugLog(`[AUTO-CFG] Scheduler starting reason=${reason} force=${force}`, "info");
+    extensionLogger?.logInfo("[AUTO-CFG] Scheduler starting", { total: records.length, scheduler: "alarms", force, reason });
+
+    for (const type of AUTO_CONFIG_TYPES) {
+      const record = records.find((item) => item.type === type);
+      const mins = record ? getAutoConfigPeriodMinutes(record) : "N/A";
+      if (record?.status === true) {
+        debugLog(`[AUTO-CFG] ${type} ON interval=${mins} min`, "success");
+      } else {
+        debugLog(`[AUTO-CFG] ${type} OFF interval=${mins} min`, "info");
+      }
+    }
+
+    const result = await reconcileAutoConfigAlarms(records);
+    debugLog("[AUTO-CFG] Config changed; alarms reconciled", "success");
+    return { ok: true, ...result, force, reason };
+  } catch (error) {
+    debugLog(`[AUTO-CFG] Scheduler error: ${error.message}`, "error");
+    extensionLogger?.logError(error, { scheduler: "alarms", force, reason }, "[AUTO-CFG] Scheduler error");
+    return { ok: false, error: error.message, force, reason };
+  } finally {
+    autoConfigSchedulerStarting = false;
+  }
+}
+
+async function stopAutoConfigScheduler() {
   for (const [key, timer] of Object.entries(autoConfigTimers)) {
     clearInterval(timer);
     delete autoConfigTimers[key];
-    debugLog(`🛑 [AUTO-CFG] Stopped timer: ${key}`, "info");
-    extensionLogger?.logInfo(`[AUTO-CFG] Timer stopped: ${key}`);
+    debugLog(`[AUTO-CFG] Stopped legacy timer: ${key}`, "info");
+    extensionLogger?.logInfo(`[AUTO-CFG] Legacy timer stopped: ${key}`);
+  }
+  await clearAutoConfigAlarms();
+}
+
+async function handleAutoConfigAlarm(alarm) {
+  if (!alarm?.name || !isAutoConfigAlarmName(alarm.name)) return;
+  debugLog(`[AUTO-CFG] Alarm tick ${alarm.name}`, "info");
+  extensionLogger?.logInfo("[AUTO-CFG] Alarm tick", { name: alarm.name, scheduledTime: alarm.scheduledTime });
+
+  try {
+    if (alarm.name === "AUTO_CFG_IMPORT_ORDER") {
+      await handleServerTask({ type: "IMPORT_ORDERS", payload: { source: "auto_alarm" } });
+    } else if (alarm.name === "AUTO_CFG_IMPORT_FBM") {
+      await handleServerTask({ type: "IMPORT_FBM_ORDERS", payload: { source: "auto_alarm" } });
+    } else if (alarm.name === "AUTO_CFG_IMPORT_ADS") {
+      const date = yesterdayYMD();
+      await handleServerTask({ type: "IMPORT_ADS_SPEND", payload: { date, source: "auto_alarm" } });
+    } else if (alarm.name === "AUTO_CFG_UPLOAD_TRACKING") {
+      await runUploadTrackingWithLock({ source: "auto_alarm" });
+    } else if (alarm.name === AUTO_CONFIG_SYNC_ALARM) {
+      const records = await fetchAutoConfigRecords();
+      const snapshot = autoConfigSnapshotForRecords(records);
+      if (snapshot === _lastAutoConfigSnapshot) {
+        debugLog("[AUTO-CFG-SYNC] No changes detected", "info");
+        return;
+      }
+      debugLog("[AUTO-CFG] Config changed; alarms reconciled", "info");
+      await startAutoConfigScheduler({
+        force: true,
+        reason: "AUTO_CFG_SYNC_CHANGED"
+      });
+    }
+  } catch (error) {
+    debugLog(`[AUTO-CFG] Alarm ${alarm.name} error: ${error.message}`, "error");
+    extensionLogger?.logError(error, { alarmName: alarm.name }, "[AUTO-CFG] Alarm error");
   }
 }
 
-// ── Auto sync config từ API mỗi 10 phút ──
-let _autoConfigSyncTimer = null;
-let _lastAutoConfigSnapshot = null;
+function ensureAutoConfigAlarmListener() {
+  if (!chrome?.alarms?.onAlarm) {
+    const message = "[AUTO-CFG] chrome.alarms unavailable. Check manifest permissions: add 'alarms'.";
+    debugLog(message, "error");
+    extensionLogger?.logInfo(message, {
+      missingPermission: "alarms",
+      manifestHint: "Add 'alarms' to permissions in manifest.json"
+    });
+    return false;
+  }
 
-async function startAutoConfigSync() {
-  if (_autoConfigSyncTimer) clearInterval(_autoConfigSyncTimer);
+  if (
+    autoConfigAlarmListenerRegistered ||
+    chrome.alarms.onAlarm.hasListener(handleAutoConfigAlarm)
+  ) {
+    autoConfigAlarmListenerRegistered = true;
+    return true;
+  }
 
-  debugLog("🔁 [AUTO-CFG-SYNC] Started — will re-check API every 10 min", "info");
-
-  _autoConfigSyncTimer = setInterval(async () => {
-    try {
-      const { ingestUrl, shopId } = await getCfg();
-      if (!ingestUrl || !shopId) return;
-
-      debugLog("🔁 [AUTO-CFG-SYNC] Checking for config changes...", "info");
-
-      const res = await fetch(`${ingestUrl}/api/auto-config?shopId=${shopId}`);
-      const json = await res.json();
-      if (!json.success) return;
-
-      const records = (json.data || []).filter(r => r.shopId === shopId);
-      const snapshot = JSON.stringify(records.map(r => ({ type: r.type, status: r.status, time: r.time })));
-
-      if (snapshot === _lastAutoConfigSnapshot) {
-        debugLog("✅ [AUTO-CFG-SYNC] No changes detected", "info");
-        return;
-      }
-
-      debugLog("⚠️ [AUTO-CFG-SYNC] Config changed — restarting scheduler...", "info");
-      _lastAutoConfigSnapshot = snapshot;
-
-      // Log chi tiết thay đổi
-      const active = records.filter(r => r.status === true);
-      const inactive = records.filter(r => r.status !== true);
-      active.forEach(r => debugLog(`  ✅ ${r.type} — ON — ${r.time} min`, "success"));
-      inactive.forEach(r => debugLog(`  ⏸️ ${r.type} — OFF — ${r.time} min`, "info"));
-
-      await startAutoConfigScheduler();
-      debugLog("✅ [AUTO-CFG-SYNC] Scheduler restarted with new config", "success");
-    } catch (e) {
-      debugLog(`❌ [AUTO-CFG-SYNC] Error: ${e.message}`, "error");
-    }
-  }, 10 * 60 * 1000);
+  chrome.alarms.onAlarm.addListener(handleAutoConfigAlarm);
+  autoConfigAlarmListenerRegistered = true;
+  debugLog("[AUTO-CFG] Alarm listener registered", "success");
+  extensionLogger?.logInfo("[AUTO-CFG] Alarm listener registered");
+  return true;
 }
 
-function stopAutoConfigSync() {
+async function startAutoConfigSync() {
   if (_autoConfigSyncTimer) {
     clearInterval(_autoConfigSyncTimer);
     _autoConfigSyncTimer = null;
-    debugLog("🛑 [AUTO-CFG-SYNC] Stopped", "info");
   }
+  const listenerReady = ensureAutoConfigAlarmListener();
+  if (!listenerReady) {
+    return { ok: false, error: "CHROME_ALARMS_UNAVAILABLE" };
+  }
+  await ensureAutoConfigSyncAlarm();
+  debugLog("[AUTO-CFG-SYNC] Started with chrome.alarms every 10 min", "info");
+  return { ok: true, scheduler: "alarms" };
+}
+
+async function stopAutoConfigSync() {
+  if (_autoConfigSyncTimer) {
+    clearInterval(_autoConfigSyncTimer);
+    _autoConfigSyncTimer = null;
+  }
+  await chrome.alarms.clear(AUTO_CONFIG_SYNC_ALARM);
+  debugLog("[AUTO-CFG-SYNC] Stopped", "info");
+}
+
+if (!ensureAutoConfigAlarmListener()) {
+  debugLog("[AUTO-CFG] Initial alarm listener registration skipped", "error");
 }
 
 // Bắt đầu polling connection status report mỗi 3 phút
@@ -6054,8 +6329,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
 
       if (msg.type === "RELOAD_AUTO_CONFIG") {
-        await startAutoConfigScheduler();
-        return sendResponse({ ok: true });
+        const result = await startAutoConfigScheduler();
+        await startAutoConfigSync();
+        return sendResponse(result);
       }
 
       if (msg.type === "ADS_BRIDGE_LOG") {
@@ -6201,26 +6477,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           }
         };
 
-        // Trigger upload with manual token
-        const { type, payload } = testTask;
-        const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
+        const { payload } = testTask;
 
         if (payload) {
           const { file, uploadParams } = payload;
-
           const blob = new Blob([file.content], { type: file.contentType });
           const fileObj = new File([blob], file.filename);
 
-          uploadToAmazon(fileObj, uploadParams).then(() => {
-            debugLog(`✅ Manual CSRF test successful!`, 'success');
-            sendResponse({ ok: true, message: "Manual CSRF test successful" });
-          }).catch(error => {
-            debugLog(`❌ Manual CSRF test failed: ${error.message}`, 'error');
-            sendResponse({ ok: false, error: error.message });
-          });
+          try {
+            const result = await withUploadTrackingLock("UPLOAD_TRACKING_TEST_TOKEN", async () => {
+              return uploadToAmazon(fileObj, uploadParams);
+            });
+            if (result?.skipped) {
+              debugLog("[UPLOAD_TRACKING] Manual CSRF test skipped because another upload is running", "info");
+              return sendResponse(result);
+            }
+            debugLog("Manual CSRF test successful!", "success");
+            return sendResponse({ ok: true, message: "Manual CSRF test successful", result });
+          } catch (error) {
+            debugLog(`Manual CSRF test failed: ${error.message}`, "error");
+            return sendResponse({ ok: false, error: error.message });
+          }
         }
 
-        return true; // Keep message channel open
+        return sendResponse({ ok: false, error: "Missing upload payload" });
       }
 
       if (msg?.type === "TEST_CONNECTION") {
@@ -6283,54 +6563,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         // Simulate task reception
         debugLog('🧪 [TEST] Simulating UPLOAD_TRACKING task...', 'info');
 
-        // Trigger the same handler as socket task
-        const { type, payload } = testTask;
-        const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
-
-        if (payload?.autoGenerated) {
-          debugLog(`🎯 Received test UPLOAD_TRACKING task: ${payload.reason}`, 'info');
-
-          // Log task start
-          await postLogSingle({
-            base,
-            token: (await getCfg()).ingestToken,
-            shopId,
-            machineId: clientId,
-            label: clientLabel,
-            action: "test",
-            level: "info",
-            message: `🎯 Starting TEST UPLOAD_TRACKING task: ${payload.reason}`
-          });
-
-          const { file, uploadParams, trackingData } = payload;
-
-          // 1. File TXT đã sẵn sàng, không cần tạo
-          const blob = new Blob([file.content], { type: file.contentType });
-          const fileObj = new File([blob], file.filename);
-
-          // Log file preparation
-          await postLogSingle({
-            base,
-            token: (await getCfg()).ingestToken,
-            shopId,
-            machineId: clientId,
-            label: clientLabel,
-            action: "test",
-            level: "info",
-            message: `📄 Prepared test file: ${file.filename} (${file.content.length} bytes)`
-          });
-
-          // 2. Upload lên platform ngay lập tức
-          uploadToAmazon(fileObj, uploadParams).then(() => {
-            debugLog(`✅ Successfully uploaded test file ${file.filename}`, 'success');
-            reportUploadResult(payload.batchId, 'success');
-          }).catch(error => {
-            debugLog(`❌ Failed to upload test file ${file.filename}: ${error.message}`, 'error');
-            reportUploadResult(payload.batchId, 'failed', error.message);
-          });
+        const result = await handleServerTask(testTask);
+        if (result?.skipped) {
+          return sendResponse(result);
         }
-
-        return sendResponse({ ok: true, message: "Test upload task triggered" });
+        return sendResponse({ ok: true, message: "Test upload task completed", result });
       }
 
       sendResponse({ ok: false, message: "Unknown command" });
@@ -6352,7 +6589,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
     debugLog("🚀 [INIT] Extension loaded — starting auto scheduler...", "info");
     await startAutoConfigScheduler();
-    startAutoConfigSync();
+    await startAutoConfigSync();
     debugLog("✅ [INIT] Auto scheduler & sync started", "success");
   } catch (e) {
     debugLog(`❌ [INIT] Auto start error: ${e.message}`, "error");
