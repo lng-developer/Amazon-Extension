@@ -1908,6 +1908,8 @@ async function getCfg(keys = []) {
     "ingestUrl",
     "ingestToken",
     "shopId",
+    "activeEnvironment",
+    "ingestEnvironments",
     "refNewOrders",
     "refAllOrders",
     // Ads headers (tự động cập nhật)
@@ -1923,6 +1925,13 @@ async function getCfg(keys = []) {
     "autoUpload_enabled", "autoUpload_interval",
     ...keys,
   ]);
+  const environment = all.activeEnvironment || "production";
+  const environmentConfig = all.ingestEnvironments?.[environment];
+  if (environmentConfig) {
+    all.ingestUrl = environmentConfig.ingestUrl || all.ingestUrl;
+    all.shopId = environmentConfig.shopId || all.shopId;
+    all.ingestToken = environmentConfig.ingestToken || all.ingestToken;
+  }
   return all;
 }
 function deriveApiUrls(ingestUrl) {
@@ -1930,7 +1939,7 @@ function deriveApiUrls(ingestUrl) {
     ingestUrl?.replace(/\/ext\/ingest(?:\/.*)?$/i, "") || ingestUrl || "";
   return {
     base,
-    importNewUrl: `${base}/api/order/update-from-xlsx`,
+    importNewUrl: `${base}/api/integration/external-order-imports/manual-excel`,
     adsSpendUrl: `${base}/api/ads/import-day`,
     getSeller: `${base}/api/user/employee-code`,
     importFBMUrl: `${base}/api/shipping-batches`,
@@ -2081,6 +2090,7 @@ async function uploadtracking(context = {}) {
 
   const { ingestUrl, shopId, ingestToken } = await getCfg();
   if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
+  if (!shopId || !ingestToken) throw new Error("Missing Shop ID or API Access Token (Options)");
   if (!shopId) throw new Error("Missing shopId (Options)");
 
   const { base } = deriveApiUrls(ingestUrl);
@@ -2693,13 +2703,14 @@ async function runImportNewOrders(referenceOverride) {
   }
 
   const fd = new FormData();
-  if (shopId) fd.append("shopId", shopId);
+  fd.append("shopId", shopId);
+  fd.append("marketplaceCode", "AMAZON");
+  fd.append("originalFilename", `orders-new-${referenceId}.txt`);
   fd.append(
     "file",
     new Blob([tsv], { type: "text/plain" }),
     `orders-new-${referenceId}.txt`
   );
-  fd.append("type", "New");
 
   let importNewOrigin = "";
   let hasImportNewHostPermission = null;
@@ -2716,7 +2727,7 @@ async function runImportNewOrders(referenceOverride) {
   try {
     resp = await fetch(importNewUrl, {
       method: "POST",
-      headers: { "x-access-token": ingestToken || "" },
+      headers: { Authorization: `Bearer ${ingestToken}` },
       body: fd,
     });
   } catch (error) {

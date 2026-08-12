@@ -37,6 +37,13 @@
 
         <div class="field-grid">
           <div class="field">
+            <label>Environment</label>
+            <select id="environment">
+              <option value="production">Production</option>
+              <option value="development">Development</option>
+            </select>
+          </div>
+          <div class="field">
             <label>API Base URL</label>
             <input id="ingestUrl" placeholder="https://api.lngmerch.co" />
           </div>
@@ -44,6 +51,11 @@
           <div class="field">
             <label>Shop ID</label>
             <input id="shopId" placeholder="6881aba9c1bbdfc541b5cd4d" />
+          </div>
+
+          <div class="field">
+            <label>API Access Token</label>
+            <input id="ingestToken" type="password" autocomplete="off" placeholder="Bearer token" />
           </div>
         </div>
 

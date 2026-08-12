@@ -32,6 +32,22 @@ function deriveApiUrls(base) {
   };
 }
 
+const DEFAULT_ENVIRONMENTS = {
+  production: { ingestUrl: "https://api.lngmerch.co", shopId: "", ingestToken: "" },
+  development: { ingestUrl: "https://dev-api.lngmerch.co", shopId: "", ingestToken: "" },
+};
+
+function readEnvironmentConfig(ingestEnvironments, environment) {
+  return { ...DEFAULT_ENVIRONMENTS[environment], ...(ingestEnvironments?.[environment] || {}) };
+}
+
+function fillEnvironmentConfig(config) {
+  if ($("#ingestUrl")) $("#ingestUrl").value = config.ingestUrl || "";
+  if ($("#shopId")) $("#shopId").value = config.shopId || "";
+  if ($("#ingestToken")) $("#ingestToken").value = config.ingestToken || "";
+  previewEndpoints();
+}
+
 function setTodayDefault() {
   const d = $("#adsDate");
   if (d && !d.value) d.value = new Date().toISOString().slice(0, 10);
@@ -55,17 +71,28 @@ document.addEventListener("DOMContentLoaded", async () => {
     const {
       ingestUrl = "",
       shopId = "",
+      ingestToken = "",
+      activeEnvironment = "production",
+      ingestEnvironments = {},
       autoEnabled = false,
       adsHeaderLastSeen,
     } = await chrome.storage.local.get([
       "ingestUrl",
       "shopId",
+      "ingestToken",
+      "activeEnvironment",
+      "ingestEnvironments",
       "autoEnabled",
       "adsHeaderLastSeen",
     ]);
 
-    if ($("#ingestUrl")) $("#ingestUrl").value = ingestUrl;
-    if ($("#shopId")) $("#shopId").value = shopId;
+    const environments = { ...ingestEnvironments };
+    if (!environments.production && ingestUrl) {
+      environments.production = { ingestUrl, shopId, ingestToken };
+    }
+    const environment = DEFAULT_ENVIRONMENTS[activeEnvironment] ? activeEnvironment : "production";
+    if ($("#environment")) $("#environment").value = environment;
+    fillEnvironmentConfig(readEnvironmentConfig(environments, environment));
 
     // Toggle có thể là #autoToggle hoặc .switch input (theo HTML của bạn)
     const autoToggle =
@@ -99,18 +126,37 @@ document.addEventListener("DOMContentLoaded", async () => {
 /* ========== Live preview Base URL ========== */
 on($("#ingestUrl"), "input", previewEndpoints);
 
+on($("#environment"), "change", async (event) => {
+  const { ingestEnvironments = {} } = await chrome.storage.local.get("ingestEnvironments");
+  fillEnvironmentConfig(readEnvironmentConfig(ingestEnvironments, event.target.value));
+});
+
 /* ========== Save config ========== */
 on($("#saveBtn"), "click", async () => {
   try {
     let ingestUrl = normalizeBaseUrl($("#ingestUrl")?.value || "");
     const shopId = ($("#shopId")?.value || "").trim();
+    const ingestToken = ($("#ingestToken")?.value || "").trim();
+    const environment = $("#environment")?.value || "production";
 
     if (!ingestUrl) return log("❌ Vui lòng nhập API Base URL hợp lệ.");
-    if (!/^https?:\/\//i.test(ingestUrl))
-      return log("❌ URL phải bắt đầu bằng http:// hoặc https://");
+    if (!/^https:\/\//i.test(ingestUrl))
+      return log("URL must begin with https:// to protect the access token");
+    if (!shopId || !ingestToken) return log("Shop ID and API Access Token are required");
 
-    await chrome.storage.local.set({ ingestUrl, shopId });
-    log("Saved config", { ingestUrl, shopId });
+    const { ingestEnvironments = {} } = await chrome.storage.local.get("ingestEnvironments");
+    const environments = {
+      ...ingestEnvironments,
+      [environment]: { ingestUrl, shopId, ingestToken },
+    };
+    await chrome.storage.local.set({
+      activeEnvironment: environment,
+      ingestEnvironments: environments,
+      ingestUrl,
+      shopId,
+      ingestToken,
+    });
+    log("Saved config", { environment, ingestUrl, shopId });
     previewEndpoints();
   } catch (e) {
     log("Save error:", e?.message || e);
