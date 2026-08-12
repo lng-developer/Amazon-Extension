@@ -54,6 +54,26 @@
           </div>
 
           <div class="field">
+            <label>Marketplace</label>
+            <select id="marketplaceCode">
+              <option value="US">US</option>
+              <option value="CA">CA</option>
+              <option value="MX">MX</option>
+              <option value="UK">UK</option>
+              <option value="DE">DE</option>
+              <option value="FR">FR</option>
+              <option value="IT">IT</option>
+              <option value="ES">ES</option>
+              <option value="NL">NL</option>
+              <option value="SE">SE</option>
+              <option value="PL">PL</option>
+              <option value="BE">BE</option>
+              <option value="JP">JP</option>
+              <option value="AU">AU</option>
+            </select>
+          </div>
+
+          <div class="field">
             <label>API Access Token</label>
             <input id="ingestToken" type="password" autocomplete="off" placeholder="Bearer token" />
           </div>
@@ -97,6 +117,83 @@
             </button>
           </div>
           <p class="hint">Nhập số phút tự động kết nối lại socket. Đặt 0 để tắt.</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header compact">
+          <div>
+            <h2>Amazon Ads</h2>
+            <p>Import daily campaign spend for the configured shop.</p>
+          </div>
+          <span class="panel-icon">ADS</span>
+        </div>
+
+        <div class="field-grid">
+          <div class="field">
+            <label>Ads Date</label>
+            <input id="adsDate" type="date" />
+          </div>
+        </div>
+
+        <div class="action-grid">
+          <button id="testAds" class="btn btn-primary">
+            Import Ads
+          </button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header compact">
+          <div>
+            <h2>Amazon Transactions</h2>
+            <p>Import transaction report for the configured shop.</p>
+          </div>
+          <span class="panel-icon">TXN</span>
+        </div>
+
+        <div class="field-grid">
+          <div class="field">
+            <label>From</label>
+            <input id="transactionsDateFrom" type="date" />
+          </div>
+          <div class="field">
+            <label>To</label>
+            <input id="transactionsDateTo" type="date" />
+          </div>
+        </div>
+
+        <div class="action-grid">
+          <button id="btnImportTransactions" class="btn btn-primary">
+            Import Transactions
+          </button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header compact">
+          <div>
+            <h2>Amazon Settlements</h2>
+            <p>Import settlement report for the configured shop.</p>
+          </div>
+          <span class="panel-icon">SET</span>
+        </div>
+
+        <div class="field-grid">
+          <div class="field">
+            <label>From</label>
+            <input id="settlementsDateFrom" type="date" />
+          </div>
+          <div class="field">
+            <label>To</label>
+            <input id="settlementsDateTo" type="date" />
+          </div>
+        </div>
+
+        <div class="action-grid">
+          <button id="btnImportSettlements" class="btn btn-primary">
+            Import Settlements
+          </button>
         </div>
       </section>
 

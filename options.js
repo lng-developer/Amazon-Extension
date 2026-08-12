@@ -28,13 +28,13 @@ function deriveApiUrls(base) {
   return {
     importNewUrl: `${base}/api/order/update-from-xlsx`,
     reportAllUrl: `${base}/api/report/import-file`,
-    adsSpendUrl: `${base}/api/ads/import-day`,
+    adsSpendUrl: `${base}/api/finance/imports/ads`,
   };
 }
 
 const DEFAULT_ENVIRONMENTS = {
-  production: { ingestUrl: "https://api.lngmerch.co", shopId: "", ingestToken: "" },
-  development: { ingestUrl: "https://dev-api.lngmerch.co", shopId: "", ingestToken: "" },
+  production: { ingestUrl: "https://api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
+  development: { ingestUrl: "https://dev-api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
 };
 
 function readEnvironmentConfig(ingestEnvironments, environment) {
@@ -45,6 +45,7 @@ function fillEnvironmentConfig(config) {
   if ($("#ingestUrl")) $("#ingestUrl").value = config.ingestUrl || "";
   if ($("#shopId")) $("#shopId").value = config.shopId || "";
   if ($("#ingestToken")) $("#ingestToken").value = config.ingestToken || "";
+  if ($("#marketplaceCode")) $("#marketplaceCode").value = config.marketplaceCode || "US";
   previewEndpoints();
 }
 
@@ -72,6 +73,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       ingestUrl = "",
       shopId = "",
       ingestToken = "",
+      marketplaceCode = "US",
       activeEnvironment = "production",
       ingestEnvironments = {},
       autoEnabled = false,
@@ -80,6 +82,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       "ingestUrl",
       "shopId",
       "ingestToken",
+      "marketplaceCode",
       "activeEnvironment",
       "ingestEnvironments",
       "autoEnabled",
@@ -88,7 +91,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     const environments = { ...ingestEnvironments };
     if (!environments.production && ingestUrl) {
-      environments.production = { ingestUrl, shopId, ingestToken };
+      environments.production = { ingestUrl, shopId, ingestToken, marketplaceCode };
     }
     const environment = DEFAULT_ENVIRONMENTS[activeEnvironment] ? activeEnvironment : "production";
     if ($("#environment")) $("#environment").value = environment;
@@ -137,6 +140,7 @@ on($("#saveBtn"), "click", async () => {
     let ingestUrl = normalizeBaseUrl($("#ingestUrl")?.value || "");
     const shopId = ($("#shopId")?.value || "").trim();
     const ingestToken = ($("#ingestToken")?.value || "").trim();
+    const marketplaceCode = ($("#marketplaceCode")?.value || "US").trim().toUpperCase();
     const environment = $("#environment")?.value || "production";
 
     if (!ingestUrl) return log("❌ Vui lòng nhập API Base URL hợp lệ.");
@@ -147,7 +151,7 @@ on($("#saveBtn"), "click", async () => {
     const { ingestEnvironments = {} } = await chrome.storage.local.get("ingestEnvironments");
     const environments = {
       ...ingestEnvironments,
-      [environment]: { ingestUrl, shopId, ingestToken },
+      [environment]: { ingestUrl, shopId, ingestToken, marketplaceCode },
     };
     await chrome.storage.local.set({
       activeEnvironment: environment,
@@ -155,8 +159,9 @@ on($("#saveBtn"), "click", async () => {
       ingestUrl,
       shopId,
       ingestToken,
+      marketplaceCode,
     });
-    log("Saved config", { environment, ingestUrl, shopId });
+    log("Saved config", { environment, ingestUrl, shopId, marketplaceCode });
     previewEndpoints();
   } catch (e) {
     log("Save error:", e?.message || e);
@@ -209,6 +214,36 @@ on($("#testAds"), "click", async () => {
       return;
     }
     log("RUN_ADS_SPEND error:", e?.message || e);
+  }
+});
+
+on($("#btnImportTransactions"), "click", async () => {
+  const dateFrom = $("#transactionsDateFrom")?.value?.trim();
+  const dateTo = $("#transactionsDateTo")?.value?.trim();
+  if (!dateFrom || !dateTo) return log("Select transaction date range");
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: "RUN_TRANSACTIONS_IMPORT",
+      payload: { dateFrom, dateTo },
+    });
+    log("RUN_TRANSACTIONS_IMPORT sent:", res || { dateFrom, dateTo });
+  } catch (e) {
+    log("RUN_TRANSACTIONS_IMPORT error:", e?.message || e);
+  }
+});
+
+on($("#btnImportSettlements"), "click", async () => {
+  const dateFrom = $("#settlementsDateFrom")?.value?.trim();
+  const dateTo = $("#settlementsDateTo")?.value?.trim();
+  if (!dateFrom || !dateTo) return log("Select settlement date range");
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: "RUN_SETTLEMENTS_IMPORT",
+      payload: { dateFrom, dateTo },
+    });
+    log("RUN_SETTLEMENTS_IMPORT sent:", res || { dateFrom, dateTo });
+  } catch (e) {
+    log("RUN_SETTLEMENTS_IMPORT error:", e?.message || e);
   }
 });
 

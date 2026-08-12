@@ -1889,6 +1889,7 @@ async function getCfg(keys = []) {
     "ingestUrl",
     "ingestToken",
     "shopId",
+    "marketplaceCode",
     "activeEnvironment",
     "ingestEnvironments",
     "refNewOrders",
@@ -1912,7 +1913,9 @@ async function getCfg(keys = []) {
     all.ingestUrl = environmentConfig.ingestUrl || all.ingestUrl;
     all.shopId = environmentConfig.shopId || all.shopId;
     all.ingestToken = environmentConfig.ingestToken || all.ingestToken;
+    all.marketplaceCode = environmentConfig.marketplaceCode || all.marketplaceCode;
   }
+  all.marketplaceCode = (all.marketplaceCode || "US").trim().toUpperCase();
   return all;
 }
 function deriveApiUrls(ingestUrl) {
@@ -1921,7 +1924,7 @@ function deriveApiUrls(ingestUrl) {
   return {
     base,
     importNewUrl: `${base}/api/integration/external-order-imports/manual-excel`,
-    adsSpendUrl: `${base}/api/ads/import-day`,
+    adsSpendUrl: `${base}/api/finance/imports/ads`,
     getSeller: `${base}/api/user/employee-code`,
     importFBMUrl: `${base}/api/shipping-batches`,
   };
@@ -2069,7 +2072,7 @@ async function uploadtracking(context = {}) {
 
   if (!extensionLogger) await initializeLogger();
 
-  const { ingestUrl, shopId, ingestToken } = await getCfg();
+  const { ingestUrl, shopId, ingestToken, marketplaceCode } = await getCfg();
   if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
   if (!shopId || !ingestToken) throw new Error("Missing Shop ID or API Access Token (Options)");
   if (!shopId) throw new Error("Missing shopId (Options)");
@@ -2685,7 +2688,7 @@ async function runImportNewOrders(referenceOverride) {
 
   const fd = new FormData();
   fd.append("shopId", shopId);
-  fd.append("marketplaceCode", "AMAZON");
+  fd.append("marketplaceCode", marketplaceCode || "US");
   fd.append("originalFilename", `orders-new-${referenceId}.txt`);
   fd.append(
     "file",
@@ -3285,20 +3288,69 @@ async function fetchAllCampaignSpend(
   }
 }
 
-function campaignRowsToTxt(rows) {
-  const header = "Campaigns\tDate\tSpend";
+function csvCell(value) {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function campaignRowsToCsv(rows) {
+  const header = "Date,Campaign Name,Spend";
   const lines = rows.map((r) =>
     [
-      String(r.campaignName).replace(/\t/g, " ").replace(/\r?\n/g, " "),
       r.date,
+      r.campaignName,
       r.spend,
-    ].join("\t")
+    ].map(csvCell).join(",")
   );
   return [header, ...lines].join("\n");
 }
 
 async function runExportAdsSpend(date) {
   return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked(date, lock));
+}
+
+async function fetchTransactionsCsvFromAmazon() {
+  throw new Error("Amazon Transactions export is not implemented yet");
+}
+
+async function fetchSettlementsTxtFromAmazon() {
+  throw new Error("Amazon Settlements export is not implemented yet");
+}
+
+async function runImportTransactions({ dateFrom, dateTo } = {}) {
+  const { ingestUrl, shopId, marketplaceCode } = await getCfg();
+  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
+  if (!shopId) throw new Error("Missing shopId (Options)");
+  if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
+
+  const { base } = deriveApiUrls(ingestUrl);
+  const csv = await fetchTransactionsCsvFromAmazon({ dateFrom, dateTo });
+  return postFileTo(`${base}/api/finance/imports/transactions`, {
+    shopId,
+    salesChannelCode: "AMAZON",
+    marketplaceCode: marketplaceCode || "US",
+    dryRun: "false",
+    sourceRef: `transactions-${dateFrom}-${dateTo}.csv`,
+    file: { name: `transactions-${dateFrom}-${dateTo}.csv`, text: csv },
+  });
+}
+
+async function runImportSettlements({ dateFrom, dateTo } = {}) {
+  const { ingestUrl, shopId, marketplaceCode } = await getCfg();
+  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
+  if (!shopId) throw new Error("Missing shopId (Options)");
+  if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
+
+  const { base } = deriveApiUrls(ingestUrl);
+  const text = await fetchSettlementsTxtFromAmazon({ dateFrom, dateTo });
+  return postFileTo(`${base}/api/finance/imports/settlements`, {
+    shopId,
+    salesChannelCode: "AMAZON",
+    marketplaceCode: marketplaceCode || "US",
+    dryRun: "false",
+    sourceRef: `settlements-${dateFrom}-${dateTo}.txt`,
+    file: { name: `settlements-${dateFrom}-${dateTo}.txt`, text },
+  });
 }
 
 async function runExportAdsSpendLocked(date, lock = {}) {
@@ -3316,11 +3368,11 @@ async function runExportAdsSpendLocked(date, lock = {}) {
       taskType: 'IMPORT_ADS_SPEND',
       batchId: `ads_${date}`,
       ordersCount: 0,
-      filename: `ads-spend-${date}.txt`
+      filename: `ads-spend-${date}.csv`
     }, `[IMPORT_ADS_SPEND] Starting ads spend export for date: ${date}`);
   }
 
-  const { ingestUrl, shopId } = await getCfg();
+  const { ingestUrl, shopId, marketplaceCode } = await getCfg();
   if (!ingestUrl) {
     const error = new Error("Missing ingestUrl (Options)");
     if (extensionLogger) {
@@ -3370,23 +3422,26 @@ async function runExportAdsSpendLocked(date, lock = {}) {
       });
     }
 
-    const txt = campaignRowsToTxt(rows);
+    const csv = campaignRowsToCsv(rows);
 
     // Log uploading to backend
     if (extensionLogger) {
       await extensionLogger.logInfo('Upload dữ liệu chi phí quảng cáo lên backend', {
         url: adsSpendUrl,
-        fileSize: txt.length,
+        fileSize: csv.length,
         rowCount: rows.length,
-        filename: `ads-spend-${date}.txt`,
+        filename: `ads-spend-${date}.csv`,
         timestamp: new Date().toISOString()
       });
     }
 
     const ingestRes = await postFileTo(adsSpendUrl, {
       shopId,
-      day: date,
-      file: { name: `ads-spend-${date}.txt`, text: txt },
+      salesChannelCode: "AMAZON",
+      marketplaceCode: marketplaceCode || "US",
+      dryRun: "false",
+      sourceRef: `ads-spend-${date}.csv`,
+      file: { name: `ads-spend-${date}.csv`, text: csv },
     });
 
     const endTime = Date.now();
@@ -3398,7 +3453,7 @@ async function runExportAdsSpendLocked(date, lock = {}) {
         taskType: 'IMPORT_ADS_SPEND',
         batchId: `ads_${date}`,
         ordersCount: rows.length,
-        filename: `ads-spend-${date}.txt`
+        filename: `ads-spend-${date}.csv`
       }, {
         duration: endTime - startTime,
         memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
@@ -3416,7 +3471,7 @@ async function runExportAdsSpendLocked(date, lock = {}) {
         taskType: 'IMPORT_ADS_SPEND',
         batchId: `ads_${date}`,
         ordersCount: 0,
-        filename: `ads-spend-${date}.txt`
+        filename: `ads-spend-${date}.csv`
       }, error, `Xuất chi phí quảng cáo thất bại cho ${date}`);
     }
     throw error;
@@ -6333,6 +6388,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
       if (msg.type === "RUN_ADS_SPEND")
         return sendResponse(await runExportAdsSpend(msg.payload?.date));
+
+      if (msg?.type === "RUN_TRANSACTIONS_IMPORT")
+        return sendResponse(await runImportTransactions(msg.payload || {}));
+
+      if (msg?.type === "RUN_SETTLEMENTS_IMPORT")
+        return sendResponse(await runImportSettlements(msg.payload || {}));
 
       // Manual full flow (CLICK) — emit log qua socket
       if (msg.type === "AUTO_RUN_NOW")
