@@ -261,7 +261,7 @@ on($("#btnSocketConnect"), "click", async () => {
    - Lưu vào chrome.storage.local key: socketAutoIntervalMin
    - 0 hoặc trống = tắt auto
    ================================================================ */
-const DEFAULT_SOCKET_AUTO_INTERVAL_MIN = 60;
+const DEFAULT_SOCKET_AUTO_INTERVAL_MIN = 0;
 let _socketAutoTimer = null;
 
 function applySocketAutoInterval(minutes) {
@@ -450,14 +450,8 @@ async function loadAutoConfig() {
 
     const list = $("#autoConfigList");
     if (list) list.innerHTML = `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:20px;">Dang tai...</div>`;
-
-    const res = await fetch(`${ingestUrl}/api/auto-config?shopId=${shopId}`);
-    const json = await res.json();
-    if (!json.success) return log("API tra loi:", JSON.stringify(json));
-
-    const records = (json.data || []).filter(r => r.shopId === shopId);
-    renderAutoConfigList(records);
-    log("✅ Auto config da duoc cap nhat");
+    renderAutoConfigList([]);
+    log("Auto Config is disabled for the new dev backend.");
   } catch (e) {
     log("Auto Config load error:", e?.message || e);
     const list = $("#autoConfigList");

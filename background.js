@@ -88,26 +88,7 @@ class ExtensionLogger {
         console.log(`[EXT-LOG] ${logType.toUpperCase()}: ${message}`, logData);
       }
 
-      if (!this.apiBaseUrl) {
-        console.warn('[EXT-LOG] No API base URL configured, skipping server log');
-        return;
-      }
-
-      const response = await fetch(`${this.apiBaseUrl}/api/ext/logs`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(logData)
-      });
-
-      const result = await response.json();
-
-      if (!result.success && this.debugMode) {
-        console.error('[EXT-LOG] Failed to submit log:', result);
-      }
-
-      return result;
+      return { success: true, skipped: true };
     } catch (error) {
       if (this.debugMode) {
         console.error('[EXT-LOG] Error submitting log:', error);
@@ -4591,6 +4572,7 @@ function stopHeartbeat() {
 // }
 
 export async function connectSocketIO(force = false) {
+  return { ok: true, skipped: true, message: "Socket disabled; extension runs imports directly." };
   console.log("[SOCKET-LOG] connectSocketIO entered", {
     force,
     connectBusy,
@@ -5878,16 +5860,7 @@ async function reconcileAutoConfigAlarms(records = []) {
 }
 
 async function fetchAutoConfigRecords() {
-  const { ingestUrl, shopId } = await getCfg();
-  if (!ingestUrl || !shopId) {
-    throw new Error("Missing ingestUrl or shopId");
-  }
-
-  const res = await fetch(`${ingestUrl}/api/auto-config?shopId=${encodeURIComponent(shopId)}`);
-  const json = await res.json();
-  if (!json.success) throw new Error("API returned success=false");
-
-  return (json.data || []).filter((record) => record.shopId === shopId);
+  return [];
 }
 
 async function startAutoConfigScheduler(options = {}) {
