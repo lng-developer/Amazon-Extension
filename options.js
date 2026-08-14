@@ -1,5 +1,7 @@
 // options.js — APO LNG (Popup) - keep action keys & old log style
 
+import { DEFAULT_ENVIRONMENTS, normalizeBaseUrl } from "./config.js";
+
 /* ========== Helpers ========== */
 const $ = (s) => document.querySelector(s);
 const on = (el, ev, fn) => el && el.addEventListener(ev, fn);
@@ -13,29 +15,6 @@ function log(...args) {
     args.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
   box.textContent += (box.textContent ? "\n" : "") + line;
 }
-
-function normalizeBaseUrl(u) {
-  if (!u) return "";
-  return u
-    .trim()
-    .replace(/[?#].*$/, "")
-    .replace(/\/ext\/ingest(?:\/.*)?$/i, "")
-    .replace(/\/+$/, "");
-}
-
-function deriveApiUrls(base) {
-  if (!base) return { importNewUrl: "", reportAllUrl: "", adsSpendUrl: "" };
-  return {
-    importNewUrl: `${base}/api/order/update-from-xlsx`,
-    reportAllUrl: `${base}/api/report/import-file`,
-    adsSpendUrl: `${base}/api/finance/imports/ads`,
-  };
-}
-
-const DEFAULT_ENVIRONMENTS = {
-  production: { ingestUrl: "https://api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
-  development: { ingestUrl: "https://dev-api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
-};
 
 function readEnvironmentConfig(ingestEnvironments, environment) {
   return { ...DEFAULT_ENVIRONMENTS[environment], ...(ingestEnvironments?.[environment] || {}) };

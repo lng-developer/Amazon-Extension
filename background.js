@@ -7,6 +7,16 @@
    =============================== */
 
 import { io } from "./lib/socket.io.esm.min.js";
+import { deriveApiUrls } from "./config.js";
+import {
+  checkOrdersStatus,
+  createShippingBatch,
+  fetchEmployeeCodesFromBackend,
+  postExtensionLog,
+  postFbmImport,
+  postFileTo,
+  postOrderImport,
+} from "./backendApi.js";
 
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
 const adsApiLock = {
@@ -1918,18 +1928,6 @@ async function getCfg(keys = []) {
   all.marketplaceCode = (all.marketplaceCode || "US").trim().toUpperCase();
   return all;
 }
-function deriveApiUrls(ingestUrl) {
-  const base =
-    ingestUrl?.replace(/\/ext\/ingest(?:\/.*)?$/i, "") || ingestUrl || "";
-  return {
-    base,
-    importNewUrl: `${base}/api/integration/external-order-imports/manual-excel`,
-    adsSpendUrl: `${base}/api/finance/imports/ads`,
-    getSeller: `${base}/api/user/employee-code`,
-    importFBMUrl: `${base}/api/shipping-batches`,
-  };
-}
-
 function resolveCarrierInfo(tracking = "") {
   const normalized = String(tracking || "").trim().toUpperCase();
 
@@ -2077,8 +2075,8 @@ async function uploadtracking(context = {}) {
   if (!shopId || !ingestToken) throw new Error("Missing Shop ID or API Access Token (Options)");
   if (!shopId) throw new Error("Missing shopId (Options)");
 
-  const { base } = deriveApiUrls(ingestUrl);
-  const url = `${base}/api/shipping-batch/check-orders-status?machineId=${encodeURIComponent(shopId)}&limit=1000`;
+  const { checkOrdersStatusUrl } = deriveApiUrls(ingestUrl);
+  const url = `${checkOrdersStatusUrl}?machineId=${encodeURIComponent(shopId)}&limit=1000`;
 
   extensionLogger?.logInfo("[UPLOAD_TRACKING] Fetching order status from API", {
     shopId,
@@ -2086,26 +2084,7 @@ async function uploadtracking(context = {}) {
   });
 
   try {
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        "x-access-token": ingestToken || "",
-      },
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      const error = new Error(`uploadtracking API ${res.status}: ${errText.slice(0, 200)}`);
-      extensionLogger?.logError(
-        error,
-        { shopId, url, status: res.status },
-        "[UPLOAD_TRACKING] API request failed"
-      );
-      throw error;
-    }
-
-    const data = await res.json();
+    const data = await checkOrdersStatus({ ingestUrl, shopId, token: ingestToken });
     const orders = data?.orders || [];
 
     // Lọc các đơn chưa submit lên Amazon
@@ -2178,13 +2157,10 @@ async function uploadtracking(context = {}) {
       shipDate: normalizeShipDateForAmazonConfirmShipment(new Date()),
     });
 
-    const batchRes = await fetch(`${base}/api/shipping-batch/create-from-orders`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-access-token": ingestToken || "",
-      },
-      body: JSON.stringify({
+    const batchData = await createShippingBatch({
+      ingestUrl,
+      token: ingestToken,
+      payload: {
         machineId: shopId,
         orders: pendingOrders.map((o) => ({
           orderId: o.orderId,
@@ -2192,31 +2168,8 @@ async function uploadtracking(context = {}) {
         })),
         label: `Auto Upload - Shop ${shopId} - ${pendingOrders.length} orders`,
         autoUpload: true,
-      }),
+      },
     });
-
-    const batchData = await batchRes.json();
-
-    if (!batchRes.ok) {
-
-      const err = new Error(
-        `create-from-orders ${batchRes.status}: ${JSON.stringify(batchData).slice(0, 200)}`
-      );
-
-      debugLog(`❌ [UPLOAD_TRACKING] create-from-orders failed: ${err.message}`, "error");
-
-      extensionLogger?.logError(
-        err,
-        {
-          shopId,
-          status: batchRes.status,
-          response: batchData,
-        },
-        "[UPLOAD_TRACKING] create-from-orders failed"
-      );
-
-      throw err;
-    }
 
     debugLog(
       `✅ [UPLOAD_TRACKING] create-from-orders: ${JSON.stringify(batchData).slice(0, 200)}`,
@@ -2603,40 +2556,6 @@ async function pollUntilReady(
 /* ===============================
    Push file về backend (REST import/report/ads)
    =============================== */
-async function postFileTo(url, fields) {
-  const { ingestToken } = await getCfg();
-  const fd = new FormData();
-
-  for (const [k, v] of Object.entries(fields || {})) {
-    if (k === "file" || k === "filename") continue;
-    if (v !== undefined && v !== null) fd.append(k, String(v));
-  }
-  if (typeof fields.file === "string") {
-    const name = fields.filename || "file.txt";
-    fd.append("file", new Blob([fields.file], { type: "text/plain" }), name);
-  } else if (fields.file && typeof fields.file.text === "string") {
-    const name = fields.file.name || "file.txt";
-    fd.append(
-      "file",
-      new Blob([fields.file.text], { type: "text/plain" }),
-      name
-    );
-  } else {
-    throw new Error("postFileTo: file missing");
-  }
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "x-access-token": ingestToken || "" },
-    body: fd,
-  });
-  if (!res.ok) throw new Error(`Backend ${res.status}`);
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-  return ct.includes("application/json")
-    ? res.json()
-    : { ok: true, raw: await res.text() };
-}
-
 async function runImportNewOrders(referenceOverride) {
   const { ingestUrl, shopId, ingestToken } = await getCfg();
   if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
@@ -2707,13 +2626,9 @@ async function runImportNewOrders(referenceOverride) {
     }
   } catch (_) { }
 
-  let resp;
+  let ingest;
   try {
-    resp = await fetch(importNewUrl, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${ingestToken}` },
-      body: fd,
-    });
+    ingest = await postOrderImport({ url: importNewUrl, token: ingestToken, formData: fd });
   } catch (error) {
     const hint = importNewOrigin
       ? ` Check API Base URL, backend availability, HTTPS certificate, and manifest host_permissions for ${importNewOrigin}/*`
@@ -2738,20 +2653,6 @@ async function runImportNewOrders(referenceOverride) {
     );
     throw wrapped;
   }
-  const responseText = await resp.text();
-  let responseBody = null;
-  try {
-    responseBody = responseText ? JSON.parse(responseText) : null;
-  } catch {
-    responseBody = { raw: responseText };
-  }
-
-  if (!resp.ok) {
-    const backendMessage = responseBody?.error || responseBody?.message || responseText;
-    throw new Error(`Backend ${resp.status}${backendMessage ? `: ${backendMessage}` : ""}`);
-  }
-
-  const ingest = responseBody || { ok: true, raw: responseText };
   return { ok: true, rows, documentId, referenceId, ingest };
 }
 
@@ -2798,17 +2699,7 @@ async function runImportFBMOrders(referenceOverride, machineId, label) {
   fd.append("machineId", machineId);
   fd.append("label", label);
 
-  const resp = await fetch(importFBMUrl, {
-    method: "POST",
-    headers: { "x-access-token": ingestToken || "" },
-    body: fd,
-  });
-  if (!resp.ok) throw new Error(`Backend ${resp.status}`);
-  const ingest = (resp.headers.get("content-type") || "")
-    .toLowerCase()
-    .includes("application/json")
-    ? await resp.json()
-    : { ok: true, raw: await resp.text() };
+  const ingest = await postFbmImport({ url: importFBMUrl, token: ingestToken, formData: fd });
 
   return { ok: true, rows, documentId, referenceId, ingest };
 }
@@ -3318,39 +3209,39 @@ async function fetchSettlementsTxtFromAmazon() {
 }
 
 async function runImportTransactions({ dateFrom, dateTo } = {}) {
-  const { ingestUrl, shopId, marketplaceCode } = await getCfg();
+  const { ingestUrl, ingestToken, shopId, marketplaceCode } = await getCfg();
   if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
   if (!shopId) throw new Error("Missing shopId (Options)");
   if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
 
-  const { base } = deriveApiUrls(ingestUrl);
+  const { transactionsImportUrl } = deriveApiUrls(ingestUrl);
   const csv = await fetchTransactionsCsvFromAmazon({ dateFrom, dateTo });
-  return postFileTo(`${base}/api/finance/imports/transactions`, {
+  return postFileTo(transactionsImportUrl, {
     shopId,
     salesChannelCode: "AMAZON",
     marketplaceCode: marketplaceCode || "US",
     dryRun: "false",
     sourceRef: `transactions-${dateFrom}-${dateTo}.csv`,
     file: { name: `transactions-${dateFrom}-${dateTo}.csv`, text: csv },
-  });
+  }, ingestToken);
 }
 
 async function runImportSettlements({ dateFrom, dateTo } = {}) {
-  const { ingestUrl, shopId, marketplaceCode } = await getCfg();
+  const { ingestUrl, ingestToken, shopId, marketplaceCode } = await getCfg();
   if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
   if (!shopId) throw new Error("Missing shopId (Options)");
   if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
 
-  const { base } = deriveApiUrls(ingestUrl);
+  const { settlementsImportUrl } = deriveApiUrls(ingestUrl);
   const text = await fetchSettlementsTxtFromAmazon({ dateFrom, dateTo });
-  return postFileTo(`${base}/api/finance/imports/settlements`, {
+  return postFileTo(settlementsImportUrl, {
     shopId,
     salesChannelCode: "AMAZON",
     marketplaceCode: marketplaceCode || "US",
     dryRun: "false",
     sourceRef: `settlements-${dateFrom}-${dateTo}.txt`,
     file: { name: `settlements-${dateFrom}-${dateTo}.txt`, text },
-  });
+  }, ingestToken);
 }
 
 async function runExportAdsSpendLocked(date, lock = {}) {
@@ -3372,7 +3263,7 @@ async function runExportAdsSpendLocked(date, lock = {}) {
     }, `[IMPORT_ADS_SPEND] Starting ads spend export for date: ${date}`);
   }
 
-  const { ingestUrl, shopId, marketplaceCode } = await getCfg();
+  const { ingestUrl, ingestToken, shopId, marketplaceCode } = await getCfg();
   if (!ingestUrl) {
     const error = new Error("Missing ingestUrl (Options)");
     if (extensionLogger) {
@@ -3442,7 +3333,7 @@ async function runExportAdsSpendLocked(date, lock = {}) {
       dryRun: "false",
       sourceRef: `ads-spend-${date}.csv`,
       file: { name: `ads-spend-${date}.csv`, text: csv },
-    });
+    }, ingestToken);
 
     const endTime = Date.now();
 
@@ -3963,20 +3854,17 @@ async function postLogSingle({
   message,
 }) {
   try {
-    await fetch(`${base}/api/logs/add`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-access-token": token || "",
-      },
-      body: JSON.stringify({
+    await postExtensionLog({
+      base,
+      token,
+      payload: {
         shopId,
         machineId,
         label,
         action,
         level,
         message,
-      }),
+      },
     });
   } catch (_) { }
 }
@@ -4347,16 +4235,8 @@ function todayYMD() {
 
 async function fetchEmployeeCodes() {
   const { ingestUrl } = await getCfg();
-  const { getSeller } = deriveApiUrls(ingestUrl);
   try {
-    const response = await fetch(getSeller, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    });
-
-    const data = await response.json();
+    const data = await fetchEmployeeCodesFromBackend({ ingestUrl });
 
     if (!Array.isArray(data)) {
       throw new Error("Invalid response format, expected an array");
