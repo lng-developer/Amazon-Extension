@@ -10,14 +10,13 @@
     "128": "logo.jpg"
   },
   "permissions": [
-    "cookies",
     "storage",
     "tabs",
     "scripting",
     "alarms",
-    "webRequest",
-    "webRequestBlocking",
-    "downloads"
+    "windows",
+    "cookies",
+    "webRequest"
   ],
   "host_permissions": [
     "https://sellercentral.amazon.com/*",
@@ -45,7 +44,6 @@
   },
   "action": {
     "default_title": "AMZ EXTENSION LNG",
-    "default_popup": "options.html",
     "default_icon": {
       "16": "logo.jpg",
       "32": "logo.jpg",

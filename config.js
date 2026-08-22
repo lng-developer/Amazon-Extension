@@ -18,12 +18,7 @@ export function deriveApiUrls(ingestUrl) {
     base,
     importNewUrl: base ? `${base}/api/integration/external-order-imports/manual-excel` : "",
     adsSpendUrl: base ? `${base}/api/finance/imports/ads` : "",
-    getSeller: base ? `${base}/api/user/employee-code` : "",
-    importFBMUrl: base ? `${base}/api/shipping-batches` : "",
-    checkOrdersStatusUrl: base ? `${base}/api/shipping-batch/check-orders-status` : "",
-    createShippingBatchUrl: base ? `${base}/api/shipping-batch/create-from-orders` : "",
     transactionsImportUrl: base ? `${base}/api/finance/imports/transactions` : "",
     settlementsImportUrl: base ? `${base}/api/finance/imports/settlements` : "",
-    logUrl: base ? `${base}/api/logs/add` : "",
   };
 }
