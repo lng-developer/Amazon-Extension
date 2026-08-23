@@ -15,7 +15,7 @@ async function request(fetchImpl, url, token, method, body) {
   return payload?.data;
 }
 
-export async function pollExtensionCommand({ base, token, client, runImport, fetchImpl = fetch }) {
+export async function pollExtensionCommand({ base, token, client, runImport, runAds, fetchImpl = fetch }) {
   if (!base || !token || !client?.clientId || !client?.label) return null;
   const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;
   await request(fetchImpl, `${root}/agent/heartbeat`, token, 'POST', client);
@@ -26,8 +26,14 @@ export async function pollExtensionCommand({ base, token, client, runImport, fet
   const lease = { ...client, leaseToken: claim.leaseToken };
   await request(fetchImpl, `${root}/agent/commands/${command.id}/start`, token, 'POST', lease);
   try {
-    if (command.type !== 'IMPORT_NEW_ORDERS') throw new Error(`Unsupported command: ${command.type}`);
-    const outcome = await runImport();
+    if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'TEST_CONNECTION'].includes(command.type)) {
+      throw new Error(`Unsupported command: ${command.type}`);
+    }
+    const outcome = command.type === 'IMPORT_NEW_ORDERS'
+      ? await runImport(command.numDays || 1)
+      : command.type === 'IMPORT_ADS_SPEND'
+        ? await runAds({ dateFrom: command.dateFrom, dateTo: command.dateTo })
+        : null;
     const importJobId = outcome?.result?.jobId || outcome?.result?.data?.jobId || outcome?.result?.ingest?.data?.jobId || null;
     const importedCount = Number(outcome?.result?.rows || 0);
     await request(fetchImpl, `${root}/agent/commands/${command.id}/complete`, token, 'POST', {

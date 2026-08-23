@@ -25,6 +25,40 @@ test('claims, runs, and completes an import command with the existing bearer tok
   assert.match(calls[3].url, /commands\/command-1\/complete$/);
 });
 
+test('completes a connection-test command without running an Amazon import', async () => {
+  const responses = [
+    { success: true, data: { id: 'agent-1' } },
+    { success: true, data: { command: { id: 'command-1', type: 'TEST_CONNECTION' }, leaseToken: 'lease-token-1234567890' } },
+    { success: true, data: { id: 'command-1', status: 'RUNNING' } },
+    { success: true, data: { id: 'command-1', status: 'SUCCEEDED' } },
+  ];
+  const result = await pollExtensionCommand({
+    base: 'https://dev-api.lngmerch.co', token: 'lng_ext_token', client: { clientId: 'rdc-1', label: 'RDC 1' },
+    runImport: async () => { throw new Error('Amazon must not be called'); },
+    fetchImpl: async () => ({ ok: true, json: async () => responses.shift() }),
+  });
+
+  assert.deepEqual(result, { id: 'command-1', status: 'SUCCEEDED' });
+});
+
+test('runs an ads import with the date range from the claimed command', async () => {
+  const responses = [
+    { success: true, data: { id: 'agent-1' } },
+    { success: true, data: { command: { id: 'command-ads', type: 'IMPORT_ADS_SPEND', dateFrom: '2026-08-01', dateTo: '2026-08-22' }, leaseToken: 'lease-token-1234567890' } },
+    { success: true, data: { id: 'command-ads', status: 'RUNNING' } },
+    { success: true, data: { id: 'command-ads', status: 'SUCCEEDED' } },
+  ];
+  let dates;
+  await pollExtensionCommand({
+    base: 'https://dev-api.lngmerch.co', token: 'lng_ext_token', client: { clientId: 'rdc-1', label: 'RDC 1' },
+    runImport: async () => { throw new Error('Orders must not be called'); },
+    runAds: async (value) => { dates = value; return { result: { rows: 2 } }; },
+    fetchImpl: async () => ({ ok: true, json: async () => responses.shift() }),
+  });
+
+  assert.deepEqual(dates, { dateFrom: '2026-08-01', dateTo: '2026-08-22' });
+});
+
 test('reports the backend error detail when heartbeat fails', async () => {
   await assert.rejects(
     pollExtensionCommand({

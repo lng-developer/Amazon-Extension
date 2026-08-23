@@ -14,7 +14,6 @@
     "tabs",
     "scripting",
     "alarms",
-    "windows",
     "cookies",
     "webRequest"
   ],
@@ -43,6 +42,7 @@
     "type": "module"
   },
   "action": {
+    "default_popup": "options.html",
     "default_title": "AMZ EXTENSION LNG",
     "default_icon": {
       "16": "logo.jpg",
