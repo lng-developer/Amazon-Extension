@@ -13,10 +13,19 @@ test("order import targets the current backend contract", () => {
 
   assert.ok(manifest.host_permissions.includes("https://api.lngmerch.co/*"));
   assert.ok(manifest.host_permissions.includes("https://dev-api.lngmerch.co/*"));
-  assert.ok(manifest.host_permissions.includes("https://*.trycloudflare.com/*"));
+  assert.equal(manifest.host_permissions.includes("https://*.trycloudflare.com/*"), false);
+  assert.equal(manifest.host_permissions.includes("http://localhost:5000/*"), false);
   assert.match(config, /\/api\/integration\/external-order-imports\/manual-excel/);
   assert.match(backendApi, /Authorization: `Bearer \$\{token\}`/);
   assert.match(background, /fd\.append\("marketplaceCode", marketplaceCode \|\| "US"\)/);
+});
+
+test('Ads debug output never prints captured credentials', () => {
+  const adsBridge = read('ads_bridge.js');
+
+  assert.doesNotMatch(adsBridge, /\[ADS\]\[DEBUG\]\[cfg\]/);
+  assert.doesNotMatch(adsBridge, /captured headers -> storage\/candidate/);
+  assert.doesNotMatch(adsBridge, /retrieveReport → headers\(use\)/);
 });
 
 test("each environment keeps its own backend configuration", () => {

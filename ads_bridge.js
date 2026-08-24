@@ -136,7 +136,6 @@
     const pagination = reportConfig?.offsetPagination || {};
 
     const cfg = await getCfg();
-    console.log("[ADS][DEBUG][cfg]", JSON.stringify(cfg, null, 2));
     bridgeLog("info", "[ADS_BRIDGE] Storage config loaded", {
       hasAccountId: !!cfg.adsAccountId,
       hasAdvertiserId: !!cfg.adsAdvertiserId,
@@ -148,21 +147,12 @@
     });
 
     const headers = await buildAdsHeaders();
-    const safeHeadersForLog = Object.fromEntries(
-      Object.entries(headers).map(([k, v]) => [
-        k,
-        /csrf|token|account|advertiser|client/i.test(k) && v ? `${String(v).slice(0, 6)}...` : v,
-      ])
-    );
-    console.log("[APO][ADS] retrieveReport → headers(use)", safeHeadersForLog);
     bridgeLog("info", "[ADS_BRIDGE] retrieveReport headers built", {
       hasAccountId: !!headers["Amazon-Ads-Account-Id"],
       hasAdvertiserId: !!headers["Amazon-Advertising-Api-Advertiserid"],
       hasCsrfToken: !!headers["Amazon-Advertising-Api-Csrf-Token"],
       hasCsrfData: !!headers["Amazon-Advertising-Api-Csrf-Data"],
     });
-    console.log("[APO][ADS] retrieveReport → payload", payload);
-
     const res = await fetch(RETRIEVE_URL, {
       method: "POST",
       credentials: "include",
@@ -174,7 +164,6 @@
     });
 
     const text = await res.text();
-    console.log("[APO][ADS] retrieveReport ←", res.status, text.slice(0, 300));
     bridgeLog(
       res.ok ? "info" : "error",
       `[ADS_BRIDGE] retrieveReport response: ${res.status} offset=${pagination.offset}`,
@@ -266,7 +255,6 @@
       lastWrite = now;
 
       await saveCapturedAdsHeaders(data, "ads_bridge");
-      console.log("[APO][ADS] captured headers -> storage/candidate", data);
     } catch (e) {
       console.warn("[APO][ADS] save headers error:", e);
     }
