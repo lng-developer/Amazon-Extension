@@ -21,7 +21,8 @@
     "https://sellercentral.amazon.com/*",
     "https://advertising.amazon.com/*",
     "https://api.lngmerch.co/*",
-    "https://dev-api.lngmerch.co/*"
+    "https://dev-api.lngmerch.co/*",
+    "http://localhost:3000/*"
   ],
   "content_scripts": [
     {

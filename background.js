@@ -212,7 +212,7 @@ async function getCfg(keys = []) {
     "autoUpload_enabled", "autoUpload_interval",
     ...keys,
   ]);
-  const environment = all.activeEnvironment || "production";
+  const environment = all.activeEnvironment || "development";
   const environmentConfig = all.ingestEnvironments?.[environment];
   if (environmentConfig) {
     all.ingestUrl = environmentConfig.ingestUrl || all.ingestUrl;

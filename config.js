@@ -1,6 +1,7 @@
 export const DEFAULT_ENVIRONMENTS = {
-  production: { ingestUrl: "https://api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
+  local: { ingestUrl: "http://localhost:3000", shopId: "", ingestToken: "", marketplaceCode: "US" },
   development: { ingestUrl: "https://dev-api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
+  production: { ingestUrl: "", shopId: "", ingestToken: "", marketplaceCode: "US" },
 };
 
 export function normalizeBaseUrl(u) {

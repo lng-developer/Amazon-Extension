@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import { DEFAULT_ENVIRONMENTS } from "../config.js";
 
 const root = new URL("..", import.meta.url);
 const read = (name) => fs.readFileSync(new URL(name, root), "utf8");
@@ -37,11 +38,20 @@ test("each environment keeps its own backend configuration", () => {
   assert.match(html, /id="marketplaceCode"/);
   assert.match(html, /id="ingestToken"/);
   assert.match(options, /from [\x27"]\.\/config\.js[\x27"]/);
-  assert.match(config, /production: \{ ingestUrl: "https:\/\/api\.lngmerch\.co"/);
+  assert.match(config, /production: \{ ingestUrl: ""/);
   assert.match(config, /development: \{ ingestUrl: "https:\/\/dev-api\.lngmerch\.co"/);
   assert.match(options, /ingestEnvironments/);
   assert.match(options, /marketplaceCode/);
   assert.match(options, /activeEnvironment/);
+});
+
+test("local testing and unconfigured production use distinct defaults", () => {
+  assert.equal(DEFAULT_ENVIRONMENTS.local.ingestUrl, "http://localhost:3000");
+  assert.equal(DEFAULT_ENVIRONMENTS.development.ingestUrl, "https://dev-api.lngmerch.co");
+  assert.equal(DEFAULT_ENVIRONMENTS.production.ingestUrl, "");
+
+  const manifest = JSON.parse(read("manifest.json"));
+  assert.ok(manifest.host_permissions.includes("http://localhost:3000/*"));
 });
 
 test('extension derives its shop from the access token', () => {
