@@ -102,3 +102,12 @@ test('activity timeline marks a completed Gmail Ads upload as succeeded', () => 
   assert.equal(runs.length, 1);
   assert.equal(runs[0].status, 'SUCCEEDED');
 });
+
+test('activity timeline marks a completed transaction import as succeeded', () => {
+  const runs = buildActivityRuns([
+    { timestamp: '2026-09-07T11:43:01.491Z', level: 'info', message: 'Transaction task started', context: { taskId: 'transactions-1' } },
+    { timestamp: '2026-09-07T11:43:30.206Z', level: 'info', message: 'Transaction task completed', context: { taskId: 'transactions-1' } },
+  ]);
+
+  assert.equal(runs[0].status, 'SUCCEEDED');
+});

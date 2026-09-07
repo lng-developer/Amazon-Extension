@@ -263,6 +263,7 @@ test("popup identifies its own extension and reports a failed local poll accurat
 
   assert.match(options, /\[connectionStatusKey, 'clientId'\]/);
   assert.match(options, /Last poll failed/);
+  assert.match(options, /result\?\.ok === false/);
 });
 
 test('missing API configuration is never reported as connected', () => {

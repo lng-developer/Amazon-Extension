@@ -14,6 +14,7 @@ import {
   shouldFailReportStatus,
 } from './adsReporting.js';
 import { classifyAmazonAdsReportLink, createGmailAdsDownloadFingerprint } from './gmailReportDownload.js';
+import { fetchTransactionsCsv as fetchAmazonTransactionsCsv } from './amazonTransaction.js';
 const REPORT_POLL_MAX_ATTEMPTS = 18;
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
 const EXTENSION_COMMAND_POLL_ALARM = "EXTENSION_COMMAND_POLL";
@@ -1072,8 +1073,8 @@ async function runExportAdsSpend({ dateFrom, dateTo }) {
   return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked({ dateFrom, dateTo }, lock));
 }
 
-async function fetchTransactionsCsvFromAmazon() {
-  throw new Error("Amazon Transactions export is not implemented yet");
+async function fetchTransactionsCsvFromAmazon({ dateFrom, dateTo }) {
+  return fetchAmazonTransactionsCsv({ dateFrom, dateTo });
 }
 
 async function fetchSettlementsTxtFromAmazon() {
@@ -1085,15 +1086,24 @@ async function runImportTransactions({ dateFrom, dateTo } = {}) {
   if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
   if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
 
-  const { transactionsImportUrl } = deriveApiUrls(ingestUrl);
-  const csv = await fetchTransactionsCsvFromAmazon({ dateFrom, dateTo });
-  return postFileTo(transactionsImportUrl, {
-    salesChannelCode: "AMAZON",
-    marketplaceCode: marketplaceCode || "US",
-    dryRun: "false",
-    sourceRef: `transactions-${dateFrom}-${dateTo}.csv`,
-    file: { name: `transactions-${dateFrom}-${dateTo}.csv`, text: csv },
-  }, ingestToken);
+  const context = { dateFrom, dateTo, taskId: `transactions_${dateFrom}_${dateTo}` };
+  await extensionLogger.logTaskProcessing(context, 'Transaction task started');
+  try {
+    const { transactionsImportUrl } = deriveApiUrls(ingestUrl);
+    const csv = await fetchTransactionsCsvFromAmazon({ dateFrom, dateTo });
+    const result = await postFileTo(transactionsImportUrl, {
+      salesChannelCode: "AMAZON",
+      marketplaceCode: marketplaceCode || "US",
+      dryRun: "false",
+      sourceRef: `transactions-${dateFrom}-${dateTo}.csv`,
+      file: { name: `transactions-${dateFrom}-${dateTo}.csv`, text: csv },
+    }, ingestToken);
+    await extensionLogger.logTaskCompleted(context, result, 'Transaction task completed');
+    return result;
+  } catch (error) {
+    await extensionLogger.logTaskFailed(context, error, 'Transaction task failed');
+    throw error;
+  }
 }
 
 async function runImportSettlements({ dateFrom, dateTo } = {}) {
