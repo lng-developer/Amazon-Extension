@@ -15,6 +15,18 @@ async function request(fetchImpl, url, token, method, body) {
   return payload?.data;
 }
 
+export async function queueOrderImportCommand({ base, token, client, fetchImpl = fetch }) {
+  if (!base || !token || !client?.clientId || !client?.label) throw new Error('Extension connection is not configured');
+  const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;
+  return request(fetchImpl, `${root}/agent/import-new-orders`, token, 'POST', { ...client, numDays: 1 });
+}
+
+export async function queueAdsSpendCommand({ base, token, client, date, fetchImpl = fetch }) {
+  if (!base || !token || !client?.clientId || !client?.label || !date) throw new Error('Development Ads import is not configured');
+  const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;
+  return request(fetchImpl, `${root}/agent/import-ads-spend`, token, 'POST', { ...client, dateFrom: date, dateTo: date });
+}
+
 export async function pollExtensionCommand({ base, token, client, runImport, runAds, fetchImpl = fetch }) {
   if (!base || !token || !client?.clientId || !client?.label) return null;
   const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;

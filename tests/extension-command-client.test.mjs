@@ -1,6 +1,35 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { pollExtensionCommand } from '../extensionCommandClient.js';
+import { pollExtensionCommand, queueOrderImportCommand, queueAdsSpendCommand } from '../extensionCommandClient.js';
+
+test('queues the manual order import before claiming it', async () => {
+  const calls = [];
+  await queueOrderImportCommand({
+    base: 'https://dev-api.lngmerch.co', token: 'lng_ext_token', client: { clientId: 'rdc-1', label: 'RDC 1', version: '0.3.0' },
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return { ok: true, json: async () => ({ success: true, data: { id: 'command-1', status: 'QUEUED' } }) };
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /agent\/import-new-orders$/);
+  assert.deepEqual(JSON.parse(calls[0].options.body), { clientId: 'rdc-1', label: 'RDC 1', version: '0.3.0', numDays: 1 });
+});
+
+test('queues a one-day Ads import before claiming it', async () => {
+  const calls = [];
+  await queueAdsSpendCommand({
+    base: 'https://dev-api.lngmerch.co', token: 'lng_ext_token', client: { clientId: 'rdc-1', label: 'RDC 1', version: '0.3.0' }, date: '2026-08-23',
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return { ok: true, json: async () => ({ success: true, data: { id: 'command-ads', status: 'QUEUED' } }) };
+    },
+  });
+
+  assert.match(calls[0].url, /agent\/import-ads-spend$/);
+  assert.deepEqual(JSON.parse(calls[0].options.body), { clientId: 'rdc-1', label: 'RDC 1', version: '0.3.0', dateFrom: '2026-08-23', dateTo: '2026-08-23' });
+});
 
 test('claims, runs, and completes an import command with the existing bearer token', async () => {
   const calls = [];
@@ -41,7 +70,7 @@ test('completes a connection-test command without running an Amazon import', asy
   assert.deepEqual(result, { id: 'command-1', status: 'SUCCEEDED' });
 });
 
-test('runs an ads import with the date range from the claimed command', async () => {
+test('runs an Ads command with its queued date range', async () => {
   const responses = [
     { success: true, data: { id: 'agent-1' } },
     { success: true, data: { command: { id: 'command-ads', type: 'IMPORT_ADS_SPEND', dateFrom: '2026-08-01', dateTo: '2026-08-22' }, leaseToken: 'lease-token-1234567890' } },

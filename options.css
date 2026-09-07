@@ -125,6 +125,18 @@ h2 {
   margin: 0 0 20px;
   color: var(--muted);
 }
+.order-progress {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid #b9c8d2;
+  border-left: 4px solid #8a9aac;
+  border-radius: 8px;
+  background: #f7fafc;
+  color: var(--text);
+  font-weight: 700;
+}
+.order-progress[data-state="COMPLETED"] { border-left-color: #17804b; }
+.order-progress[data-state="FAILED"] { border-left-color: #d92d20; color: #b42318; }
 label {
   display: block;
   margin: 14px 0 6px;

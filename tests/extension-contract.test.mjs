@@ -21,6 +21,15 @@ test("order import targets the current backend contract", () => {
   assert.match(background, /fd\.append\("marketplaceCode", marketplaceCode \|\| "US"\)/);
 });
 
+test('extension icons use PNG logo assets', () => {
+  const manifest = JSON.parse(read('manifest.json'));
+
+  for (const iconPath of Object.values(manifest.icons)) {
+    assert.match(iconPath, /^icons\/logo-\d+\.png$/);
+    assert.ok(fs.existsSync(new URL(iconPath, root)));
+  }
+});
+
 test('Ads debug output never prints captured credentials', () => {
   const adsBridge = read('ads_bridge.js');
 
@@ -29,7 +38,106 @@ test('Ads debug output never prints captured credentials', () => {
   assert.doesNotMatch(adsBridge, /retrieveReport → headers\(use\)/);
 });
 
-test("each environment keeps its own backend configuration", () => {
+test('Ads header sniffer captures CSRF headers returned by Amazon responses', () => {
+  const sniffer = read('ads_main_sniffer.js');
+  const bridge = read('ads_bridge.js');
+
+  assert.match(sniffer, /response\.headers/);
+  assert.match(sniffer, /getAllResponseHeaders/);
+  assert.doesNotMatch(sniffer, /console\.log/);
+  assert.doesNotMatch(bridge, /now - lastWrite < 300/);
+});
+
+test('Ads Reporting forwards its response CSRF token when creating a report', () => {
+  const sniffer = read('ads_main_sniffer.js');
+  const bridge = read('ads_bridge.js');
+  const background = read('background.js');
+
+  assert.match(sniffer, /'x-csrf-token': 'adsReportingCsrfToken'/);
+  assert.match(background, /"x-csrf-token": "adsReportingCsrfToken"/);
+  assert.match(bridge, /adsReportingCsrfToken/);
+  assert.match(bridge, /h\["x-csrf-token"\] = adsReportingCsrfToken/);
+});
+
+test('Ads Reporting preflight does not require legacy Campaign API headers', () => {
+  const background = read('background.js');
+
+  assert.match(background, /function hasAdsReportingHeaders\(st = \{\}\) \{\s*return !!st\.adsReportingCsrfToken;/);
+  assert.match(background, /async function ensureFreshAdsReportingHeaders\(\)/);
+  assert.match(background, /await ensureFreshAdsReportingHeaders\(\);/);
+});
+
+test('Ads Reporting waits for its CSRF token instead of whole-page completion', () => {
+  const background = read('background.js');
+  const start = background.indexOf('async function forceRefreshAdsHeaders');
+  const end = background.indexOf('async function ensureFreshAdsHeaders', start);
+  const refresh = background.slice(start, end);
+
+  assert.match(background, /async function waitForAdsReportingHeaders\(\)/);
+  assert.match(refresh, /if \(reporting\) \{\s*headers = await waitForAdsReportingHeaders\(\);/);
+});
+
+test('Ads header sniffer is injected after the Reporting reload begins', () => {
+  const background = read('background.js');
+  const start = background.indexOf('async function reloadAdsTabForHeaderCapture');
+  const end = background.indexOf('async function forceRefreshAdsHeaders', start);
+  const reload = background.slice(start, end);
+
+  assert.match(reload, /changeInfo\.status !== "loading"/);
+  assert.match(reload, /await ensureAdsBridgeInjected\(tabId\)/);
+  assert.match(reload, /await chrome\.tabs\.reload\(tabId\)/);
+});
+
+test('Ads Reporting uses the Reporting tab for token, report, and download operations', () => {
+  const background = read('background.js');
+  const refresh = background.slice(background.indexOf('async function forceRefreshAdsHeaders'), background.indexOf('async function ensureFreshAdsHeaders'));
+  const reporting = background.slice(background.indexOf('async function adsReportingViaContentScript'), background.indexOf('async function downloadAdsReportCsv'));
+  const download = background.slice(background.indexOf('async function downloadAdsReportCsv'), background.indexOf('async function runExportAdsSpendLocked'));
+
+  assert.match(background, /async function ensureAdsReportingTab\(\)/);
+  assert.match(background, /url: `\$\{ADS_BASE\}\/reporting`/);
+  assert.match(refresh, /reporting \? ensureAdsReportingTab\(\) : ensureAdsTab\(\)/);
+  assert.match(reporting, /await ensureAdsReportingTab\(\)/);
+  assert.match(download, /await ensureAdsReportingTab\(\)/);
+});
+
+test('Ads import uses Amazon Reporting CSV instead of synthesizing campaign rows', () => {
+  const manifest = JSON.parse(read('manifest.json'));
+  const background = read('background.js');
+  const bridge = read('ads_bridge.js');
+
+  assert.match(bridge, /ADS_REPORTING_REQUEST/);
+  assert.match(bridge, /ADS_DOWNLOAD_LATEST_REPORT/);
+  assert.match(background, /buildOneOffReportConfig/);
+  assert.doesNotMatch(background, /campaignRowsToCsv/);
+  assert.ok(manifest.host_permissions.includes('https://decorated-reports-prod-iad.s3.amazonaws.com/*'));
+});
+
+test('Ads Reporting bridge returns an error instead of leaving the import lock pending', () => {
+  const bridge = read('ads_bridge.js');
+
+  assert.match(bridge, /if \(msg\?\.type === 'ADS_REPORTING_REQUEST'\) \{\s*try \{/);
+  assert.match(bridge, /sendResponse\(\{ ok: false, status: 0, message:/);
+});
+
+test('development-only build has the minimum Ads surface', () => {
+  const manifest = JSON.parse(read('manifest.json'));
+  const html = read('options.html');
+  const config = read('config.js');
+
+  assert.equal(manifest.permissions.includes('cookies'), true);
+  assert.equal(manifest.permissions.includes('webRequest'), false);
+  assert.equal(manifest.host_permissions.includes('https://advertising.amazon.com/*'), true);
+  const adsScripts = manifest.content_scripts?.filter((script) => script.matches?.includes('https://advertising.amazon.com/*')) || [];
+  assert.ok(adsScripts.some((script) => script.js?.includes('ads_bridge.js') && script.run_at === 'document_start'));
+  assert.ok(adsScripts.some((script) => script.js?.includes('ads_main_sniffer.js') && script.run_at === 'document_start' && script.world === 'MAIN'));
+  assert.match(html, /data-tab="ads"/);
+  assert.match(html, /btnExportAds/);
+  assert.match(config, /development: \{ ingestUrl: "https:\/\/dev-api\.lngmerch\.co"/);
+  assert.doesNotMatch(config, /production:/);
+});
+
+test("extension only persists the development backend configuration", () => {
   const options = read("options.js");
   const html = read("options.html");
   const config = read("config.js");
@@ -38,20 +146,10 @@ test("each environment keeps its own backend configuration", () => {
   assert.match(html, /id="marketplaceCode"/);
   assert.match(html, /id="ingestToken"/);
   assert.match(options, /from [\x27"]\.\/config\.js[\x27"]/);
-  assert.match(config, /production: \{ ingestUrl: ""/);
   assert.match(config, /development: \{ ingestUrl: "https:\/\/dev-api\.lngmerch\.co"/);
   assert.match(options, /ingestEnvironments/);
   assert.match(options, /marketplaceCode/);
   assert.match(options, /activeEnvironment/);
-});
-
-test("local testing and unconfigured production use distinct defaults", () => {
-  assert.equal(DEFAULT_ENVIRONMENTS.local.ingestUrl, "http://localhost:3000");
-  assert.equal(DEFAULT_ENVIRONMENTS.development.ingestUrl, "https://dev-api.lngmerch.co");
-  assert.equal(DEFAULT_ENVIRONMENTS.production.ingestUrl, "");
-
-  const manifest = JSON.parse(read("manifest.json"));
-  assert.ok(manifest.host_permissions.includes("http://localhost:3000/*"));
 });
 
 test('extension derives its shop from the access token', () => {
@@ -110,7 +208,7 @@ test("popup separates every operational flow into an accessible tab", () => {
   const html = read("options.html");
   const options = read("options.js");
 
-  for (const tab of ["orders", "ads", "transactions", "settlements", "settings", "logs"]) {
+  for (const tab of ["orders", "transactions", "settlements", "settings", "logs"]) {
     assert.match(html, new RegExp(`data-tab="${tab}"`));
     assert.match(html, new RegExp(`data-panel="${tab}"`));
   }
@@ -165,6 +263,44 @@ test("popup identifies its own extension and reports a failed local poll accurat
 
   assert.match(options, /\[connectionStatusKey, 'clientId'\]/);
   assert.match(options, /Last poll failed/);
+});
+
+test('missing API configuration is never reported as connected', () => {
+  const background = read('background.js');
+  const options = read('options.js');
+
+  assert.match(background, /if \(!config\.ingestUrl \|\| !config\.ingestToken\)/);
+  assert.match(background, /state: "NOT_CONFIGURED"/);
+  assert.match(options, /state\?\.state === 'NOT_CONFIGURED'/);
+});
+
+test('Amazon report requests follow the session-establishing redirect', () => {
+  const background = read('background.js');
+
+  assert.doesNotMatch(background, /redirect:\s*["']manual["']/);
+});
+
+test('new-order report payload matches the Amazon FBM request', () => {
+  const background = read('background.js');
+
+  assert.match(background, /type:\s*["']fbmOrdersReport["']/);
+  assert.doesNotMatch(background, /type:\s*["']newOrdersReport["']/);
+});
+
+test('order report polling allows up to three minutes for Amazon to finish', () => {
+  const background = read('background.js');
+
+  assert.match(background, /const REPORT_POLL_MAX_ATTEMPTS = 18;/);
+  assert.match(background, /maxAttempts: REPORT_POLL_MAX_ATTEMPTS/);
+});
+
+test('order upload reads marketplace code from the extension configuration', () => {
+  const background = read('background.js');
+  const start = background.indexOf('async function runImportNewOrders');
+  const end = background.indexOf('async function ensureAdsTab', start);
+  const orderImport = background.slice(start, end);
+
+  assert.match(orderImport, /const \{ ingestUrl, ingestToken, marketplaceCode \} = await getCfg\(\);/);
 });
 
 test("command polling keeps a stable extension identity", () => {

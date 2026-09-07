@@ -1,8 +1,11 @@
 export const DEFAULT_ENVIRONMENTS = {
-  local: { ingestUrl: "http://localhost:3000", shopId: "", ingestToken: "", marketplaceCode: "US" },
   development: { ingestUrl: "https://dev-api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
-  production: { ingestUrl: "", shopId: "", ingestToken: "", marketplaceCode: "US" },
 };
+
+export const DEVELOPMENT_API_URLS = [
+  "https://dev-api.lngmerch.co",
+  "http://localhost:3001",
+];
 
 export function normalizeBaseUrl(u) {
   if (!u) return "";
@@ -11,6 +14,11 @@ export function normalizeBaseUrl(u) {
     .replace(/[?#].*$/, "")
     .replace(/\/ext\/ingest(?:\/.*)?$/i, "")
     .replace(/\/+$/, "");
+}
+
+export function resolveDevelopmentApiUrl(value) {
+  const base = normalizeBaseUrl(value);
+  return DEVELOPMENT_API_URLS.includes(base) ? base : DEFAULT_ENVIRONMENTS.development.ingestUrl;
 }
 
 export function deriveApiUrls(ingestUrl) {

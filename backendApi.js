@@ -6,7 +6,9 @@ export async function postFileTo(url, fields, token = "") {
     if (v !== undefined && v !== null) fd.append(k, String(v));
   }
 
-  if (typeof fields.file === "string") {
+  if (fields.file instanceof Blob) {
+    fd.append("file", fields.file, fields.filename || "file.csv");
+  } else if (typeof fields.file === "string") {
     fd.append("file", new Blob([fields.file], { type: "text/plain" }), fields.filename || "file.txt");
   } else if (fields.file && typeof fields.file.text === "string") {
     fd.append("file", new Blob([fields.file.text], { type: "text/plain" }), fields.file.name || "file.txt");

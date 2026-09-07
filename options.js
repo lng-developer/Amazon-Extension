@@ -1,14 +1,24 @@
-import { DEFAULT_ENVIRONMENTS, normalizeBaseUrl } from './config.js';
+import { DEFAULT_ENVIRONMENTS, normalizeBaseUrl, resolveDevelopmentApiUrl } from './config.js';
 import { buildActivityRuns, createExtensionLogger, formatVietnamTime } from './extensionLogger.js';
+import { ORDER_IMPORT_PROGRESS_KEY } from './orderImportProgress.js';
 
 const $ = (selector) => document.querySelector(selector);
 const log = (message) => { $('#log').textContent = message; };
 const today = () => new Date().toISOString().slice(0, 10);
-const readConfig = (all, environment) => ({ ...DEFAULT_ENVIRONMENTS[environment], ...(all.ingestEnvironments?.[environment] || {}) });
+const readConfig = (all) => ({ ...DEFAULT_ENVIRONMENTS.development, ...(all.ingestEnvironments?.development || {}), ingestUrl: resolveDevelopmentApiUrl(all.ingestEnvironments?.development?.ingestUrl) });
 const tabs = [...document.querySelectorAll('[data-tab]')];
 const panels = [...document.querySelectorAll('[data-panel]')];
 const extensionLogger = createExtensionLogger({ storage: chrome.storage.local });
 const connectionStatusKey = 'extensionConnectionStatus';
+async function renderOrderImportProgress() {
+  const stored = await chrome.storage.local.get(ORDER_IMPORT_PROGRESS_KEY);
+  const progress = stored[ORDER_IMPORT_PROGRESS_KEY];
+  const status = $('#orderProgress');
+  status.dataset.state = progress?.state || 'IDLE';
+  status.textContent = progress
+    ? `${progress.message}${progress.attempt ? ` · check ${progress.attempt}/${progress.maxAttempts}` : ''}${Number.isFinite(progress.rows) ? ` · ${progress.rows} rows` : ''}${progress.error ? ` · ${progress.error}` : ''}`
+    : 'No import in progress.';
+}
 function relativeTime(target) { const seconds = Math.max(0, Math.ceil((target - Date.now()) / 1000)); return seconds ? `in ${seconds}s` : 'now'; }
 async function renderConnectionStatus() {
   const stored = await chrome.storage.local.get([connectionStatusKey, 'clientId']);
@@ -16,6 +26,8 @@ async function renderConnectionStatus() {
   const agent = stored.clientId ? `Ext …${stored.clientId.slice(-6)} · ` : '';
   $('#beConnection').textContent = state?.state === 'CONNECTED'
     ? `${agent}BE: Connected · last heartbeat ${new Date(state.lastHeartbeatAt).toLocaleTimeString()}`
+    : state?.state === 'NOT_CONFIGURED'
+      ? 'BE: Not configured · API Base URL and token required'
     : `${agent}BE: Last poll failed`;
   $('#bePoll').textContent = `Next poll: ${state?.nextPollAt ? relativeTime(state.nextPollAt) : '-'}`;
 }
@@ -83,15 +95,16 @@ function fill(config) {
 }
 
 async function save() {
-  const environment = $('#environment').value;
-  const config = { ingestUrl: normalizeBaseUrl($('#ingestUrl').value), ingestToken: $('#ingestToken').value.trim(), marketplaceCode: $('#marketplaceCode').value.trim().toUpperCase() || 'US' };
-  const { ingestEnvironments = {} } = await chrome.storage.local.get('ingestEnvironments');
-  const cleanedEnvironments = Object.fromEntries(Object.entries(ingestEnvironments).map(([name, value]) => {
-    const { shopId: _shopId, ...savedConfig } = value;
-    return [name, savedConfig];
-  }));
+  const environment = 'development';
+  const requestedUrl = normalizeBaseUrl($('#ingestUrl').value);
+  const ingestUrl = resolveDevelopmentApiUrl(requestedUrl);
+  if (requestedUrl && requestedUrl !== ingestUrl) {
+    log('API Base URL must be https://dev-api.lngmerch.co or http://localhost:3001.');
+    return;
+  }
+  const config = { ingestUrl, ingestToken: $('#ingestToken').value.trim(), marketplaceCode: $('#marketplaceCode').value.trim().toUpperCase() || 'US' };
   await chrome.storage.local.remove('shopId');
-  await chrome.storage.local.set({ ...config, activeEnvironment: environment, ingestEnvironments: { ...cleanedEnvironments, [environment]: config } });
+  await chrome.storage.local.set({ ...config, activeEnvironment: environment, ingestEnvironments: { [environment]: config } });
   log('Checking connection…');
   try {
     const result = await chrome.runtime.sendMessage({ type: 'HEARTBEAT_NOW' });
@@ -115,12 +128,11 @@ async function send(type, payload = {}) {
 
 document.addEventListener('DOMContentLoaded', async () => {
   const all = await chrome.storage.local.get(['activeEnvironment', 'ingestEnvironments']);
-  const environment = all.activeEnvironment || 'development';
+  const environment = 'development';
   $('#environment').value = environment;
-  fill(readConfig(all, environment));
+  fill(readConfig(all));
   $('#adsDate').value = today();
   tabs.forEach((tab) => tab.addEventListener('click', () => activateTab(tab.dataset.tab)));
-  $('#environment').addEventListener('change', () => fill(readConfig(all, $('#environment').value)));
   $('#btnSave').addEventListener('click', () => void save());
   $('#btnCheckNow').addEventListener('click', async () => { await chrome.runtime.sendMessage({ type: 'HEARTBEAT_NOW' }); await renderConnectionStatus(); });
   $('#btnImportNew').addEventListener('click', () => void send('AUTO_RUN_NOW'));
@@ -138,5 +150,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     log('Logs cleared.');
   });
   await renderConnectionStatus();
-  window.setInterval(() => void renderConnectionStatus(), 1000);
+  await renderOrderImportProgress();
+  window.setInterval(() => { void renderConnectionStatus(); void renderOrderImportProgress(); }, 1000);
 });

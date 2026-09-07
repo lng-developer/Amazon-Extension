@@ -1,8 +1,20 @@
 /* Amazon order, ads, transaction, settlement imports and LNG command polling. */
-import { deriveApiUrls } from "./config.js";
-import { pollExtensionCommand } from "./extensionCommandClient.js";
+import { DEFAULT_ENVIRONMENTS, deriveApiUrls, resolveDevelopmentApiUrl } from "./config.js";
+import { pollExtensionCommand, queueAdsSpendCommand, queueOrderImportCommand } from "./extensionCommandClient.js";
 import { postFileTo, postOrderImport } from "./backendApi.js";
 import { createExtensionLogger } from "./extensionLogger.js";
+import { ORDER_IMPORT_PROGRESS_KEY, createOrderImportProgress } from './orderImportProgress.js';
+import { parseTSV } from './orderReportParser.js';
+import {
+  buildOneOffReportConfig,
+  findCsvReportTemplate,
+  isTerminalReportStatus,
+  REPORT_POLL_INTERVAL_MS,
+  reportConfigurationId,
+  shouldFailReportStatus,
+} from './adsReporting.js';
+import { classifyAmazonAdsReportLink, createGmailAdsDownloadFingerprint } from './gmailReportDownload.js';
+const REPORT_POLL_MAX_ATTEMPTS = 18;
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
 const EXTENSION_COMMAND_POLL_ALARM = "EXTENSION_COMMAND_POLL";
 const EXTENSION_COMMAND_POLL_BACKOFF_KEY = "extensionCommandPollBackoff";
@@ -10,6 +22,9 @@ const EXTENSION_CONNECTION_STATUS_KEY = "extensionConnectionStatus";
 const EXTENSION_COMMAND_POLL_BACKOFF_MINUTES = [1, 2, 5, 10];
 const adsApiLock = { running: false, taskName: "", runId: "", startedAt: 0 };
 const extensionLogger = createExtensionLogger({ storage: chrome.storage.local });
+async function setOrderImportProgress(state, message, details = {}) {
+  await chrome.storage.local.set({ [ORDER_IMPORT_PROGRESS_KEY]: createOrderImportProgress(state, message, details) });
+}
 const log = (message, context) => void extensionLogger.logInfo(message, context);
 const debugLog = (message, level = "info") =>
   void (level === "error" ? extensionLogger.logError(null, undefined, message) : extensionLogger.logInfo(message));
@@ -25,11 +40,15 @@ const ADS_HEADER_STORAGE_KEYS = [
   "adsMarketplaceId",
   "adsCsrfData",
   "adsCsrfToken",
+  "adsReportingCsrfToken",
   "adsHeaderLastSeen",
 ];
 const ADS_HEADER_REFRESH_TIMEOUT_MS = 25 * 1000;
 const ADS_TAB_LOAD_TIMEOUT_MS = 35 * 1000;
 const ADS_PAGE_SETTLE_MS = 3500;
+const GMAIL_ADS_RECENT_DOWNLOADS_KEY = 'gmailAdsRecentDownloads';
+const GMAIL_ADS_RECENT_DOWNLOADS_TTL_MS = 24 * 60 * 60 * 1000;
+const GMAIL_ADS_MAX_FILE_SIZE = 20 * 1024 * 1024;
 
 const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -44,21 +63,84 @@ async function waitForAdsTabComplete(tabId) {
   });
 }
 async function clearAdsHeaders() { await chrome.storage.local.remove([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]); }
-async function forceRefreshAdsHeaders() {
-  const tabId = await ensureAdsTab();
-  await ensureAdsBridgeInjected(tabId);
+
+async function reloadAdsTabForHeaderCapture(tabId) {
+  const injected = new Promise((resolve, reject) => {
+    let handled = false;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+    };
+    const onUpdated = async (updatedTabId, changeInfo) => {
+      if (handled || updatedTabId !== tabId || changeInfo.status !== "loading") return;
+      handled = true;
+      cleanup();
+      try {
+        await ensureAdsBridgeInjected(tabId);
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Amazon Ads page did not start reloading"));
+    }, ADS_HEADER_REFRESH_TIMEOUT_MS);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+
   await chrome.tabs.reload(tabId);
-  await waitForAdsTabComplete(tabId);
-  await delayMs(ADS_PAGE_SETTLE_MS);
-  const state = await chrome.storage.local.get([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
-  const headers = { ...(state.adsCandidateHeaders || {}), ...state };
-  if (!isAdsHeaderComplete(headers)) throw createAdsError("Amazon Ads headers are unavailable. Sign in to advertising.amazon.com and open the campaign page.", 401);
+  await injected;
+}
+
+async function forceRefreshAdsHeaders({ reporting = false } = {}) {
+  const tabId = await (reporting ? ensureAdsReportingTab() : ensureAdsTab());
+  await reloadAdsTabForHeaderCapture(tabId);
+  let headers;
+  if (reporting) {
+    headers = await waitForAdsReportingHeaders();
+  } else {
+    await waitForAdsTabComplete(tabId);
+    await delayMs(ADS_PAGE_SETTLE_MS);
+    const state = await chrome.storage.local.get([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
+    headers = { ...(state.adsCandidateHeaders || {}), ...state };
+  }
+  if (!(reporting ? hasAdsReportingHeaders(headers) : isAdsHeaderComplete(headers))) {
+    throw createAdsError(
+      reporting
+        ? "Amazon Ads Reporting CSRF token was not observed. Reload the extension, then retry once."
+        : "Amazon Ads headers are unavailable. Sign in to advertising.amazon.com and open the campaign page.",
+      401,
+    );
+  }
   await chrome.storage.local.set(Object.fromEntries(ADS_HEADER_STORAGE_KEYS.map((key) => [key, headers[key]])));
 }
 async function ensureFreshAdsHeaders() {
   const state = await readAdsHeaderState();
   if (isAdsHeaderComplete(state)) return;
   await forceRefreshAdsHeaders();
+}
+
+async function ensureFreshAdsReportingHeaders() {
+  const state = await readAdsHeaderState();
+  if (hasAdsReportingHeaders(state)) return;
+  await forceRefreshAdsHeaders({ reporting: true });
+}
+
+function hasAdsReportingHeaders(st = {}) {
+  return !!st.adsReportingCsrfToken;
+}
+
+async function waitForAdsReportingHeaders() {
+  const expiresAt = Date.now() + ADS_HEADER_REFRESH_TIMEOUT_MS;
+  let state = {};
+  do {
+    state = await chrome.storage.local.get([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
+    const headers = { ...(state.adsCandidateHeaders || {}), ...state };
+    if (hasAdsReportingHeaders(headers)) return headers;
+    await delayMs(500);
+  } while (Date.now() < expiresAt);
+  return { ...(state.adsCandidateHeaders || {}), ...state };
 }
 
 function isAdsHeaderComplete(st = {}) {
@@ -68,7 +150,8 @@ function isAdsHeaderComplete(st = {}) {
     st.adsClientId &&
     st.adsMarketplaceId &&
     st.adsCsrfData &&
-    st.adsCsrfToken
+    st.adsCsrfToken &&
+    st.adsReportingCsrfToken
   );
 }
 
@@ -183,7 +266,6 @@ async function requestOnce(url, init = {}) {
   const headers = { ...(await amazonHeaders()), ...(init.headers || {}) };
   return fetch(url, {
     credentials: "include",
-    redirect: "manual",
     ...init,
     headers,
   });
@@ -206,19 +288,21 @@ async function getCfg(keys = []) {
     "adsMarketplaceId",
     "adsCsrfData",
     "adsCsrfToken",
+    "adsReportingCsrfToken",
     "adsHeaderLastSeen",
     // Auto
     "autoEnabled",
     "autoUpload_enabled", "autoUpload_interval",
     ...keys,
   ]);
-  const environment = all.activeEnvironment || "development";
+  const environment = "development";
   const environmentConfig = all.ingestEnvironments?.[environment];
   if (environmentConfig) {
     all.ingestUrl = environmentConfig.ingestUrl || all.ingestUrl;
     all.ingestToken = environmentConfig.ingestToken || all.ingestToken;
     all.marketplaceCode = environmentConfig.marketplaceCode || all.marketplaceCode;
   }
+  all.ingestUrl = resolveDevelopmentApiUrl(all.ingestUrl);
   all.marketplaceCode = (all.marketplaceCode || "US").trim().toUpperCase();
   return all;
 }
@@ -235,7 +319,7 @@ async function ensureIdentity() {
    ============================== */
 function buildNewOrdersPayload(numDays = 1) {
   return {
-    type: "newOrdersReport",
+    type: "fbmOrdersReport",
     reportVersion: "new",
     includeSalesChannel: false,
     numDays: String([1, 2, 7, 15, 30].includes(Number(numDays)) ? numDays : 1),
@@ -385,13 +469,13 @@ async function downloadByDocumentId(documentId) {
 }
 
 /* ===============================
-   Poll helper (10s x 5) + chống trùng ref
+   Poll helper (10s x 18) + chống trùng ref
    =============================== */
 const activeRefs = new Map();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function pollUntilReady(
   referenceId,
-  { intervalMs = 10000, maxAttempts = 5 } = {}
+  { intervalMs = 10000, maxAttempts = 5, onAttempt } = {}
 ) {
   // Initialize logger if not exists
   if (!extensionLogger) {
@@ -412,6 +496,7 @@ async function pollUntilReady(
     }
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await onAttempt?.(attempt, maxAttempts);
       // Log each polling attempt
       if (extensionLogger) {
         await extensionLogger.logInfo(`[AMAZON_API] Amazon report polling attempt ${attempt}/${maxAttempts}`, {
@@ -482,12 +567,13 @@ async function pollUntilReady(
    Push file về backend (REST import/report/ads)
    =============================== */
 async function runImportNewOrders(referenceOverride, numDays) {
-  const { ingestUrl, ingestToken } = await getCfg();
+  const { ingestUrl, ingestToken, marketplaceCode } = await getCfg();
   if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
   const { importNewUrl } = deriveApiUrls(ingestUrl);
 
   let referenceId = referenceOverride;
   if (!referenceId) {
+    await setOrderImportProgress('REQUESTING_REPORT', 'Requesting Amazon report');
     const newOrdersPayload = buildNewOrdersPayload(numDays);
     console.log(`[IMPORT_ORDERS] Requesting New Orders report with rolling window: ${newOrdersPayload.numDays} days`);
     extensionLogger?.logInfo(`[IMPORT_ORDERS] Requesting New Orders report with rolling window: ${newOrdersPayload.numDays} days`, {
@@ -512,9 +598,12 @@ async function runImportNewOrders(referenceOverride, numDays) {
   }
   if (!referenceId) throw new Error("No referenceId found for NEW orders.");
 
+  await setOrderImportProgress('WAITING_FOR_REPORT', 'Waiting for Amazon report', { referenceId, attempt: 0, maxAttempts: REPORT_POLL_MAX_ATTEMPTS });
+
   const st = await pollUntilReady(referenceId, {
     intervalMs: 10000,
-    maxAttempts: 5,
+    maxAttempts: REPORT_POLL_MAX_ATTEMPTS,
+    onAttempt: (attempt, maxAttempts) => setOrderImportProgress('WAITING_FOR_REPORT', 'Waiting for Amazon report', { referenceId, attempt, maxAttempts }),
   });
 
   let tsv,
@@ -524,6 +613,7 @@ async function runImportNewOrders(referenceOverride, numDays) {
     tsv = st.tsv;
     rows = parseTSV(tsv).rows.length;
   } else {
+    await setOrderImportProgress('DOWNLOADING_REPORT', 'Downloading Amazon report', { referenceId });
     const r = await downloadByDocumentId(st.documentId);
     tsv = r.tsv;
     documentId = r.documentId;
@@ -552,6 +642,7 @@ async function runImportNewOrders(referenceOverride, numDays) {
 
   let ingest;
   try {
+    await setOrderImportProgress('UPLOADING_TO_BE', 'Uploading report to LNG', { referenceId, rows });
     ingest = await postOrderImport({ url: importNewUrl, token: ingestToken, formData: fd });
   } catch (error) {
     const hint = importNewOrigin
@@ -576,6 +667,7 @@ async function runImportNewOrders(referenceOverride, numDays) {
     );
     throw wrapped;
   }
+  await setOrderImportProgress('COMPLETED', 'Order import completed', { referenceId, rows });
   return { ok: true, rows, documentId, referenceId, ingest };
 }
 
@@ -602,6 +694,22 @@ async function ensureAdsTab() {
   return tab.id;
 }
 
+async function ensureAdsReportingTab() {
+  const tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
+  let tab = tabs.find((candidate) => candidate.url?.includes("/reporting"));
+
+  if (!tab) {
+    debugLog("🌐 [ADS-TAB] Opening Amazon Ads Reporting page...", "info");
+    extensionLogger?.logInfo("[ADS-TAB] Opening Amazon Ads Reporting page");
+    tab = await chrome.tabs.create({ url: `${ADS_BASE}/reporting`, active: true });
+  } else {
+    debugLog(`🌐 [ADS-TAB] Reusing Amazon Ads Reporting tab: ${tab.id}`, "info");
+    extensionLogger?.logInfo("[ADS-TAB] Reusing Amazon Ads Reporting tab", { tabId: tab.id });
+  }
+
+  return tab.id;
+}
+
 async function injectAdsMainWorldSniffer(tabId) {
   try {
     await chrome.scripting.executeScript({
@@ -620,13 +728,19 @@ async function injectAdsMainWorldSniffer(tabId) {
           "amazon-advertising-api-marketplaceid": "adsMarketplaceId",
           "amazon-advertising-api-csrf-data": "adsCsrfData",
           "amazon-advertising-api-csrf-token": "adsCsrfToken",
+          "x-csrf-token": "adsReportingCsrfToken",
         };
 
         function normalizeHeaders(headers) {
           const out = {};
           if (!headers) return out;
           try {
-            if (headers instanceof Headers) {
+            if (typeof headers === "string") {
+              headers.split(/\r?\n/).forEach((line) => {
+                const separator = line.indexOf(":");
+                if (separator > 0) out[line.slice(0, separator).trim().toLowerCase()] = line.slice(separator + 1).trim();
+              });
+            } else if (headers instanceof Headers) {
               headers.forEach((v, k) => (out[String(k).toLowerCase()] = String(v)));
             } else if (Array.isArray(headers)) {
               headers.forEach(([k, v]) => (out[String(k).toLowerCase()] = String(v)));
@@ -672,7 +786,13 @@ async function injectAdsMainWorldSniffer(tabId) {
               publish(merged);
             }
           } catch (_) { }
-          return nativeFetch.apply(this, arguments);
+          return nativeFetch.apply(this, arguments).then((response) => {
+            try {
+              const url = typeof input === "string" ? input : input?.url;
+              if (url && shouldCapture(url)) publish(response.headers);
+            } catch (_) { }
+            return response;
+          });
         };
 
         const nativeOpen = XMLHttpRequest.prototype.open;
@@ -696,6 +816,7 @@ async function injectAdsMainWorldSniffer(tabId) {
           try {
             if (this.__apoAdsUrl && shouldCapture(this.__apoAdsUrl)) {
               publish(this.__apoAdsHeaders || {});
+              this.addEventListener("loadend", () => publish(this.getAllResponseHeaders()));
             }
           } catch (_) { }
           return nativeSend.apply(this, arguments);
@@ -877,201 +998,77 @@ async function fetchAdsJsonCS(payload, options = {}) {
   throw lastError || new Error("retrieveReport failed after auth retry");
 }
 
-function buildCampaignSpendPayload({
-  startDate,
-  endDate,
-  size,
-  offset,
-  timeUnit = "DAILY",
-  isCheckCampain = false,
-}) {
-  const valueFilter = isCheckCampain
-    ? ["ENABLED", "PAUSED"]
-    : ["ENABLED", "PAUSED", "ARCHIVED"];
-  return {
-    reportConfig: {
-      reportId: "CrossProgramCampaignReport",
-      currencyOfView: "USD",
-      endDate,
-      fields: ["campaignName", "spend", "state"],
-      filter: {
-        and: [
-          {
-            comparisonOperator: "IN",
-            field: "state",
-            not: false,
-            values: valueFilter,
-          },
-        ],
-      },
-      offsetPagination: { size, offset },
-      startDate,
-      timeUnits: [timeUnit],
-    },
-  };
+async function adsReportingViaContentScript(operation, payload, options = {}) {
+  const tabId = await ensureAdsReportingTab();
+  await ensureAdsBridgeInjected(tabId);
+  const response = await chrome.tabs.sendMessage(tabId, {
+    type: 'ADS_REPORTING_REQUEST',
+    operation,
+    payload,
+    options,
+  });
+  if (!response?.ok) throw createAdsError(response?.message || `Amazon Ads ${operation} failed`, response?.status || 0);
+  return response.data;
 }
 
-async function fetchAllCampaignSpend(
-  startDate,
-  endDate,
-  pageSize = 300,
-  isCheckCampain = false,
-  options = {}
-) {
-  // Initialize logger if not exists
-  if (!extensionLogger) {
-    await initializeLogger();
-  }
+function reportConfigurations(response) {
+  return response?.reportConfigurations || response?.data?.reportConfigurations || [];
+}
 
-  // Log Amazon Ads API request start
-  if (extensionLogger) {
-    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Starting Amazon Ads API request', {
-      startDate: startDate,
-      endDate: endDate,
-      pageSize: pageSize,
-      isCheckCampain: isCheckCampain,
-      endpoint: 'Amazon Ads Campaign Spend API',
-      timestamp: new Date().toISOString()
-    });
-  }
+async function createAndRunAdsReport(reportDate, lock) {
+  const { adsAdvertiserId } = await getCfg();
+  const queryPayload = { maxResults: 50, sort: [{ by: 'latestScheduledReportLastUpdatedDateTime', direction: 'DESCENDING' }] };
+  const templates = reportConfigurations(await adsReportingViaContentScript('QUERY_CONFIGURATIONS', queryPayload, lock));
+  const template = findCsvReportTemplate(templates);
+  if (!template) throw new Error('Amazon Ads CSV report template is unavailable. Create a Campaign report with Campaign name and Total cost first.');
 
+  const accountId = adsAdvertiserId || template.linkedAccounts?.[0]?.advertiserAccountId;
+  if (!accountId) throw new Error('Amazon Ads advertiser account is unavailable. Open the Campaign Manager tab and try again.');
+  const created = await adsReportingViaContentScript('CREATE_CONFIGURATION', {
+    accessRequestedAccounts: [{ advertiserAccountId: accountId }],
+    reportConfigurations: [buildOneOffReportConfig(template, reportDate)],
+  }, lock);
+  const configurationId = reportConfigurationId(created);
+  if (!configurationId) throw new Error('Amazon Ads did not return a report configuration ID.');
+
+  await adsReportingViaContentScript('RUN_CONFIGURATION', {
+    accessRequestedAccounts: [{ advertiserAccountId: accountId }],
+    scheduledReports: [{ reportConfigurationId: configurationId }],
+  }, lock);
+  return configurationId;
+}
+
+async function waitForAdsReport(configurationId, lock) {
+  const queryPayload = { maxResults: 50, sort: [{ by: 'latestScheduledReportLastUpdatedDateTime', direction: 'DESCENDING' }] };
+  for (let attempt = 1; attempt <= REPORT_POLL_MAX_ATTEMPTS; attempt += 1) {
+    const configurations = reportConfigurations(await adsReportingViaContentScript('QUERY_CONFIGURATIONS', queryPayload, lock));
+    const report = configurations.find((item) => item.reportConfigurationId === configurationId);
+    const status = report?.latestScheduledReportStatus;
+    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Amazon Ads report polling', { attempt, maxAttempts: REPORT_POLL_MAX_ATTEMPTS, status: status || 'PENDING' });
+    if (status === 'COMPLETED') return report;
+    if (shouldFailReportStatus(status)) throw new Error(`Amazon Ads report ${String(status).toLowerCase()}.`);
+    if (isTerminalReportStatus(status)) throw new Error(`Amazon Ads report ${String(status).toLowerCase()}.`);
+    if (attempt < REPORT_POLL_MAX_ATTEMPTS) await delayMs(REPORT_POLL_INTERVAL_MS);
+  }
+  throw new Error('Amazon Ads report did not complete within three minutes.');
+}
+
+async function downloadAdsReportCsv(configurationId, lock) {
+  const tabId = await ensureAdsReportingTab();
+  await ensureAdsBridgeInjected(tabId);
+  const response = await chrome.tabs.sendMessage(tabId, { type: 'ADS_DOWNLOAD_LATEST_REPORT', configurationId, options: lock });
+  if (!response?.downloadUrl) throw new Error(response?.message || 'Amazon Ads Download latest is unavailable. Open the Amazon Reporting tab and try again.');
   try {
-    const firstJson = await fetchAdsJsonCS(
-      buildCampaignSpendPayload({
-        startDate,
-        endDate,
-        size: Math.max(1, Math.min(pageSize, 300)),
-        offset: 0,
-        isCheckCampain,
-      }),
-      { ...options, isCheckCampain, pageOffset: 0, pageSize: Math.max(1, Math.min(pageSize, 300)) }
-    );
-
-    const report0 = firstJson?.report || firstJson?.data?.report || {};
-    const count = report0?.numberOfRecords ?? 0;
-    const rows1 = Array.isArray(report0?.data) ? report0.data : [];
-
-    // Log first page results
-    if (extensionLogger) {
-      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Amazon Ads API first page response', {
-        totalRecords: count,
-        firstPageRows: rows1.length,
-        startDate: startDate,
-        endDate: endDate,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    if (count === 0 || rows1.length === 0) {
-      // Log no data found
-      if (extensionLogger) {
-        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] No campaign spend data found', {
-          startDate: startDate,
-          endDate: endDate,
-          totalRecords: count,
-          timestamp: new Date().toISOString()
-        });
-      }
-      return [];
-    }
-
-    const totalPages = Math.ceil(count / pageSize);
-    let all = rows1;
-
-    // Log pagination info
-    if (extensionLogger && totalPages > 1) {
-      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Fetching additional pages from Amazon Ads API', {
-        totalPages: totalPages,
-        totalRecords: count,
-        pageSize: pageSize,
-        startDate: startDate,
-        endDate: endDate,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    for (let page = 1; page < totalPages; page++) {
-      const js = await fetchAdsJsonCS(
-        buildCampaignSpendPayload({
-          startDate,
-          endDate,
-          size: pageSize,
-          offset: page * pageSize,
-          isCheckCampain,
-        }),
-        { ...options, isCheckCampain, pageOffset: page * pageSize, pageSize }
-      );
-      const report = js?.report || js?.data?.report || {};
-      const more = Array.isArray(report?.data) ? report.data : [];
-
-      // Log each page fetch
-      if (extensionLogger) {
-        await extensionLogger.logInfo(`[IMPORT_ADS_SPEND] Amazon Ads API page ${page + 1}/${totalPages} response`, {
-          pageRows: more.length,
-          totalFetched: all.length + more.length,
-          totalRecords: count,
-          timestamp: new Date().toISOString()
-        });
-      }
-
-      if (!more.length) break;
-      all = all.concat(more);
-    }
-
-    const processedData = all.map((r) => ({
-      campaignName: r.campaignName ?? "",
-      date: r.date ?? startDate,
-      spend: Number(r.spend ?? 0),
-      state: r.state ?? "",
-    }));
-
-    // Log successful completion
-    if (extensionLogger) {
-      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Amazon Ads API data fetch completed', {
-        totalCampaigns: processedData.length,
-        totalSpend: processedData.reduce((sum, r) => sum + r.spend, 0),
-        startDate: startDate,
-        endDate: endDate,
-        pagesProcessed: totalPages,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    return processedData;
-
-  } catch (error) {
-    // Log Amazon Ads API error
-    if (extensionLogger) {
-      await extensionLogger.logError(error, {
-        startDate: startDate,
-        endDate: endDate,
-        pageSize: pageSize,
-        isCheckCampain: isCheckCampain,
-        endpoint: 'Amazon Ads Campaign Spend API'
-      }, '[IMPORT_ADS_SPEND] Amazon Ads API request failed');
-    }
-    throw error;
+    const download = await fetch(response.downloadUrl);
+    if (!download.ok) throw new Error(`Amazon Ads CSV download failed (${download.status}).`);
+    return await download.blob();
+  } finally {
+    response.downloadUrl = null;
   }
-}
-
-function csvCell(value) {
-  const text = String(value ?? "");
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-}
-
-function campaignRowsToCsv(rows) {
-  const header = "Date,Campaign Name,Spend";
-  const lines = rows.map((r) =>
-    [
-      r.date,
-      r.campaignName,
-      r.spend,
-    ].map(csvCell).join(",")
-  );
-  return [header, ...lines].join("\n");
 }
 
 async function runExportAdsSpend({ dateFrom, dateTo }) {
+  if ((await getCfg()).ingestUrl !== DEFAULT_ENVIRONMENTS.development.ingestUrl) throw new Error("Ads import is restricted to Development");
   return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked({ dateFrom, dateTo }, lock));
 }
 
@@ -1150,7 +1147,7 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo }, lock = {}) {
   const { adsSpendUrl } = deriveApiUrls(ingestUrl);
 
   // Đảm bảo Ads headers còn hạn trước khi gọi Ads API
-  await ensureFreshAdsHeaders({ ...lock, reason: "runExportAdsSpend" });
+  await ensureFreshAdsReportingHeaders();
 
   if (!dateFrom || !dateTo) {
     const error = new Error("dateFrom and dateTo (YYYY-MM-DD) are required");
@@ -1164,47 +1161,25 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo }, lock = {}) {
     throw error;
   }
   try {
-    // Log fetching campaign data
-    if (extensionLogger) {
-      await extensionLogger.logInfo('Lấy dữ liệu chi phí campaign từ Amazon', {
-        dateFrom,
-        dateTo,
-        endpoint: 'Amazon Ads API',
-        timestamp: new Date().toISOString()
-      });
-    }
+    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Creating one-time Amazon Reporting CSV', { dateFrom, dateTo });
+    const configurationId = await createAndRunAdsReport(dateFrom, lock);
+    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Amazon Reporting CSV requested', { dateFrom, dateTo });
+    await waitForAdsReport(configurationId, lock);
+    const csv = await downloadAdsReportCsv(configurationId, lock);
+    const filename = `ads-report-${dateFrom}.csv`;
 
-    const rows = await fetchAllCampaignSpend(dateFrom, dateTo, 300, false, lock);
-
-    // Log data processing
-    if (extensionLogger) {
-      await extensionLogger.logInfo('Xử lý dữ liệu chi phí campaign', {
-        rowCount: rows.length,
-        dateFrom,
-        dateTo,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    const csv = campaignRowsToCsv(rows);
-
-    // Log uploading to backend
-    if (extensionLogger) {
-      await extensionLogger.logInfo('Upload dữ liệu chi phí quảng cáo lên backend', {
-        url: adsSpendUrl,
-        fileSize: csv.length,
-        rowCount: rows.length,
-        filename: `ads-spend-${dateFrom}-${dateTo}.csv`,
-        timestamp: new Date().toISOString()
-      });
-    }
+    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Uploading original Amazon Reporting CSV', {
+      fileSize: csv.size,
+      filename,
+    });
 
     const ingestRes = await postFileTo(adsSpendUrl, {
       salesChannelCode: "AMAZON",
       marketplaceCode: marketplaceCode || "US",
       dryRun: "false",
-      sourceRef: `ads-spend-${dateFrom}-${dateTo}.csv`,
-      file: { name: `ads-spend-${dateFrom}-${dateTo}.csv`, text: csv },
+      sourceRef: filename,
+      filename,
+      file: csv,
     }, ingestToken);
 
     const endTime = Date.now();
@@ -1215,8 +1190,8 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo }, lock = {}) {
         taskId: `ads_export_${startTime}`,
         taskType: 'IMPORT_ADS_SPEND',
         batchId: `ads_${dateFrom}_${dateTo}`,
-        ordersCount: rows.length,
-        filename: `ads-spend-${dateFrom}-${dateTo}.csv`
+        ordersCount: 0,
+        filename
       }, {
         duration: endTime - startTime,
         memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
@@ -1224,7 +1199,7 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo }, lock = {}) {
       }, `Xuất chi phí quảng cáo hoàn thành thành công cho ${dateFrom} đến ${dateTo}`);
     }
 
-    return { ok: true, rows: rows.length, ingest: ingestRes };
+    return { ok: true, rows: ingestRes?.data?.rowCount || 0, ingest: ingestRes };
 
   } catch (error) {
     // Log task failed
@@ -1242,15 +1217,67 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo }, lock = {}) {
 }
 
 async function getBaseShopAndIdentity() { const config = await getCfg(); const { clientId, clientLabel } = await ensureIdentity(); return { base: deriveApiUrls(config.ingestUrl).base, clientId, clientLabel }; }
-async function runFullFlowAndEmitLogs(numDays) { const importResult = await runImportNewOrders(undefined, numDays); return { ok: true, phases: [{ type: "import", status: "success", rows: importResult?.rows || 0 }], result: importResult }; }
-async function pollExtensionCommands() { const config = await getCfg(); const identity = await getBaseShopAndIdentity(); return pollExtensionCommand({ base: identity.base, token: config.ingestToken, client: { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }, runImport: (numDays) => runFullFlowAndEmitLogs(numDays), runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }) }); }
+async function gmailAdsDownloadKey(url) {
+  const bytes = new TextEncoder().encode(url);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((item) => item.toString(16).padStart(2, '0')).join('');
+}
+async function uploadGmailAdsDownload(url) {
+  const report = classifyAmazonAdsReportLink(url);
+  if (!report) return { ok: false, ignored: true };
+  const config = await getCfg();
+  const key = await gmailAdsDownloadKey(createGmailAdsDownloadFingerprint(config.ingestUrl, url));
+  const task = {
+    taskId: `gmail-ads-${key.slice(0, 12)}`,
+    taskType: 'IMPORT_ADS_SPEND',
+    filename: report.filename,
+  };
+  const now = Date.now();
+  const stored = await chrome.storage.local.get(GMAIL_ADS_RECENT_DOWNLOADS_KEY);
+  const recent = (stored[GMAIL_ADS_RECENT_DOWNLOADS_KEY] || {}).entries || {};
+  for (const [item, timestamp] of Object.entries(recent)) if (now - timestamp > GMAIL_ADS_RECENT_DOWNLOADS_TTL_MS) delete recent[item];
+  await extensionLogger.logTaskProcessing(task, 'Downloading Amazon Ads report from Gmail');
+  try {
+    if (recent[key]) {
+      await extensionLogger.logTaskCompleted(task, null, 'Amazon Ads report upload completed (already imported)');
+      return { ok: true, skipped: true, reason: 'ALREADY_IMPORTED' };
+    }
+
+    const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
+    if (!response.ok) throw new Error(`Amazon Ads email download failed (${response.status}).`);
+    const file = await response.blob();
+    if (!file.size || file.size > GMAIL_ADS_MAX_FILE_SIZE) throw new Error('Amazon Ads email report has an invalid file size.');
+    const { adsSpendUrl } = deriveApiUrls(config.ingestUrl);
+    const result = await postFileTo(adsSpendUrl, {
+      salesChannelCode: 'AMAZON', marketplaceCode: config.marketplaceCode || 'US', dryRun: 'false',
+      sourceRef: report.filename, filename: report.filename, file,
+    }, config.ingestToken);
+    recent[key] = now;
+    await chrome.storage.local.set({ [GMAIL_ADS_RECENT_DOWNLOADS_KEY]: { entries: recent } });
+    await extensionLogger.logTaskCompleted(task, result, 'Amazon Ads report upload completed');
+    return { ok: true, rows: result?.data?.rowCount || 0, ingest: result };
+  } catch (error) {
+    await extensionLogger.logTaskFailed(task, error, `Amazon Ads report upload failed: ${error?.message || String(error)}`);
+    throw error;
+  }
+}
+async function runFullFlowAndEmitLogs(numDays) { try { const importResult = await runImportNewOrders(undefined, numDays); return { ok: true, phases: [{ type: "import", status: "success", rows: importResult?.rows || 0 }], result: importResult }; } catch (error) { await setOrderImportProgress('FAILED', 'Order import failed', { error: error?.message || String(error) }); throw error; } }
+async function pollExtensionCommands(config = null) { config ||= await getCfg(); const identity = await getBaseShopAndIdentity(); return pollExtensionCommand({ base: identity.base, token: config.ingestToken, client: { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }, runImport: (numDays) => runFullFlowAndEmitLogs(numDays), runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }) }); }
+async function queueManualOrderImport() { const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }; const command = await queueOrderImportCommand({ base: identity.base, token: config.ingestToken, client }); await setOrderImportProgress('QUEUED', 'Import queued'); await pollExtensionCommandsWithBackoff({ force: true }); return { ok: true, commandId: command.id }; }
+async function queueManualAdsSpend(date) { const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }; const command = await queueAdsSpendCommand({ base: identity.base, token: config.ingestToken, client, date }); await pollExtensionCommandsWithBackoff({ force: true }); return { ok: true, commandId: command.id }; }
 async function pollExtensionCommandsWithBackoff({ force = false } = {}) {
   const now = Date.now();
   const state = await chrome.storage.local.get(EXTENSION_COMMAND_POLL_BACKOFF_KEY);
   const backoff = state[EXTENSION_COMMAND_POLL_BACKOFF_KEY] || {};
   if (!force && backoff.nextAttemptAt > now) return null;
+  const config = await getCfg();
+  if (!config.ingestUrl || !config.ingestToken) {
+    await chrome.storage.local.remove(EXTENSION_COMMAND_POLL_BACKOFF_KEY);
+    await chrome.storage.local.set({ [EXTENSION_CONNECTION_STATUS_KEY]: { state: "NOT_CONFIGURED", lastHeartbeatAt: null, nextPollAt: null, lastTask: null } });
+    return null;
+  }
   try {
-    const result = await pollExtensionCommands();
+    const result = await pollExtensionCommands(config);
     await chrome.storage.local.remove(EXTENSION_COMMAND_POLL_BACKOFF_KEY);
     await chrome.storage.local.set({ [EXTENSION_CONNECTION_STATUS_KEY]: { state: "CONNECTED", lastHeartbeatAt: now, nextPollAt: now + 60_000, lastTask: result || null } });
     return result;
@@ -1263,10 +1290,8 @@ async function pollExtensionCommandsWithBackoff({ force = false } = {}) {
   }
 }
 async function startExtensionCommandPolling() { await chrome.alarms.create(EXTENSION_COMMAND_POLL_ALARM, { periodInMinutes: 1 }); await pollExtensionCommandsWithBackoff().catch(() => undefined); }
-const ADS_HEADER_KEYS = { "amazon-ads-account-id": "adsAccountId", "amazon-advertising-api-advertiserid": "adsAdvertiserId", "amazon-advertising-api-clientid": "adsClientId", "amazon-advertising-api-marketplaceid": "adsMarketplaceId", "amazon-advertising-api-csrf-data": "adsCsrfData", "amazon-advertising-api-csrf-token": "adsCsrfToken" };
-chrome.webRequest.onBeforeSendHeaders.addListener((details) => { const found = Object.fromEntries((details.requestHeaders || []).map((h) => [ADS_HEADER_KEYS[String(h.name || "").toLowerCase()], h.value]).filter(([k, v]) => k && v)); if (Object.keys(found).length) chrome.storage.local.set({ ...found, adsHeaderLastSeen: Date.now() }); }, { urls: ["https://advertising.amazon.com/*"] }, ["requestHeaders", "extraHeaders"]);
 chrome.runtime.onInstalled.addListener(() => startExtensionCommandPolling());
 chrome.runtime.onStartup.addListener(() => startExtensionCommandPolling());
 chrome.storage.onChanged.addListener((changes) => { if (changes.ingestUrl || changes.ingestToken) startExtensionCommandPolling(); });
 chrome.alarms.onAlarm.addListener((alarm) => { if (alarm?.name === EXTENSION_COMMAND_POLL_ALARM) pollExtensionCommandsWithBackoff().catch(() => undefined); });
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => { (async () => { if (msg?.type === "PING") return sendResponse({ ok: true }); if (msg?.type === "HEARTBEAT_NOW") { await pollExtensionCommandsWithBackoff({ force: true }); return sendResponse({ ok: true, message: "Heartbeat completed." }); } if (msg?.type === "AUTO_RUN_NOW") return sendResponse(await runFullFlowAndEmitLogs("manual")); if (msg?.type === "RUN_ADS_SPEND") return sendResponse(await runExportAdsSpend({ dateFrom: msg.payload?.dateFrom || msg.payload?.date, dateTo: msg.payload?.dateTo || msg.payload?.date })); if (msg?.type === "RUN_TRANSACTIONS_IMPORT") return sendResponse(await runImportTransactions(msg.payload || {})); if (msg?.type === "RUN_SETTLEMENTS_IMPORT") return sendResponse(await runImportSettlements(msg.payload || {})); return sendResponse({ ok: false, error: "Unsupported action" }); })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) })); return true; });
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => { (async () => { if (msg?.type === "PING") return sendResponse({ ok: true }); if (msg?.type === "HEARTBEAT_NOW") { await pollExtensionCommandsWithBackoff({ force: true }); return sendResponse({ ok: true, message: "Heartbeat completed." }); } if (msg?.type === "AUTO_RUN_NOW") return sendResponse(await queueManualOrderImport()); if (msg?.type === "RUN_ADS_SPEND") return sendResponse(await queueManualAdsSpend(msg.payload?.date)); if (msg?.type === "RUN_TRANSACTIONS_IMPORT") return sendResponse(await runImportTransactions(msg.payload || {})); if (msg?.type === "RUN_SETTLEMENTS_IMPORT") return sendResponse(await runImportSettlements(msg.payload || {})); if (msg?.type === "GMAIL_AMAZON_ADS_DOWNLOAD") return sendResponse(await uploadGmailAdsDownload(msg.url)); return sendResponse({ ok: false, error: "Unsupported action" }); })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) })); return true; });

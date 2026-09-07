@@ -82,3 +82,23 @@ test('activity timeline groups a failed Ads run and formats the operator time in
   assert.equal(runs[0].events.length, 3);
   assert.match(formatVietnamTime(runs[0].startedAt), /13:16:15 ICT/);
 });
+
+test('activity timeline marks a completed Gmail Ads upload as succeeded', () => {
+  const runs = buildActivityRuns([
+    {
+      timestamp: '2026-08-25T08:40:00.000Z',
+      level: 'info',
+      message: 'Downloading Amazon Ads report from Gmail',
+      context: { taskId: 'gmail-ads-1', taskType: 'IMPORT_ADS_SPEND' },
+    },
+    {
+      timestamp: '2026-08-25T08:40:02.000Z',
+      level: 'info',
+      message: 'Amazon Ads report upload completed',
+      context: { taskId: 'gmail-ads-1', taskType: 'IMPORT_ADS_SPEND' },
+    },
+  ]);
+
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0].status, 'SUCCEEDED');
+});

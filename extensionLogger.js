@@ -64,7 +64,7 @@ export function buildActivityRuns(events = []) {
       run.status = 'FAILED';
       const error = event?.context?.errorMessage || event.message;
       if (!run.error || !/^\[ADS-LOCK\] Released error [^:]+$/.test(error)) run.error = error;
-    } else if (/task completed|hoàn thành/i.test(event.message || '')) {
+    } else if (/task completed|upload completed|hoàn thành/i.test(event.message || '')) {
       run.status = 'SUCCEEDED';
     }
     return runs;
