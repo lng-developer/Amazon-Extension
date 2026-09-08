@@ -1,4 +1,4 @@
-export async function postFileTo(url, fields, token = "") {
+export async function postFileTo(url, fields, token = "", options = {}) {
   const fd = new FormData();
 
   for (const [k, v] of Object.entries(fields || {})) {
@@ -18,12 +18,30 @@ export async function postFileTo(url, fields, token = "") {
 
   const res = await fetch(url, {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
+    },
     body: fd,
   });
-  if (!res.ok) throw new Error(`Backend ${res.status}`);
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-  return ct.includes("application/json") ? res.json() : { ok: true, raw: await res.text() };
+  const body = await readBackendResponse(res);
+  if (!res.ok) {
+    const message = body?.error?.message || body?.error || body?.message || body?.raw || "";
+    throw new Error(`Backend ${res.status}${message ? `: ${message}` : ""}`);
+  }
+  return body || { ok: true };
+}
+
+export async function getJson(url, token = "") {
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const body = await readBackendResponse(res);
+  if (!res.ok) {
+    const message = body?.error?.message || body?.error?.code || body?.error || body?.message || body?.raw || "";
+    throw new Error(`Backend ${res.status}${message ? `: ${message}` : ""}`);
+  }
+  return body || { ok: true };
 }
 
 async function readBackendResponse(res) {

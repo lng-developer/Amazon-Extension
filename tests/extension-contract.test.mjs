@@ -165,6 +165,7 @@ test('extension derives its shop from the access token', () => {
 
 test("transactions import targets finance transaction endpoint", () => {
   const background = read("background.js");
+  const backendApi = read("backendApi.js");
   const config = read("config.js");
   const html = read("options.html");
 
@@ -175,6 +176,10 @@ test("transactions import targets finance transaction endpoint", () => {
   assert.match(background, /RUN_TRANSACTIONS_IMPORT/);
   assert.match(background, /salesChannelCode: "AMAZON"/);
   assert.match(background, /marketplaceCode: marketplaceCode \|\| "US"/);
+  assert.match(background, /sha256Key\(`TRANSACTIONS\|\$\{dateFrom\}\|\$\{dateTo\}\|\$\{csv\}`\)/);
+  assert.match(backendApi, /Idempotency-Key/);
+  assert.match(background, /api\/finance\/import-batches\/\$\{batchId\}/);
+  assert.match(background, /recalculationStatus/);
 });
 
 test("settlements import targets finance settlement endpoint", () => {
@@ -185,10 +190,27 @@ test("settlements import targets finance settlement endpoint", () => {
   assert.match(html, /id="settlementsDateFrom"/);
   assert.match(html, /id="settlementsDateTo"/);
   assert.match(html, /id="btnImportSettlements"/);
+  assert.match(html, /opens the Flat File V2 menu and reads the download link automatically/);
   assert.match(config, /\/api\/finance\/imports\/settlements/);
   assert.match(background, /RUN_SETTLEMENTS_IMPORT/);
   assert.match(background, /salesChannelCode: "AMAZON"/);
   assert.match(background, /marketplaceCode: marketplaceCode \|\| "US"/);
+  assert.match(background, /chrome\.scripting\.executeScript/);
+  assert.match(background, /aria-haspopup/);
+  assert.match(background, /data-href/);
+  assert.match(background, /querySelectorAll\('\*'\)/);
+  assert.match(background, /shadowRoot/);
+  assert.match(background, /kat-dropdown-button/);
+  assert.match(background, /data-action/);
+  assert.match(background, /button\[data-action\]/);
+  assert.match(background, /find\(\(candidate\) => allElements\(candidate\)\.some\(\(element\) => element\.matches\('kat-dropdown-button'\)\)\)/);
+  assert.match(background, /referenceId/);
+  assert.match(background, /rowFound/);
+  assert.match(background, /args: \[\{ dateFrom, dateTo \}\]/);
+  assert.match(background, /selectSettlementDownload/);
+  assert.match(background, /SETTLEMENT_IMPORT_COOLDOWN_MS/);
+  assert.match(background, /sha256Key\(`SETTLEMENTS\|\$\{referenceId\}\|\$\{text\}`\)/);
+  assert.match(background, /waitForFinanceImport/);
 });
 
 test("backend API calls are centralized", () => {
@@ -264,6 +286,12 @@ test("popup identifies its own extension and reports a failed local poll accurat
   assert.match(options, /\[connectionStatusKey, 'clientId'\]/);
   assert.match(options, /Last poll failed/);
   assert.match(options, /result\?\.ok === false/);
+});
+
+test('manual settlement skips are visible instead of looking like a new run', () => {
+  const options = read('options.js');
+  assert.match(options, /result\?\.skipped/);
+  assert.match(options, /Skipped:/);
 });
 
 test('missing API configuration is never reported as connected', () => {

@@ -120,7 +120,11 @@ async function send(type, payload = {}) {
   log('Starting…');
   try {
     const result = await chrome.runtime.sendMessage({ type, payload });
-    log(result?.ok === false ? `Failed: ${result.error || 'Unknown error'}` : 'Started.');
+    log(result?.ok === false
+      ? `Failed: ${result.error || 'Unknown error'}`
+      : result?.skipped
+        ? `Skipped: ${result.reason || 'Already handled'}`
+        : 'Started.');
   } finally {
     if (button?.tagName === 'BUTTON') button.disabled = false;
   }
