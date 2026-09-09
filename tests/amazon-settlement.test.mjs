@@ -5,6 +5,7 @@ import {
   SETTLEMENT_IMPORT_COOLDOWN_MS,
   canStartSettlementImport,
   parseStatementPeriod,
+  settlementImportDecision,
   selectSettlementDownload,
   validateSettlementText,
 } from '../amazonSettlement.js';
@@ -58,4 +59,12 @@ test('blocks repeated settlement downloads during the cooldown', () => {
   assert.equal(canStartSettlementImport({ attemptedAt: now - 1_000 }, now), false);
   assert.equal(canStartSettlementImport({ attemptedAt: now - SETTLEMENT_IMPORT_COOLDOWN_MS }, now), true);
   assert.equal(canStartSettlementImport(null, now), true);
+});
+
+test('skips a settlement that LNG already completed before download', () => {
+  assert.deepEqual(
+    settlementImportDecision({ completed: true, referenceId: '27554249931' }),
+    { ok: true, skipped: true, reason: 'SETTLEMENT_ALREADY_IMPORTED', referenceId: '27554249931' },
+  );
+  assert.equal(settlementImportDecision({ completed: false, referenceId: '27554249931' }), null);
 });

@@ -206,7 +206,7 @@ test("settlements import targets finance settlement endpoint", () => {
   assert.match(background, /find\(\(candidate\) => allElements\(candidate\)\.some\(\(element\) => element\.matches\('kat-dropdown-button'\)\)\)/);
   assert.match(background, /referenceId/);
   assert.match(background, /rowFound/);
-  assert.match(background, /args: \[\{ dateFrom, dateTo \}\]/);
+  assert.match(background, /args: \[autoDiscover \? \{ dateFrom, dateTo, autoDiscover \} : \{ dateFrom, dateTo \}\]/);
   assert.match(background, /selectSettlementDownload/);
   assert.match(background, /SETTLEMENT_IMPORT_COOLDOWN_MS/);
   assert.match(background, /sha256Key\(`SETTLEMENTS\|\$\{referenceId\}\|\$\{text\}`\)/);
@@ -350,6 +350,35 @@ test("extension command polling uses the LNG command API and current import flow
   assert.match(client, /\/api\/integration\/extension-commands/);
   assert.match(client, /IMPORT_NEW_ORDERS/);
   assert.match(client, /Authorization: `Bearer \$\{token\}`/);
+});
+
+test('extension command polling supports finance imports', () => {
+  const background = read('background.js');
+  const client = read('extensionCommandClient.js');
+
+  assert.match(client, /IMPORT_TRANSACTIONS/);
+  assert.match(client, /IMPORT_SETTLEMENTS/);
+  assert.match(client, /runTransactions/);
+  assert.match(client, /runSettlements/);
+  assert.match(background, /runTransactions: \(\{ dateFrom, dateTo \}\) => runImportTransactions\(\{ dateFrom, dateTo \}\)/);
+  assert.match(background, /runSettlements: \(\) => runScheduledSettlementImport\(\)/);
+});
+
+test('settlement automation opens All Statements only when no tab exists', () => {
+  const background = read('background.js');
+
+  assert.match(background, /async function ensureSettlementStatementsTab\(\)/);
+  assert.match(background, /chrome\.tabs\.create\(\{ url: ALL_STATEMENTS_URL, active: false \}\)/);
+  assert.match(background, /candidate\.url\?\.includes\('\/payments\/past-settlements'\)/);
+  assert.match(background, /autoDiscover/);
+  assert.match(background, /Present/);
+});
+
+test('settlement automation checks LNG completion before downloading a discovered statement', () => {
+  const background = read('background.js');
+
+  assert.match(background, /imports\/settlements\/\$\{encodeURIComponent\(referenceId\)\}\/completed/);
+  assert.match(background, /settlementImportDecision/);
 });
 
 test("legacy realtime, FBM, tracking, and legacy-token APIs are absent", () => {

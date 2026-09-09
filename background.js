@@ -19,6 +19,7 @@ import {
   SETTLEMENT_IMPORT_COOLDOWN_MS,
   canStartSettlementImport,
   getSettlementReferenceId,
+  settlementImportDecision,
   selectSettlementDownload,
   validateSettlementText,
 } from './amazonSettlement.js';
@@ -38,6 +39,7 @@ const debugLog = (message, level = "info") =>
   void (level === "error" ? extensionLogger.logError(null, undefined, message) : extensionLogger.logInfo(message));
 async function initializeLogger() { return extensionLogger; }
 const SC_BASE = "https://sellercentral.amazon.com";
+const ALL_STATEMENTS_URL = `${SC_BASE}/payments/past-settlements?ref_=xx_settle_ttab_trans`;
 const ADS_BASE = "https://advertising.amazon.com";
 const ADS_RETRIEVE_URL = "https://advertising.amazon.com/a9g-api-gateway/cm/dds/retrieveReport";
 /* ---------- Amazon Ads Auth Hardening ---------- */
@@ -64,14 +66,15 @@ const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function createAdsError(message, status = 0, responseText = "") { const error = new Error(message); error.status = status; error.responseText = responseText; return error; }
 function isAdsAuthError(error) { return [401, 403].includes(Number(error?.status)) || /sign.?in|login|unauthor/i.test(String(error?.responseText || error?.message || "")); }
-async function waitForAdsTabComplete(tabId) {
+async function waitForTabComplete(tabId, timeoutMessage = "Amazon page did not finish loading") {
   if ((await chrome.tabs.get(tabId)).status === "complete") return;
   await new Promise((resolve, reject) => {
     const onUpdated = (updatedTabId, changeInfo) => { if (updatedTabId === tabId && changeInfo.status === "complete") { clearTimeout(timeout); chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); } };
-    const timeout = setTimeout(() => { chrome.tabs.onUpdated.removeListener(onUpdated); reject(new Error("Amazon Ads page did not finish loading")); }, ADS_TAB_LOAD_TIMEOUT_MS);
+    const timeout = setTimeout(() => { chrome.tabs.onUpdated.removeListener(onUpdated); reject(new Error(timeoutMessage)); }, ADS_TAB_LOAD_TIMEOUT_MS);
     chrome.tabs.onUpdated.addListener(onUpdated);
   });
 }
+async function waitForAdsTabComplete(tabId) { return waitForTabComplete(tabId, "Amazon Ads page did not finish loading"); }
 async function clearAdsHeaders() { await chrome.storage.local.remove([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]); }
 
 async function reloadAdsTabForHeaderCapture(tabId) {
@@ -1124,7 +1127,7 @@ async function waitForFinanceImport({ base, batchId, token, context, kind = 'Fin
   throw new Error(`${kind} import polling timed out`);
 }
 
-async function extractSettlementDownloadCandidates({ dateFrom, dateTo } = {}) {
+async function extractSettlementDownloadCandidates({ dateFrom, dateTo, autoDiscover = false } = {}) {
   const diagnostics = { elementCount: 0, downloadElementCount: 0, rowFound: false, controlCount: 0, toggleFound: false, referenceIdFound: false };
   const allElements = (root) => {
     const elements = [];
@@ -1171,7 +1174,23 @@ async function extractSettlementDownloadCandidates({ dateFrom, dateTo } = {}) {
   };
 
   const existing = collect();
-  if (existing.length || !dateFrom || !dateTo) return { candidates: existing, diagnostics };
+  if (existing.length && !autoDiscover) return { candidates: existing, diagnostics };
+  if ((!dateFrom || !dateTo) && !autoDiscover) return { candidates: existing, diagnostics };
+  if (!dateFrom || !dateTo) {
+    const rows = allElements(document)
+      .filter((candidate) => candidate.matches('tr,[role="row"]') && !/\bPresent\b/i.test(candidate.innerText || ''))
+      .map((row) => {
+        const dates = ((row.innerText || '').match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || []).map((value) => {
+          const [month, day, year] = value.split('/');
+          return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        });
+        return { row, dates };
+      })
+      .filter(({ row, dates }) => dates.length >= 2 && allElements(row).some((element) => element.matches('kat-dropdown-button')))
+      .sort((left, right) => right.dates[1].localeCompare(left.dates[1]));
+    if (!rows.length) return { candidates: existing, diagnostics };
+    [dateFrom, dateTo] = rows[0].dates;
+  }
 
   const dates = [dateFrom, dateTo];
   // ponytail: one DOM scan per manual import; add a page-specific adapter only if Amazon virtualizes these rows.
@@ -1230,21 +1249,41 @@ async function extractSettlementDownloadCandidates({ dateFrom, dateTo } = {}) {
   return { candidates: collect(), diagnostics };
 }
 
-async function findSettlementDownload({ dateFrom, dateTo }) {
+function settlementPeriodDates(periodText) {
+  const dates = (periodText.match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || []).map((value) => {
+    const [month, day, year] = value.split('/');
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  });
+  return dates.length >= 2 ? { dateFrom: dates[0], dateTo: dates[1] } : null;
+}
+
+async function ensureSettlementStatementsTab() {
   const tabs = await chrome.tabs.query({ url: `${SC_BASE}/payments/*` });
   const statementTabs = tabs.filter((candidate) => candidate.url?.includes('/payments/past-settlements'));
   const [focusedTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const tab = (focusedTab?.url?.includes('/payments/past-settlements') ? focusedTab : null)
+  let tab = (focusedTab?.url?.includes('/payments/past-settlements') ? focusedTab : null)
     || statementTabs.find((candidate) => candidate.active)
     || statementTabs[0];
-  if (!tab?.id) throw new Error('Open Amazon All Statements while signed in before importing settlements');
+  if (!tab) tab = await chrome.tabs.create({ url: ALL_STATEMENTS_URL, active: false });
+  if (!tab?.id) throw new Error('SELLER_CENTRAL_AUTH_REQUIRED: Amazon All Statements could not be opened');
+  await waitForTabComplete(tab.id, 'Amazon All Statements did not finish loading');
+  const loaded = await chrome.tabs.get(tab.id);
+  if (!loaded.url?.includes('/payments/past-settlements')) {
+    throw new Error('SELLER_CENTRAL_AUTH_REQUIRED: Sign in to Seller Central on the VPS, then retry');
+  }
+  await delayMs(750);
+  return loaded;
+}
+
+async function findSettlementDownload({ dateFrom, dateTo, autoDiscover = false } = {}) {
+  const tab = await ensureSettlementStatementsTab();
 
   let execution;
   try {
     execution = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractSettlementDownloadCandidates,
-      args: [{ dateFrom, dateTo }],
+      args: [autoDiscover ? { dateFrom, dateTo, autoDiscover } : { dateFrom, dateTo }],
     });
   } catch (error) {
     throw new Error(`Cannot inspect Amazon All Statements: ${error?.message || String(error)}`);
@@ -1253,14 +1292,16 @@ async function findSettlementDownload({ dateFrom, dateTo }) {
   const candidates = Array.isArray(inspected) ? inspected : inspected.candidates || [];
   if (!candidates.length) {
     const diagnostics = Array.isArray(inspected) ? {} : inspected.diagnostics || {};
-    throw new Error(`No settlement download link found for ${dateFrom} to ${dateTo}. DOM elements=${diagnostics.elementCount || 0}, download nodes=${diagnostics.downloadElementCount || 0}, row=${diagnostics.rowFound ? 'yes' : 'no'}, controls=${diagnostics.controlCount || 0}, toggle=${diagnostics.toggleFound ? 'yes' : 'no'}, referenceId=${diagnostics.referenceIdFound ? 'yes' : 'no'}`);
+    throw new Error(`No settlement download link found${dateFrom && dateTo ? ` for ${dateFrom} to ${dateTo}` : ''}. DOM elements=${diagnostics.elementCount || 0}, download nodes=${diagnostics.downloadElementCount || 0}, row=${diagnostics.rowFound ? 'yes' : 'no'}, controls=${diagnostics.controlCount || 0}, toggle=${diagnostics.toggleFound ? 'yes' : 'no'}, referenceId=${diagnostics.referenceIdFound ? 'yes' : 'no'}`);
   }
-  const selected = selectSettlementDownload(candidates, { dateFrom, dateTo });
+  const selected = autoDiscover ? candidates[0] : selectSettlementDownload(candidates, { dateFrom, dateTo });
+  const period = settlementPeriodDates(selected.periodText || '');
+  if (autoDiscover && !period) throw new Error('Settlement period could not be read from Amazon All Statements');
   const url = new URL(selected.href);
   if (url.origin !== SC_BASE || url.pathname !== '/payments/reports/download') {
     throw new Error('Amazon settlement download link is not trusted');
   }
-  return { ...selected, href: url.href, referenceId: getSettlementReferenceId(url.href), tabId: tab.id };
+  return { ...selected, href: url.href, referenceId: getSettlementReferenceId(url.href), tabId: tab.id, ...(period || {}) };
 }
 
 async function fetchSettlementsTxtFromAmazon({ dateFrom, dateTo, descriptor: providedDescriptor } = {}) {
@@ -1321,21 +1362,37 @@ async function runImportTransactions({ dateFrom, dateTo } = {}) {
   }
 }
 
-async function runImportSettlements({ dateFrom, dateTo } = {}) {
+async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDescriptor } = {}) {
   if (settlementImportLock.running) {
     throw new Error('Settlement import already running; wait for the current import to finish');
   }
   const { ingestUrl, ingestToken, marketplaceCode } = await getCfg();
   if (!ingestUrl || !ingestToken) throw new Error("Missing ingestUrl or ingestToken (Options)");
-  if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
 
   settlementImportLock.running = true;
   let referenceId = null;
-  const context = { dateFrom, dateTo, taskId: `settlements_${dateFrom}_${dateTo}` };
+  let context = { dateFrom: dateFrom || null, dateTo: dateTo || null, taskId: 'settlements_scheduled' };
   try {
+    const descriptor = providedDescriptor || await findSettlementDownload({ dateFrom, dateTo });
+    const resolvedDateFrom = dateFrom || descriptor.dateFrom;
+    const resolvedDateTo = dateTo || descriptor.dateTo;
+    if (!resolvedDateFrom || !resolvedDateTo) throw new Error("dateFrom and dateTo are required");
+    context = { dateFrom: resolvedDateFrom, dateTo: resolvedDateTo, taskId: `settlements_${resolvedDateFrom}_${resolvedDateTo}` };
     await extensionLogger.logTaskProcessing(context, 'Settlement task started');
-    const descriptor = await findSettlementDownload({ dateFrom, dateTo });
     referenceId = descriptor.referenceId;
+    const { settlementsImportUrl, base } = deriveApiUrls(ingestUrl);
+    const completion = await getJson(
+      `${base}/api/finance/imports/settlements/${encodeURIComponent(referenceId)}/completed`,
+      ingestToken,
+    );
+    const completedSkip = settlementImportDecision({
+      completed: completion?.data?.completed === true,
+      referenceId,
+    });
+    if (completedSkip) {
+      await extensionLogger.logTaskCompleted(context, completedSkip, 'Settlement task skipped (already imported)');
+      return completedSkip;
+    }
     const history = await readSettlementImportHistory();
     const previous = history[referenceId];
     if (previous?.status === 'COMPLETED' && previous.batchId) {
@@ -1354,10 +1411,9 @@ async function runImportSettlements({ dateFrom, dateTo } = {}) {
       return skipped;
     }
 
-    await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'FETCHING', dateFrom, dateTo });
-    const { text, summary } = await fetchSettlementsTxtFromAmazon({ dateFrom, dateTo, descriptor });
+    await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'FETCHING', dateFrom: resolvedDateFrom, dateTo: resolvedDateTo });
+    const { text, summary } = await fetchSettlementsTxtFromAmazon({ dateFrom: resolvedDateFrom, dateTo: resolvedDateTo, descriptor });
     const idempotencyKey = await sha256Key(`SETTLEMENTS|${referenceId}|${text}`);
-    const { settlementsImportUrl, base } = deriveApiUrls(ingestUrl);
     const result = await postFileTo(settlementsImportUrl, {
       salesChannelCode: "AMAZON",
       marketplaceCode: marketplaceCode || "US",
@@ -1384,6 +1440,11 @@ async function runImportSettlements({ dateFrom, dateTo } = {}) {
   } finally {
     settlementImportLock.running = false;
   }
+}
+
+async function runScheduledSettlementImport() {
+  const descriptor = await findSettlementDownload({ autoDiscover: true });
+  return runImportSettlements({ dateFrom: descriptor.dateFrom, dateTo: descriptor.dateTo, descriptor });
 }
 
 async function runExportAdsSpendLocked({ dateFrom, dateTo }, lock = {}) {
@@ -1536,7 +1597,7 @@ async function uploadGmailAdsDownload(url) {
   }
 }
 async function runFullFlowAndEmitLogs(numDays) { try { const importResult = await runImportNewOrders(undefined, numDays); return { ok: true, phases: [{ type: "import", status: "success", rows: importResult?.rows || 0 }], result: importResult }; } catch (error) { await setOrderImportProgress('FAILED', 'Order import failed', { error: error?.message || String(error) }); throw error; } }
-async function pollExtensionCommands(config = null) { config ||= await getCfg(); const identity = await getBaseShopAndIdentity(); return pollExtensionCommand({ base: identity.base, token: config.ingestToken, client: { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }, runImport: (numDays) => runFullFlowAndEmitLogs(numDays), runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }) }); }
+async function pollExtensionCommands(config = null) { config ||= await getCfg(); const identity = await getBaseShopAndIdentity(); return pollExtensionCommand({ base: identity.base, token: config.ingestToken, client: { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }, runImport: (numDays) => runFullFlowAndEmitLogs(numDays), runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }), runTransactions: ({ dateFrom, dateTo }) => runImportTransactions({ dateFrom, dateTo }), runSettlements: () => runScheduledSettlementImport() }); }
 async function queueManualOrderImport() { const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }; const command = await queueOrderImportCommand({ base: identity.base, token: config.ingestToken, client }); await setOrderImportProgress('QUEUED', 'Import queued'); await pollExtensionCommandsWithBackoff({ force: true }); return { ok: true, commandId: command.id }; }
 async function queueManualAdsSpend(date) { const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }; const command = await queueAdsSpendCommand({ base: identity.base, token: config.ingestToken, client, date }); await pollExtensionCommandsWithBackoff({ force: true }); return { ok: true, commandId: command.id }; }
 async function pollExtensionCommandsWithBackoff({ force = false } = {}) {
