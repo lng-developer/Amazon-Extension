@@ -19,6 +19,7 @@ import {
   SETTLEMENT_IMPORT_COOLDOWN_MS,
   canStartSettlementImport,
   getSettlementReferenceId,
+  settlementImportDecision,
   selectSettlementDownload,
   validateSettlementText,
 } from './amazonSettlement.js';
@@ -1379,6 +1380,19 @@ async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDesc
     context = { dateFrom: resolvedDateFrom, dateTo: resolvedDateTo, taskId: `settlements_${resolvedDateFrom}_${resolvedDateTo}` };
     await extensionLogger.logTaskProcessing(context, 'Settlement task started');
     referenceId = descriptor.referenceId;
+    const { settlementsImportUrl, base } = deriveApiUrls(ingestUrl);
+    const completion = await getJson(
+      `${base}/api/finance/imports/settlements/${encodeURIComponent(referenceId)}/completed`,
+      ingestToken,
+    );
+    const completedSkip = settlementImportDecision({
+      completed: completion?.data?.completed === true,
+      referenceId,
+    });
+    if (completedSkip) {
+      await extensionLogger.logTaskCompleted(context, completedSkip, 'Settlement task skipped (already imported)');
+      return completedSkip;
+    }
     const history = await readSettlementImportHistory();
     const previous = history[referenceId];
     if (previous?.status === 'COMPLETED' && previous.batchId) {
@@ -1400,7 +1414,6 @@ async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDesc
     await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'FETCHING', dateFrom: resolvedDateFrom, dateTo: resolvedDateTo });
     const { text, summary } = await fetchSettlementsTxtFromAmazon({ dateFrom: resolvedDateFrom, dateTo: resolvedDateTo, descriptor });
     const idempotencyKey = await sha256Key(`SETTLEMENTS|${referenceId}|${text}`);
-    const { settlementsImportUrl, base } = deriveApiUrls(ingestUrl);
     const result = await postFileTo(settlementsImportUrl, {
       salesChannelCode: "AMAZON",
       marketplaceCode: marketplaceCode || "US",

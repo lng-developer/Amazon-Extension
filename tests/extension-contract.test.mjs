@@ -374,6 +374,13 @@ test('settlement automation opens All Statements only when no tab exists', () =>
   assert.match(background, /Present/);
 });
 
+test('settlement automation checks LNG completion before downloading a discovered statement', () => {
+  const background = read('background.js');
+
+  assert.match(background, /imports\/settlements\/\$\{encodeURIComponent\(referenceId\)\}\/completed/);
+  assert.match(background, /settlementImportDecision/);
+});
+
 test("legacy realtime, FBM, tracking, and legacy-token APIs are absent", () => {
   const manifest = JSON.parse(read("manifest.json"));
   const background = read("background.js");

@@ -56,6 +56,12 @@ export function canStartSettlementImport(previous, now = Date.now()) {
   return now - Number(previous.attemptedAt) >= SETTLEMENT_IMPORT_COOLDOWN_MS;
 }
 
+export function settlementImportDecision({ completed, referenceId }) {
+  return completed
+    ? { ok: true, skipped: true, reason: 'SETTLEMENT_ALREADY_IMPORTED', referenceId }
+    : null;
+}
+
 export function getSettlementReferenceId(href) {
   const referenceId = new URL(href).searchParams.get('referenceId');
   if (!referenceId) throw new Error('Settlement download link has no referenceId');
