@@ -27,7 +27,7 @@ export async function queueAdsSpendCommand({ base, token, client, date, fetchImp
   return request(fetchImpl, `${root}/agent/import-ads-spend`, token, 'POST', { ...client, dateFrom: date, dateTo: date });
 }
 
-export async function pollExtensionCommand({ base, token, client, runImport, runAds, fetchImpl = fetch }) {
+export async function pollExtensionCommand({ base, token, client, runImport, runAds, runTransactions, runSettlements, fetchImpl = fetch }) {
   if (!base || !token || !client?.clientId || !client?.label) return null;
   const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;
   await request(fetchImpl, `${root}/agent/heartbeat`, token, 'POST', client);
@@ -38,18 +38,24 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
   const lease = { ...client, leaseToken: claim.leaseToken };
   await request(fetchImpl, `${root}/agent/commands/${command.id}/start`, token, 'POST', lease);
   try {
-    if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'TEST_CONNECTION'].includes(command.type)) {
+    if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'TEST_CONNECTION'].includes(command.type)) {
       throw new Error(`Unsupported command: ${command.type}`);
     }
     const outcome = command.type === 'IMPORT_NEW_ORDERS'
       ? await runImport(command.numDays || 1)
       : command.type === 'IMPORT_ADS_SPEND'
         ? await runAds({ dateFrom: command.dateFrom, dateTo: command.dateTo })
+        : command.type === 'IMPORT_TRANSACTIONS'
+          ? await runTransactions({ dateFrom: command.dateFrom, dateTo: command.dateTo })
+          : command.type === 'IMPORT_SETTLEMENTS'
+            ? await runSettlements()
         : null;
-    const importJobId = outcome?.result?.jobId || outcome?.result?.data?.jobId || outcome?.result?.ingest?.data?.jobId || null;
-    const importedCount = Number(outcome?.result?.rows || 0);
+    const result = outcome?.data || outcome?.result || outcome;
+    const importJobId = result?.id || result?.importBatchId || result?.jobId || result?.data?.jobId || result?.ingest?.data?.jobId || null;
+    const importedCount = Number(result?.importedCount ?? result?.processedRows ?? result?.rows ?? 0);
+    const failedCount = Number(result?.failedCount ?? result?.errorCount ?? 0);
     await request(fetchImpl, `${root}/agent/commands/${command.id}/complete`, token, 'POST', {
-      ...lease, success: true, importJobId, importedCount, failedCount: 0,
+      ...lease, success: true, importJobId, importedCount, failedCount,
     });
     return { id: command.id, status: 'SUCCEEDED' };
   } catch (error) {
