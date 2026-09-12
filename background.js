@@ -1,214 +1,47 @@
-/* ===============================
-   background.js (MV3, ESM) — APO LNG (Realtime only)
-   - Không ghi DB: không /api/ext/connect, không /api/logs/*
-   - Chỉ Socket.IO realtime: ext:heartbeat, ext:log, client:ack
-   - Import NEW / Report ALL / Ads vẫn hoạt động như cũ
-   - Auto: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 (giờ LOCAL)
-   =============================== */
-
-import { io } from "./lib/socket.io.esm.min.js";
-import { deriveApiUrls } from "./config.js";
+/* Amazon order, ads, transaction, settlement imports and LNG command polling. */
+import { DEFAULT_ENVIRONMENTS, deriveApiUrls, resolveDevelopmentApiUrl } from "./config.js";
+import { pollExtensionCommand, queueAdsSpendCommand, queueOrderImportCommand } from "./extensionCommandClient.js";
+import { getJson, postFileTo, postOrderImport } from "./backendApi.js";
+import { createExtensionLogger } from "./extensionLogger.js";
+import { ORDER_IMPORT_PROGRESS_KEY, createOrderImportProgress } from './orderImportProgress.js';
+import { parseTSV } from './orderReportParser.js';
 import {
-  checkOrdersStatus,
-  createShippingBatch,
-  fetchEmployeeCodesFromBackend,
-  postExtensionLog,
-  postFbmImport,
-  postFileTo,
-  postOrderImport,
-} from "./backendApi.js";
-
+  buildOneOffReportConfig,
+  findCsvReportTemplate,
+  isTerminalReportStatus,
+  REPORT_POLL_INTERVAL_MS,
+  reportConfigurationId,
+  shouldFailReportStatus,
+} from './adsReporting.js';
+import { classifyAmazonAdsReportLink, createGmailAdsDownloadFingerprint } from './gmailReportDownload.js';
+import { fetchTransactionsCsv as fetchAmazonTransactionsCsv } from './amazonTransaction.js';
+import {
+  SETTLEMENT_IMPORT_COOLDOWN_MS,
+  canStartSettlementImport,
+  getSettlementReferenceId,
+  settlementImportDecision,
+  selectSettlementDownload,
+  validateSettlementText,
+} from './amazonSettlement.js';
+const REPORT_POLL_MAX_ATTEMPTS = 18;
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
-const adsApiLock = {
-  running: false,
-  taskName: "",
-  runId: "",
-  startedAt: 0,
-};
-const UPLOAD_TRACKING_LOCK_STALE_MS = 10 * 60 * 1000;
-const uploadTrackingLock = {
-  running: false,
-  taskName: "",
-  runId: "",
-  startedAt: 0,
-};
-
-// Global logger instance
-let extensionLogger = null;
-
-// Test connection polling
-let testConnectionInterval = null;
-
-// Initialize logger when we have identity
-async function initializeLogger() {
-  if (!extensionLogger) {
-    try {
-      const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
-      if (base && shopId && clientId) {
-        extensionLogger = new ExtensionLogger(clientId, shopId, clientLabel || 'Unknown Shop', base);
-        console.log('[LOGGER] Extension logger initialized', { clientId, shopId, clientLabel, base });
-      }
-    } catch (error) {
-      console.error('[LOGGER] Failed to initialize extension logger:', error);
-    }
-  }
-  return extensionLogger;
+const EXTENSION_COMMAND_POLL_ALARM = "EXTENSION_COMMAND_POLL";
+const EXTENSION_COMMAND_POLL_BACKOFF_KEY = "extensionCommandPollBackoff";
+const EXTENSION_CONNECTION_STATUS_KEY = "extensionConnectionStatus";
+const EXTENSION_COMMAND_POLL_BACKOFF_MINUTES = [1, 2, 5, 10];
+const adsApiLock = { running: false, taskName: "", runId: "", startedAt: 0 };
+const extensionLogger = createExtensionLogger({ storage: chrome.storage.local });
+async function setOrderImportProgress(state, message, details = {}) {
+  await chrome.storage.local.set({ [ORDER_IMPORT_PROGRESS_KEY]: createOrderImportProgress(state, message, details) });
 }
-
-/* ========== Extension Logger Class ========== */
-class ExtensionLogger {
-  constructor(machineId, shopId, shopName, apiBaseUrl) {
-    this.machineId = machineId;
-    this.shopId = shopId;
-    this.shopName = shopName;
-    this.apiBaseUrl = apiBaseUrl;
-    this.sessionId = this.generateSessionId();
-    this.extensionVersion = chrome.runtime.getManifest().version;
-    this.debugMode = true; // Enable console logging
-  }
-
-  generateSessionId() {
-    return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  }
-
-  async submitLog(logType, message, options = {}) {
-    try {
-      const logData = {
-        machineId: this.machineId,
-        shopId: this.shopId,
-        shopName: this.shopName,
-        logType,
-        message,
-        level: options.level || 'info',
-        taskInfo: options.taskInfo,
-        uploadInfo: options.uploadInfo,
-        errorInfo: options.errorInfo,
-        metadata: {
-          extensionVersion: this.extensionVersion,
-          browserInfo: navigator.userAgent,
-          sessionId: this.sessionId,
-          requestId: options.requestId,
-          ...options.metadata
-        },
-        performance: options.performance,
-        rawData: options.rawData
-      };
-
-      if (this.debugMode) {
-        console.log(`[EXT-LOG] ${logType.toUpperCase()}: ${message}`, logData);
-      }
-
-      return { success: true, skipped: true };
-    } catch (error) {
-      if (this.debugMode) {
-        console.error('[EXT-LOG] Error submitting log:', error);
-      }
-      // Không throw error để tránh ảnh hưởng đến logic chính
-    }
-  }
-
-  // Convenience methods
-  async logTaskReceived(taskInfo, message = 'Task received from server') {
-    return this.submitLog('task_received', message, { taskInfo });
-  }
-
-  async logTaskProcessing(taskInfo, message = 'Processing task') {
-    return this.submitLog('task_processing', message, { taskInfo });
-  }
-
-  async logTaskCompleted(taskInfo, performance, message = 'Task completed successfully') {
-    return this.submitLog('task_completed', message, { taskInfo, performance });
-  }
-
-  async logTaskFailed(taskInfo, error, message = 'Task failed') {
-    return this.submitLog('task_failed', message, {
-      taskInfo,
-      level: 'error',
-      errorInfo: {
-        errorCode: error.code || 'UNKNOWN_ERROR',
-        errorMessage: error.message,
-        stackTrace: error.stack
-      }
-    });
-  }
-
-  async logConnectionStatus(status, details = {}, message) {
-    return this.submitLog('connection_status', message, {
-      level: status === 'connected' ? 'info' : 'warn',
-      rawData: { status, ...details }
-    });
-  }
-
-  async logUploadStarted(uploadInfo, taskInfo, message = 'Upload started') {
-    return this.submitLog('upload_started', message, { uploadInfo, taskInfo });
-  }
-
-  async logUploadCompleted(uploadInfo, taskInfo, performance, message = 'Upload completed successfully') {
-    return this.submitLog('upload_completed', message, { uploadInfo, taskInfo, performance });
-  }
-
-  async logUploadFailed(uploadInfo, taskInfo, error, message = 'Upload failed') {
-    return this.submitLog('upload_failed', message, {
-      uploadInfo,
-      taskInfo,
-      level: 'error',
-      errorInfo: {
-        errorCode: error.code || 'UPLOAD_ERROR',
-        errorMessage: error.message,
-        stackTrace: error.stack
-      }
-    });
-  }
-
-  async logUploadProgress(uploadInfo, message = 'Upload progress update') {
-    return this.submitLog('upload_progress', message, { uploadInfo });
-  }
-
-  async logError(error, context = {}, message = 'Error occurred') {
-    return this.submitLog('error', message, {
-      level: 'error',
-      errorInfo: {
-        errorCode: error.code || 'GENERAL_ERROR',
-        errorMessage: error.message,
-        stackTrace: error.stack,
-        context
-      }
-    });
-  }
-
-  async logInfo(message, rawData = {}) {
-    return this.submitLog('info', message, { rawData });
-  }
-
-  async logDebug(message, rawData = {}) {
-    return this.submitLog('debug', message, { level: 'debug', rawData });
-  }
-}
-
-/* ========== Original Code ========== */
-
-const log = (...args) => {
-  const message = `[${new Date().toLocaleTimeString()}] ` + args.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
-  console.log("[APO]", ...args);  // Giữ console.log cho debug
-  // Gửi đến popup để hiển thị trên màn hình
-  chrome.runtime.sendMessage({ type: "LOG", payload: message }).catch(() => { });  // Ignore lỗi nếu popup không mở
-};
-
+const log = (message, context) => void extensionLogger.logInfo(message, context);
+const debugLog = (message, level = "info") =>
+  void (level === "error" ? extensionLogger.logError(null, undefined, message) : extensionLogger.logInfo(message));
+async function initializeLogger() { return extensionLogger; }
 const SC_BASE = "https://sellercentral.amazon.com";
-const SC_FEEDS_URL = `${SC_BASE}/order-reports-and-feeds/feeds`;
-const AMAZON_UPLOADFEED_URL_PATH = "/order-reports-and-feeds/api/uploadFeed";
-const AMAZON_UPLOADFEED_PAGE_URL = "https://sellercentral.amazon.com/order-reports-and-feeds/feeds";
-const AMAZON_UPLOADFEED_MIN_CSRF_LENGTH = 80;
-const AMAZON_UPLOADFEED_BUILD_ID = "uploadfeed-page-context-csrf-formdata-v1";
-const AMAZON_UPLOADFEED_CSRF_CACHE_KEY = "amazonUploadFeedCsrfCache";
-const AMAZON_UPLOADFEED_CSRF_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-const AMAZON_UPLOADFEED_SNIFFER_FLAG = "__APO_UPLOADFEED_SNIFFER_INSTALLED__";
-globalThis.__UPLOADFEED_HELPER_BUILD__ = "uploadfeed-helper-v2026-05-12-01";
-console.log("[UPLOAD_TRACKING] HELPER BUILD LOADED", globalThis.__UPLOADFEED_HELPER_BUILD__);
+const ALL_STATEMENTS_URL = `${SC_BASE}/payments/past-settlements?ref_=xx_settle_ttab_trans`;
 const ADS_BASE = "https://advertising.amazon.com";
-const ADS_RETRIEVE_URL =
-  "https://advertising.amazon.com/a9g-api-gateway/cm/dds/retrieveReport";
-
+const ADS_RETRIEVE_URL = "https://advertising.amazon.com/a9g-api-gateway/cm/dds/retrieveReport";
 /* ---------- Amazon Ads Auth Hardening ---------- */
 const ADS_HEADER_STORAGE_KEYS = [
   "adsAccountId",
@@ -217,13 +50,111 @@ const ADS_HEADER_STORAGE_KEYS = [
   "adsMarketplaceId",
   "adsCsrfData",
   "adsCsrfToken",
+  "adsReportingCsrfToken",
   "adsHeaderLastSeen",
 ];
 const ADS_HEADER_REFRESH_TIMEOUT_MS = 25 * 1000;
 const ADS_TAB_LOAD_TIMEOUT_MS = 35 * 1000;
 const ADS_PAGE_SETTLE_MS = 3500;
+const GMAIL_ADS_RECENT_DOWNLOADS_KEY = 'gmailAdsRecentDownloads';
+const GMAIL_ADS_RECENT_DOWNLOADS_TTL_MS = 24 * 60 * 60 * 1000;
+const GMAIL_ADS_MAX_FILE_SIZE = 20 * 1024 * 1024;
+const SETTLEMENT_IMPORT_HISTORY_KEY = 'settlementImportHistory';
+const settlementImportLock = { running: false };
 
 const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function createAdsError(message, status = 0, responseText = "") { const error = new Error(message); error.status = status; error.responseText = responseText; return error; }
+function isAdsAuthError(error) { return [401, 403].includes(Number(error?.status)) || /sign.?in|login|unauthor/i.test(String(error?.responseText || error?.message || "")); }
+async function waitForTabComplete(tabId, timeoutMessage = "Amazon page did not finish loading") {
+  if ((await chrome.tabs.get(tabId)).status === "complete") return;
+  await new Promise((resolve, reject) => {
+    const onUpdated = (updatedTabId, changeInfo) => { if (updatedTabId === tabId && changeInfo.status === "complete") { clearTimeout(timeout); chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); } };
+    const timeout = setTimeout(() => { chrome.tabs.onUpdated.removeListener(onUpdated); reject(new Error(timeoutMessage)); }, ADS_TAB_LOAD_TIMEOUT_MS);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+}
+async function waitForAdsTabComplete(tabId) { return waitForTabComplete(tabId, "Amazon Ads page did not finish loading"); }
+async function clearAdsHeaders() { await chrome.storage.local.remove([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]); }
+
+async function reloadAdsTabForHeaderCapture(tabId) {
+  const injected = new Promise((resolve, reject) => {
+    let handled = false;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+    };
+    const onUpdated = async (updatedTabId, changeInfo) => {
+      if (handled || updatedTabId !== tabId || changeInfo.status !== "loading") return;
+      handled = true;
+      cleanup();
+      try {
+        await ensureAdsBridgeInjected(tabId);
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Amazon Ads page did not start reloading"));
+    }, ADS_HEADER_REFRESH_TIMEOUT_MS);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+
+  await chrome.tabs.reload(tabId);
+  await injected;
+}
+
+async function forceRefreshAdsHeaders({ reporting = false } = {}) {
+  const tabId = await (reporting ? ensureAdsReportingTab() : ensureAdsTab());
+  await reloadAdsTabForHeaderCapture(tabId);
+  let headers;
+  if (reporting) {
+    headers = await waitForAdsReportingHeaders();
+  } else {
+    await waitForAdsTabComplete(tabId);
+    await delayMs(ADS_PAGE_SETTLE_MS);
+    const state = await chrome.storage.local.get([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
+    headers = { ...(state.adsCandidateHeaders || {}), ...state };
+  }
+  if (!(reporting ? hasAdsReportingHeaders(headers) : isAdsHeaderComplete(headers))) {
+    throw createAdsError(
+      reporting
+        ? "Amazon Ads Reporting CSRF token was not observed. Reload the extension, then retry once."
+        : "Amazon Ads headers are unavailable. Sign in to advertising.amazon.com and open the campaign page.",
+      401,
+    );
+  }
+  await chrome.storage.local.set(Object.fromEntries(ADS_HEADER_STORAGE_KEYS.map((key) => [key, headers[key]])));
+}
+async function ensureFreshAdsHeaders() {
+  const state = await readAdsHeaderState();
+  if (isAdsHeaderComplete(state)) return;
+  await forceRefreshAdsHeaders();
+}
+
+async function ensureFreshAdsReportingHeaders() {
+  const state = await readAdsHeaderState();
+  if (hasAdsReportingHeaders(state)) return;
+  await forceRefreshAdsHeaders({ reporting: true });
+}
+
+function hasAdsReportingHeaders(st = {}) {
+  return !!st.adsReportingCsrfToken;
+}
+
+async function waitForAdsReportingHeaders() {
+  const expiresAt = Date.now() + ADS_HEADER_REFRESH_TIMEOUT_MS;
+  let state = {};
+  do {
+    state = await chrome.storage.local.get([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
+    const headers = { ...(state.adsCandidateHeaders || {}), ...state };
+    if (hasAdsReportingHeaders(headers)) return headers;
+    await delayMs(500);
+  } while (Date.now() < expiresAt);
+  return { ...(state.adsCandidateHeaders || {}), ...state };
+}
 
 function isAdsHeaderComplete(st = {}) {
   return !!(
@@ -232,7 +163,8 @@ function isAdsHeaderComplete(st = {}) {
     st.adsClientId &&
     st.adsMarketplaceId &&
     st.adsCsrfData &&
-    st.adsCsrfToken
+    st.adsCsrfToken &&
+    st.adsReportingCsrfToken
   );
 }
 
@@ -327,1535 +259,8 @@ async function withAdsApiLock(taskName, fn, options = {}) {
   }
 }
 
-function makeUploadTrackingRunId(taskName) {
-  return `${taskName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function isUploadTrackingLocked() {
-  if (!uploadTrackingLock.running) return false;
-  const age = Date.now() - Number(uploadTrackingLock.startedAt || 0);
-  if (age > UPLOAD_TRACKING_LOCK_STALE_MS) {
-    const message = `[UPLOAD_TRACKING_LOCK] Stale lock expired ${uploadTrackingLock.taskName} runId=${uploadTrackingLock.runId}`;
-    debugLog(message, "error");
-    extensionLogger?.logInfo(message, { lock: { ...uploadTrackingLock }, age });
-    uploadTrackingLock.running = false;
-    uploadTrackingLock.taskName = "";
-    uploadTrackingLock.runId = "";
-    uploadTrackingLock.startedAt = 0;
-    chrome.storage.local.set({ uploadTrackingLockState: { ...uploadTrackingLock } }).catch(() => { });
-    return false;
-  }
-  return true;
-}
-
-async function persistUploadTrackingLockState() {
-  await chrome.storage.local.set({ uploadTrackingLockState: { ...uploadTrackingLock } });
-}
-
-function createUploadTrackingLockSkipped(taskName) {
-  return {
-    ok: false,
-    skipped: true,
-    reason: "UPLOAD_TRACKING_ALREADY_RUNNING",
-    runningTaskName: uploadTrackingLock.taskName,
-    runningRunId: uploadTrackingLock.runId,
-    requestedTaskName: taskName,
-  };
-}
-
-async function withUploadTrackingLock(taskName, fn, options = {}) {
-  if (isUploadTrackingLocked()) {
-    const skipped = createUploadTrackingLockSkipped(taskName);
-    const message = `[UPLOAD_TRACKING_LOCK] Skip ${taskName}, another upload is running: ${uploadTrackingLock.taskName}`;
-    debugLog(message, "info");
-    extensionLogger?.logInfo(message, {
-      requestedTaskName: taskName,
-      runningTaskName: uploadTrackingLock.taskName,
-      runningRunId: uploadTrackingLock.runId,
-      runningStartedAt: uploadTrackingLock.startedAt,
-    });
-    if (options.throwOnSkip) {
-      const err = new Error(message);
-      Object.assign(err, skipped);
-      throw err;
-    }
-    return skipped;
-  }
-
-  const runId = options.runId || makeUploadTrackingRunId(taskName);
-  uploadTrackingLock.running = true;
-  uploadTrackingLock.taskName = taskName;
-  uploadTrackingLock.runId = runId;
-  uploadTrackingLock.startedAt = Date.now();
-  await persistUploadTrackingLockState();
-
-  debugLog(`[UPLOAD_TRACKING_LOCK] Acquired ${taskName} runId=${runId}`, "success");
-  extensionLogger?.logInfo(`[UPLOAD_TRACKING_LOCK] Acquired ${taskName}`, {
-    runId,
-    taskName,
-    startedAt: uploadTrackingLock.startedAt,
-  });
-
-  try {
-    const result = await fn({ runId, taskName, lockOwner: true });
-    debugLog(`[UPLOAD_TRACKING_LOCK] Released success ${taskName} runId=${runId}`, "success");
-    extensionLogger?.logInfo(`[UPLOAD_TRACKING_LOCK] Released success ${taskName}`, { runId, taskName });
-    return result;
-  } catch (error) {
-    debugLog(`[UPLOAD_TRACKING_LOCK] Released error ${taskName} runId=${runId}: ${error?.message || error}`, "error");
-    extensionLogger?.logError(error, { runId, taskName }, `[UPLOAD_TRACKING_LOCK] Released error ${taskName}`);
-    throw error;
-  } finally {
-    if (uploadTrackingLock.runId === runId) {
-      uploadTrackingLock.running = false;
-      uploadTrackingLock.taskName = "";
-      uploadTrackingLock.runId = "";
-      uploadTrackingLock.startedAt = 0;
-      await persistUploadTrackingLockState();
-    }
-  }
-}
-
-async function runUploadTrackingWithLock(context = {}) {
-  return withUploadTrackingLock("UPLOAD_TRACKING", async (lock) => {
-    return uploadtracking({ ...context, lock });
-  });
-}
-
-function canMutateAdsHeaders(options = {}) {
-  if (!isAdsApiLocked()) return true;
-  return !!options.lockOwner && isAdsLockOwner(options.runId);
-}
-
-async function clearAdsHeaders(reason = "unknown", options = {}) {
-  if (!canMutateAdsHeaders(options)) {
-    debugLog("[ADS-AUTH] clear blocked: not lock owner", "error");
-    extensionLogger?.logInfo("[ADS-AUTH] clear blocked: not lock owner", {
-      reason,
-      callerRunId: options.runId,
-      callerTaskName: options.taskName,
-      lock: { ...adsApiLock },
-    });
-    return false;
-  }
-
-  await chrome.storage.local.remove(ADS_HEADER_STORAGE_KEYS);
-  debugLog(`🧹 [ADS-AUTH] Cleared cached Ads headers: ${reason}`, "info");
-  extensionLogger?.logInfo("[ADS-AUTH] Cleared cached Ads headers", { reason, runId: options.runId, taskName: options.taskName });
-  return true;
-}
-
-function isAdsSignInText(text = "") {
-  return /sign[\s-]?in|password|passkey|authentication|login|unauthorized|csrf/i.test(String(text || ""));
-}
-
-function createAdsError(message, status = 0, responseText = "") {
-  const err = new Error(message);
-  err.status = status;
-  err.responseText = responseText;
-  err.code = status === 401 || status === 403 || isAdsSignInText(responseText)
-    ? "ADS_AUTH_ERROR"
-    : "ADS_API_ERROR";
-  return err;
-}
-
-function isAdsAuthError(error) {
-  const status = Number(error?.status || 0);
-  return (
-    status === 401 ||
-    status === 403 ||
-    error?.code === "ADS_AUTH_ERROR" ||
-    isAdsSignInText(error?.responseText || error?.message || "")
-  );
-}
-
-async function waitForAdsTabComplete(tabId, timeoutMs = ADS_TAB_LOAD_TIMEOUT_MS) {
-  const existing = await chrome.tabs.get(tabId).catch(() => null);
-  if (existing?.status === "complete") return true;
-
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (ok) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      resolve(ok);
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    const onUpdated = (tid, info) => {
-      if (tid === tabId && info.status === "complete") finish(true);
-    };
-    chrome.tabs.onUpdated.addListener(onUpdated);
-  });
-}
-
-async function getAdsPageHint(tabId) {
-  try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => ({
-        href: location.href,
-        title: document.title,
-        bodyText: (document.body?.innerText || "").slice(0, 1200),
-      }),
-    });
-    return res?.result || {};
-  } catch (e) {
-    return { error: e?.message || String(e) };
-  }
-}
-
-async function waitForAdsHeaderCapture({ since = 0, timeoutMs = ADS_HEADER_REFRESH_TIMEOUT_MS } = {}) {
-  const initial = await readAdsHeaderState();
-  if (isAdsHeaderComplete(initial) && (!since || Number(initial.adsHeaderLastSeen || 0) >= since - 1000)) {
-    return true;
-  }
-  const initialCandidate = await chrome.storage.local.get(["adsCandidateHeaders"]);
-  if (isAdsHeaderComplete(initialCandidate.adsCandidateHeaders || {}) &&
-    (!since || Number(initialCandidate.adsCandidateHeaders.adsHeaderLastSeen || 0) >= since - 1000)) {
-    return true;
-  }
-
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = async (ok) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      chrome.storage.onChanged.removeListener(listener);
-      if (!ok) {
-        const latest = await readAdsHeaderState();
-        ok = isAdsHeaderComplete(latest) && (!since || Number(latest.adsHeaderLastSeen || 0) >= since - 1000);
-        if (!ok) {
-          const candidate = await chrome.storage.local.get(["adsCandidateHeaders"]);
-          ok = isAdsHeaderComplete(candidate.adsCandidateHeaders || {}) &&
-            (!since || Number(candidate.adsCandidateHeaders.adsHeaderLastSeen || 0) >= since - 1000);
-        }
-      }
-      resolve(!!ok);
-    };
-
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    const watched = new Set([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
-    const listener = async (changes, areaName) => {
-      if (areaName !== "local") return;
-      if (!Object.keys(changes || {}).some((k) => watched.has(k))) return;
-      const latest = await readAdsHeaderState();
-      const candidate = await chrome.storage.local.get(["adsCandidateHeaders"]);
-      const candidateOk = isAdsHeaderComplete(candidate.adsCandidateHeaders || {}) &&
-        (!since || Number(candidate.adsCandidateHeaders.adsHeaderLastSeen || 0) >= since - 1000);
-      if ((isAdsHeaderComplete(latest) && (!since || Number(latest.adsHeaderLastSeen || 0) >= since - 1000)) || candidateOk) {
-        finish(true);
-      }
-    };
-    chrome.storage.onChanged.addListener(listener);
-  });
-}
-
-
-/* ---------- Cookies & CSRF (Seller Central) ---------- */
-async function getCookie(url, name) {
-  try {
-    const ck = await chrome.cookies.get({ url, name });
-    return ck?.value || "";
-  } catch {
-    return "";
-  }
-}
-
-function createAmazonUploadError(code, message, details = {}) {
-  const error = new Error(message);
-  error.code = code;
-  Object.assign(error, details);
-  return error;
-}
-
-function logUploadTrackingDiagnostic(message, fields = {}, level = "info") {
-  const safeFields = {};
-  for (const [key, value] of Object.entries(fields || {})) {
-    const lowerKey = String(key).toLowerCase();
-    if (lowerKey.includes("csrf") && typeof value === "string" && !lowerKey.includes("included") && !lowerKey.includes("source") && !lowerKey.includes("length")) {
-      safeFields[key] = value ? "[redacted]" : value;
-    } else if (lowerKey.includes("cookie") && typeof value === "string") {
-      safeFields[key] = value ? "[redacted]" : value;
-    } else {
-      safeFields[key] = value;
-    }
-  }
-
-  const inlineFields = Object.entries(safeFields)
-    .map(([key, value]) => `${key}=${typeof value === "object" ? JSON.stringify(value) : String(value)}`)
-    .join(" ");
-  const fullMessage = inlineFields ? `${message} ${inlineFields}` : message;
-  debugLog(fullMessage, level);
-  extensionLogger?.logInfo(fullMessage, safeFields);
-}
-
-function isValidUploadFeedCsrfToken(value) {
-  const token = String(value || "").trim();
-  if (!token) return false;
-  if (token.length < AMAZON_UPLOADFEED_MIN_CSRF_LENGTH) return false;
-  if (/^(undefined|null|true|false)$/i.test(token)) return false;
-  return /^[A-Za-z0-9+/=_-]+$/.test(token);
-}
-
-const uploadFeedCaptureLogDedupe = { lastKey: "", lastAt: 0 };
-
-function shouldLogUploadFeedCapture(source, tokenLength) {
-  const key = `${source}:${tokenLength}`;
-  const now = Date.now();
-  if (uploadFeedCaptureLogDedupe.lastKey === key && now - uploadFeedCaptureLogDedupe.lastAt < 5000) return false;
-  uploadFeedCaptureLogDedupe.lastKey = key;
-  uploadFeedCaptureLogDedupe.lastAt = now;
-  return true;
-}
-
-async function getUploadFeedCsrfCacheStatus() {
-  const data = await chrome.storage.local.get([AMAZON_UPLOADFEED_CSRF_CACHE_KEY]);
-  const cache = data[AMAZON_UPLOADFEED_CSRF_CACHE_KEY] || null;
-  const token = String(cache?.token || "");
-  const ageMs = cache?.capturedAt ? Date.now() - Number(cache.capturedAt || 0) : null;
-  const expired = ageMs !== null && ageMs > AMAZON_UPLOADFEED_CSRF_CACHE_TTL_MS;
-  const tokenValid = isValidUploadFeedCsrfToken(token);
-  const isTestToken = !!cache?.isTestToken;
-  const valid = !!cache?.token && tokenValid && !expired && !isTestToken;
-  return {
-    cache,
-    valid,
-    tokenFound: !!cache?.token,
-    tokenLength: cache?.tokenLength || token.length || 0,
-    source: cache?.source || null,
-    ageMs,
-    ageMin: ageMs === null ? null : Math.floor(ageMs / 60000),
-    expired,
-    tokenValid,
-    isTestToken,
-  };
-}
-
-async function getCachedUploadFeedCsrfToken() {
-  const status = await getUploadFeedCsrfCacheStatus();
-  return status.valid ? status.cache : null;
-}
-
-async function clearUploadFeedCsrfCache(reason = "unknown", metadata = {}) {
-  await chrome.storage.local.remove([AMAZON_UPLOADFEED_CSRF_CACHE_KEY]);
-  logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrf cache cleared", {
-    reason,
-    code: metadata?.code || "",
-    status: metadata?.status || 0,
-  }, "info");
-  return { ok: true, cleared: true, reason };
-}
-
-async function saveUploadFeedCsrfTokenCapture(capture = {}) {
-  const token = String(capture.token || "").trim();
-  if (!isValidUploadFeedCsrfToken(token)) {
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrfToken capture ignored", {
-      source: capture.source || "unknown",
-      tokenLength: token.length,
-      valid: false,
-      url: capture.url || "",
-      pageTitle: capture.pageTitle || "",
-    }, "error");
-    return { ok: false, reason: "invalid_token" };
-  }
-
-  const cache = {
-    token,
-    tokenLength: token.length,
-    source: ["formDataAppend", "formDataSet", "fetchFormData", "requestFormData", "xhrFormData", "consoleLog", "webRequestFormData"].includes(capture.source) ? capture.source : "formDataAppend",
-    capturedAt: Number(capture.capturedAt || Date.now()),
-    url: String(capture.url || ""),
-    pageTitle: String(capture.pageTitle || ""),
-    isTestToken: !!capture.isTestToken,
-  };
-  await chrome.storage.local.set({ [AMAZON_UPLOADFEED_CSRF_CACHE_KEY]: cache });
-  if (shouldLogUploadFeedCapture(cache.source, cache.tokenLength)) {
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrfToken captured", {
-      source: cache.source,
-      tokenLength: cache.tokenLength,
-      capturedAt: cache.capturedAt,
-      url: cache.url,
-      pageTitle: cache.pageTitle,
-      isTestToken: cache.isTestToken,
-    }, cache.source === "webRequestFormData" ? "success" : "info");
-  }
-  return { ok: true, tokenLength: cache.tokenLength, source: cache.source, capturedAt: cache.capturedAt };
-}
-
-chrome.webRequest.onBeforeRequest.addListener(
-  (details) => {
-    try {
-      const formData = details?.requestBody?.formData || {};
-      const rawToken = Array.isArray(formData.csrfToken) ? formData.csrfToken[0] : formData.csrfToken;
-      const token = String(rawToken || "").trim();
-      const fieldNames = Object.keys(formData);
-      if (!isValidUploadFeedCsrfToken(token)) return;
-
-      if (shouldLogUploadFeedCapture("webRequestFormData", token.length)) {
-        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrfToken captured by webRequest", {
-          source: "webRequestFormData",
-          tokenLength: token.length,
-          fieldNames,
-          url: details.url || "",
-        }, "success");
-      }
-
-      Promise.resolve(saveUploadFeedCsrfTokenCapture({
-        token,
-        source: "webRequestFormData",
-        url: details.url,
-        pageTitle: "Captured by webRequest",
-        capturedAt: Date.now(),
-        isTestToken: false
-      })).catch((error) => {
-        console.warn("[UPLOAD_TRACKING] webRequest csrfToken capture failed:", error?.message || error);
-      });
-    } catch (error) {
-      console.warn("[UPLOAD_TRACKING] webRequest uploadFeed capture exception:", error?.message || error);
-    }
-  },
-  { urls: [`${SC_BASE}${AMAZON_UPLOADFEED_URL_PATH}*`] },
-  ["requestBody"]
-);
-
-function extractUploadFeedCsrfTokenInPage() {
-  const MIN_CSRF_LENGTH = 80;
-  const isValid = (value) => {
-    const token = String(value || "").trim();
-    if (!token) return false;
-    if (token.length < MIN_CSRF_LENGTH) return false;
-    if (/^(undefined|null|true|false)$/i.test(token)) return false;
-    return /^[A-Za-z0-9+/=_-]+$/.test(token);
-  };
-  const candidates = [];
-  const addCandidate = (value, source) => {
-    const token = String(value || "").trim();
-    if (isValid(token)) candidates.push({ csrfToken: token, csrfSource: source });
-  };
-
-  const selectors = [
-    'input[name="csrfToken"]',
-    'input[name="csrf-token"]',
-    'input[name="_csrf"]',
-    'input[name="csrf"]',
-    'meta[name="csrf-token"]',
-    'meta[name="csrfToken"]',
-    "[data-csrf-token]",
-    "[data-csrf]",
-  ];
-  for (const selector of selectors) {
-    try {
-      for (const el of Array.from(document.querySelectorAll(selector))) {
-        addCandidate(el.value || el.content || el.getAttribute("content") || el.getAttribute("data-csrf-token") || el.getAttribute("data-csrf"), "selector");
-      }
-    } catch { }
-  }
-
-  const keyLooksRelevant = (key) => /csrf|csrftoken|antiCsrf|anti-csrf|token/i.test(String(key || ""));
-  try {
-    for (const key of Object.keys(window)) {
-      if (keyLooksRelevant(key)) addCandidate(window[key], "window");
-      const value = window[key];
-      if (value && typeof value === "object") {
-        for (const nestedKey of Object.keys(value).slice(0, 200)) {
-          if (keyLooksRelevant(nestedKey)) addCandidate(value[nestedKey], "window");
-        }
-      }
-    }
-  } catch { }
-
-  const scriptText = Array.from(document.scripts || [])
-    .map((script) => script.textContent || "")
-    .join("\n")
-    .slice(0, 2000000);
-  const pageText = `${document.documentElement?.innerHTML || ""}\n${scriptText}`;
-  const regexes = [
-    /csrfToken["']?\s*[:=]\s*["']([^"']+)["']/gi,
-    /csrf-token["']?\s*[:=]\s*["']([^"']+)["']/gi,
-    /csrf_token["']?\s*[:=]\s*["']([^"']+)["']/gi,
-    /["']csrfToken["']\s*:\s*["']([^"']+)["']/gi,
-    /'csrfToken'\s*:\s*'([^']+)'/gi,
-  ];
-  for (const regex of regexes) {
-    let match;
-    while ((match = regex.exec(pageText))) addCandidate(match[1], "scriptRegex");
-  }
-
-  const best = candidates.sort((a, b) => b.csrfToken.length - a.csrfToken.length)[0];
-  return {
-    csrfToken: best?.csrfToken || "",
-    csrfSource: best?.csrfSource || "none",
-    csrfTokenLength: best?.csrfToken?.length || 0,
-  };
-}
-
-function extractAmazonCsrfFromText(text = "") {
-  const csrfMatches = [
-    /csrfToken['"]\s*:\s*['"]([^'"]+)['"]/i,
-    /name=['"]csrfToken['"][^>]*value=['"]([^'"]+)['"]/i,
-    /anti-csrftoken-a2z['"]\s*:\s*['"]([^'"]+)['"]/i,
-    /"csrfToken"\s*:\s*"([^"]+)"/i,
-    /window\.csrfToken\s*=\s*['"]([^'"]+)['"]/i,
-    /data-csrf-token=['"]([^'"]+)['"]/i,
-    /<meta[^>]+name=['"]csrf-token['"][^>]+content=['"]([^'"]+)['"]/i,
-  ];
-
-  for (const regex of csrfMatches) {
-    const match = String(text || "").match(regex);
-    if (match?.[1]) return match[1];
-  }
-  return "";
-}
-
-async function waitForSellerCentralTabComplete(tabId, timeoutMs = 35000) {
-  const existing = await chrome.tabs.get(tabId).catch(() => null);
-  if (existing?.status === "complete") return true;
-
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (ok) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      resolve(ok);
-    };
-    const timer = setTimeout(() => finish(false), timeoutMs);
-    const onUpdated = (tid, info) => {
-      if (tid === tabId && info.status === "complete") finish(true);
-    };
-    chrome.tabs.onUpdated.addListener(onUpdated);
-  });
-}
-
-async function findOrOpenSellerCentralFeedsTab() {
-  const tabs = await chrome.tabs.query({ url: `${SC_BASE}/*` }).catch(() => []);
-  const feedsTab = tabs.find((tab) => (tab.url || "").startsWith(SC_FEEDS_URL));
-  const tab = feedsTab || tabs[0];
-
-  if (tab?.id) {
-    return chrome.tabs.update(tab.id, { url: SC_FEEDS_URL, active: true });
-  }
-
-  return chrome.tabs.create({ url: SC_FEEDS_URL, active: true });
-}
-
-async function installUploadFeedCsrfSniffer(tabId) {
-  if (!tabId) return { ok: false, error: "missing_tab_id" };
-
-  const bridge = () => {
-    if (window.__APO_UPLOADFEED_CSRF_BRIDGE_INSTALLED__) return true;
-    window.__APO_UPLOADFEED_CSRF_BRIDGE_INSTALLED__ = true;
-    window.addEventListener("message", (event) => {
-      try {
-        if (event.source !== window) return;
-        const data = event.data || {};
-        if (data.__apoUploadFeedDebug === true) {
-          chrome.runtime.sendMessage({
-            type: "UPLOADFEED_SNIFFER_DEBUG",
-            payload: {
-              event: String(data.event || ""),
-              href: String(data.href || location.href),
-              title: String(data.title || document.title),
-              installedAt: Number(data.installedAt || 0),
-            },
-          }).catch(() => { });
-          return;
-        }
-        if (data.__apoUploadFeedCsrfCaptured === true) {
-          chrome.runtime.sendMessage({
-            type: "UPLOADFEED_CSRF_CAPTURED",
-            payload: {
-              token: String(data.token || ""),
-              source: String(data.source || ""),
-              url: String(data.url || location.href),
-              pageTitle: String(data.pageTitle || document.title),
-              capturedAt: Number(data.capturedAt || Date.now()),
-              isTestToken: !!data.isTestToken,
-            },
-          }).catch(() => { });
-        }
-      } catch { }
-    });
-    return true;
-  };
-
-  const sniffer = (flagName, uploadPath) => {
-    const installedAt = Date.now();
-    window[flagName] = true;
-    window.__APO_UPLOADFEED_SNIFFER_INSTALLED__ = true;
-    window.__APO_UPLOADFEED_SNIFFER_INSTALLED_AT__ = installedAt;
-
-    const originalConsoleLog = window.__APO_UPLOADFEED_NATIVE_CONSOLE_LOG__ || console.log.bind(console);
-    window.__APO_UPLOADFEED_NATIVE_CONSOLE_LOG__ = originalConsoleLog;
-
-    const isValidToken = (value) => {
-      const token = String(value || "").trim();
-      if (!token) return false;
-      if (token.length < 80) return false;
-      if (/^(undefined|null|true|false)$/i.test(token)) return false;
-      return /^[A-Za-z0-9+/=_-]+$/.test(token);
-    };
-
-    const isUploadFeedUrl = (url) => String(url || "").includes(uploadPath);
-    const fieldNamesOf = (body) => {
-      try {
-        if (!(body instanceof FormData)) return [];
-        return Array.from(body.keys());
-      } catch {
-        return [];
-      }
-    };
-
-    const postDebug = (event, fields = {}) => {
-      try {
-        window.postMessage({
-          __apoUploadFeedDebug: true,
-          event,
-          href: location.href,
-          title: document.title,
-          installedAt,
-          ...fields,
-        }, "*");
-      } catch { }
-    };
-
-    const publish = (token, source, extra = {}) => {
-      try {
-        const value = String(token || "").trim();
-        if (!isValidToken(value)) return false;
-        originalConsoleLog(`[APO_UPLOADFEED_SNIFFER] csrfToken captured from ${source}`, {
-          source,
-          tokenLength: value.length,
-          isTestToken: !!extra.isTestToken,
-        });
-        window.postMessage({
-          __apoUploadFeedCsrfCaptured: true,
-          token: value,
-          source,
-          url: location.href,
-          pageTitle: document.title,
-          capturedAt: Date.now(),
-          isTestToken: !!extra.isTestToken,
-        }, "*");
-        return true;
-      } catch {
-        return false;
-      }
-    };
-
-    const findTokenDeep = (value, seen = new WeakSet()) => {
-      try {
-        if (isValidToken(value)) return String(value).trim();
-        if (!value || typeof value !== "object") return "";
-        if (seen.has(value)) return "";
-        seen.add(value);
-        if (value instanceof FormData) {
-          const token = value.get("csrfToken");
-          return isValidToken(token) ? String(token).trim() : "";
-        }
-        if (isValidToken(value.csrfToken)) return String(value.csrfToken).trim();
-        for (const key of Object.keys(value).slice(0, 100)) {
-          const found = findTokenDeep(value[key], seen);
-          if (found) return found;
-        }
-      } catch { }
-      return "";
-    };
-
-    const inspectConsoleArgs = (args) => {
-      try {
-        for (const arg of args) {
-          if (!arg || typeof arg !== "object") continue;
-          const relevant = arg.type === "UPLOAD_ACTION" || arg.feedTypeName === "confirmShipment";
-          if (!relevant) continue;
-          const token = findTokenDeep(arg);
-          if (token) publish(token, "consoleLog", { isTestToken: !!arg.__apoTestToken });
-        }
-      } catch { }
-    };
-
-    const inspectFormData = (body, source) => {
-      let csrf = "";
-      let names = [];
-      try {
-        names = fieldNamesOf(body);
-        if (body instanceof FormData) csrf = body.get("csrfToken");
-      } catch { }
-      const csrfIncluded = isValidToken(csrf);
-      originalConsoleLog("[APO_UPLOADFEED_SNIFFER] uploadFeed request detected", {
-        source,
-        hasFormData: body instanceof FormData,
-        fieldNames: names,
-        csrfIncluded,
-        csrfTokenLength: csrfIncluded ? String(csrf).trim().length : 0,
-      });
-      if (csrfIncluded) publish(csrf, source);
-    };
-
-    try {
-      const nativeAppend = FormData.prototype.append;
-      if (typeof nativeAppend === "function" && !nativeAppend.__apoUploadFeedPatched) {
-        const patchedAppend = function (name, value, filename) {
-          try {
-            if (String(name) === "csrfToken") publish(value, "formDataAppend");
-          } catch { }
-          return nativeAppend.apply(this, arguments);
-        };
-        patchedAppend.__apoUploadFeedPatched = true;
-        FormData.prototype.append = patchedAppend;
-      }
-    } catch { }
-
-    try {
-      const nativeSet = FormData.prototype.set;
-      if (typeof nativeSet === "function" && !nativeSet.__apoUploadFeedPatched) {
-        const patchedSet = function (name, value, filename) {
-          try {
-            if (String(name) === "csrfToken") publish(value, "formDataSet");
-          } catch { }
-          return nativeSet.apply(this, arguments);
-        };
-        patchedSet.__apoUploadFeedPatched = true;
-        FormData.prototype.set = patchedSet;
-      }
-    } catch { }
-
-    try {
-      const nativeConsoleLog = console.log;
-      if (!nativeConsoleLog.__apoUploadFeedPatched) {
-        const patchedConsoleLog = function (...args) {
-          try {
-            inspectConsoleArgs(args);
-          } catch { }
-          return originalConsoleLog(...args);
-        };
-        patchedConsoleLog.__apoUploadFeedPatched = true;
-        console.log = patchedConsoleLog;
-      }
-    } catch { }
-
-    try {
-      const NativeRequest = window.Request;
-      if (typeof NativeRequest === "function" && !NativeRequest.__apoUploadFeedPatched) {
-        const PatchedRequest = function (input, init = {}) {
-          try {
-            const url = typeof input === "string" ? input : input?.url;
-            const body = init?.body || input?.body;
-            if (isUploadFeedUrl(url)) inspectFormData(body, "requestFormData");
-          } catch { }
-          return new NativeRequest(input, init);
-        };
-        Object.setPrototypeOf(PatchedRequest, NativeRequest);
-        PatchedRequest.prototype = NativeRequest.prototype;
-        PatchedRequest.__apoUploadFeedPatched = true;
-        window.Request = PatchedRequest;
-      }
-    } catch { }
-
-    try {
-      const nativeFetch = window.fetch;
-      if (typeof nativeFetch === "function" && !nativeFetch.__apoUploadFeedPatched) {
-        const patchedFetch = function (input, init = {}) {
-          try {
-            const url = typeof input === "string" ? input : input?.url;
-            const body = init?.body;
-            if (isUploadFeedUrl(url)) inspectFormData(body, "fetchFormData");
-          } catch { }
-          return nativeFetch.apply(this, arguments);
-        };
-        patchedFetch.__apoUploadFeedPatched = true;
-        window.fetch = patchedFetch;
-      }
-    } catch { }
-
-    try {
-      const nativeOpen = XMLHttpRequest.prototype.open;
-      const nativeSend = XMLHttpRequest.prototype.send;
-      if (typeof nativeOpen === "function" && typeof nativeSend === "function" && !nativeSend.__apoUploadFeedPatched) {
-        XMLHttpRequest.prototype.open = function (method, url) {
-          try {
-            this.__apoUploadFeedUrl = url;
-          } catch { }
-          return nativeOpen.apply(this, arguments);
-        };
-        const patchedSend = function (body) {
-          try {
-            if (isUploadFeedUrl(this.__apoUploadFeedUrl)) inspectFormData(body, "xhrFormData");
-          } catch { }
-          return nativeSend.apply(this, arguments);
-        };
-        patchedSend.__apoUploadFeedPatched = true;
-        XMLHttpRequest.prototype.send = patchedSend;
-      }
-    } catch { }
-
-    const status = {
-      href: location.href,
-      title: document.title,
-      installedAt,
-      fetchPatched: !!window.fetch?.__apoUploadFeedPatched,
-      requestPatched: !!window.Request?.__apoUploadFeedPatched,
-      xhrPatched: !!XMLHttpRequest.prototype.send?.__apoUploadFeedPatched,
-      formDataAppendPatched: !!FormData.prototype.append?.__apoUploadFeedPatched,
-      formDataSetPatched: !!FormData.prototype.set?.__apoUploadFeedPatched,
-      consoleLogPatched: !!console.log?.__apoUploadFeedPatched,
-    };
-    originalConsoleLog("[APO_UPLOADFEED_SNIFFER] MAIN sniffer installed", status);
-    postDebug("snifferInstalled", status);
-    return true;
-  };
-
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    func: bridge,
-    world: "ISOLATED",
-  });
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    func: sniffer,
-    args: [AMAZON_UPLOADFEED_SNIFFER_FLAG, AMAZON_UPLOADFEED_URL_PATH],
-    world: "MAIN",
-  });
-
-  return { ok: true, tabId };
-}
-
-globalThis.installUploadFeedSnifferNow = async function () {
-  const tab = await findOrOpenSellerCentralFeedsTab();
-  if (!tab?.id) {
-    return { ok: false, error: "Unable to open Seller Central feeds tab" };
-  }
-
-  await waitForSellerCentralTabComplete(tab.id);
-  await delayMs(1000);
-
-  const result = await installUploadFeedCsrfSniffer(tab.id);
-
-  return {
-    ok: true,
-    tabId: tab.id,
-    result
-  };
-};
-
-globalThis.verifyUploadFeedSnifferNow = async function () {
-  const tab = await findOrOpenSellerCentralFeedsTab();
-  if (!tab?.id) {
-    return { ok: false, error: "Unable to open Seller Central feeds tab" };
-  }
-
-  await waitForSellerCentralTabComplete(tab.id);
-
-  const [res] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "MAIN",
-    func: () => ({
-      mainWorldFlag: !!window.__APO_UPLOADFEED_SNIFFER_INSTALLED__,
-      installedAt: window.__APO_UPLOADFEED_SNIFFER_INSTALLED_AT__ || 0,
-      href: location.href,
-      title: document.title,
-      fetchPatched: !!window.fetch?.__apoUploadFeedPatched,
-      requestPatched: !!window.Request?.__apoUploadFeedPatched,
-      xhrPatched: !!XMLHttpRequest.prototype.send?.__apoUploadFeedPatched,
-      formDataAppendPatched: !!FormData.prototype.append?.__apoUploadFeedPatched,
-      formDataSetPatched: !!FormData.prototype.set?.__apoUploadFeedPatched,
-      consoleLogPatched: !!console.log?.__apoUploadFeedPatched,
-    }),
-  });
-
-  return {
-    ok: true,
-    tabId: tab.id,
-    ...(res?.result || {})
-  };
-};
-
-globalThis.checkUploadFeedCsrfCacheNow = async function () {
-  const cache = await getCachedUploadFeedCsrfToken();
-
-  return {
-    ok: true,
-    tokenFound: !!cache,
-    tokenLength: cache?.tokenLength || 0,
-    source: cache?.source || "none",
-    ageMs: cache?.capturedAt ? Date.now() - cache.capturedAt : null,
-    valid: !!cache,
-    isTestToken: !!cache?.isTestToken
-  };
-};
-
-globalThis.clearUploadFeedCsrfCacheNow = async function () {
-  return clearUploadFeedCsrfCache("manual_service_worker_console");
-};
-
-globalThis.testUploadFeedSnifferCaptureNow = async function () {
-  const tab = await findOrOpenSellerCentralFeedsTab();
-  if (!tab?.id) {
-    return { ok: false, error: "Unable to open Seller Central feeds tab" };
-  }
-
-  await waitForSellerCentralTabComplete(tab.id);
-  await installUploadFeedCsrfSniffer(tab.id);
-
-  const fakeToken =
-    "TEST" +
-    "A".repeat(120) +
-    "==";
-
-  const [res] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    world: "MAIN",
-    func: (token) => {
-      console.log("dispatching", {
-        type: "UPLOAD_ACTION",
-        feedTypeName: "confirmShipment",
-        payload: {
-          csrfToken: token
-        },
-        __apoTestToken: true
-      });
-
-      return {
-        ok: true,
-        href: location.href,
-        title: document.title,
-        tokenLength: token.length
-      };
-    },
-    args: [fakeToken],
-  });
-
-  return {
-    ok: true,
-    tabId: tab.id,
-    result: res?.result || null
-  };
-};
-
-console.log("[UPLOAD_TRACKING] Service Worker uploadFeed debug helpers exposed", {
-  installUploadFeedSnifferNow: typeof globalThis.installUploadFeedSnifferNow,
-  verifyUploadFeedSnifferNow: typeof globalThis.verifyUploadFeedSnifferNow,
-  checkUploadFeedCsrfCacheNow: typeof globalThis.checkUploadFeedCsrfCacheNow,
-  clearUploadFeedCsrfCacheNow: typeof globalThis.clearUploadFeedCsrfCacheNow,
-  testUploadFeedSnifferCaptureNow: typeof globalThis.testUploadFeedSnifferCaptureNow
-});
-
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  try {
-    if (changeInfo.status !== "complete") return;
-    const url = tab?.url || "";
-    if (!url.startsWith(SC_FEEDS_URL)) return;
-    Promise.resolve(installUploadFeedCsrfSniffer(tabId))
-      .then((result) => {
-        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer auto-installed on feeds tab", {
-          tabId,
-          url,
-          ok: !!result?.ok,
-        }, result?.ok ? "success" : "error");
-      })
-      .catch((error) => {
-        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer auto-install failed on feeds tab", {
-          tabId,
-          url,
-          error: error?.message || String(error),
-        }, "error");
-      });
-  } catch (error) {
-    console.warn("[UPLOAD_TRACKING] feeds tab sniffer auto-install exception:", error?.message || error);
-  }
-});
-
-async function getSellerCentralPageCsrfFromTab(tabId) {
-  try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const inputs = Array.from(document.querySelectorAll(
-          'input[name="csrfToken"], input[name="anti-csrftoken-a2z"], meta[name="csrf-token"], [data-csrf-token]'
-        ));
-        const tokenFromDom = inputs
-          .map((el) => el.value || el.content || el.getAttribute("data-csrf-token") || "")
-          .find(Boolean) || "";
-
-        let initialState = "";
-        try {
-          initialState = JSON.stringify(window.__INITIAL_STATE__ || {});
-        } catch {
-          initialState = "";
-        }
-        const pageText = [
-          document.documentElement?.innerHTML || "",
-          initialState,
-        ].join("\n");
-
-        return {
-          href: location.href,
-          title: document.title,
-          tokenFromDom,
-          tokenFromHtml: (() => {
-            const patterns = [
-              /csrfToken['"]\s*:\s*['"]([^'"]+)['"]/i,
-              /anti-csrftoken-a2z['"]\s*:\s*['"]([^'"]+)['"]/i,
-              /"csrfToken"\s*:\s*"([^"]+)"/i,
-              /window\.csrfToken\s*=\s*['"]([^'"]+)['"]/i,
-              /data-csrf-token=['"]([^'"]+)['"]/i,
-            ];
-            for (const pattern of patterns) {
-              const match = pageText.match(pattern);
-              if (match?.[1]) return match[1];
-            }
-            return "";
-          })(),
-          bodyText: (document.body?.innerText || "").slice(0, 1200),
-        };
-      },
-    });
-
-    const result = res?.result || {};
-    return {
-      token: result.tokenFromDom || result.tokenFromHtml || "",
-      pageHint: result,
-    };
-  } catch (error) {
-    return {
-      token: "",
-      pageHint: { error: error?.message || String(error) },
-    };
-  }
-}
-
-async function refreshSellerCentralUploadAuth() {
-  debugLog("[UPLOAD_TRACKING] Refreshing Seller Central auth in tab", "info");
-  const tab = await findOrOpenSellerCentralFeedsTab();
-  if (!tab?.id) {
-    throw createAmazonUploadError(
-      "AMAZON_CSRF_MISSING",
-      "Cannot open Seller Central feeds tab to refresh authentication. Open Seller Central, log in, then retry."
-    );
-  }
-
-  await waitForSellerCentralTabComplete(tab.id);
-  await delayMs(1500);
-
-  const cookieToken = await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z");
-  const { token: pageToken, pageHint } = await getSellerCentralPageCsrfFromTab(tab.id);
-  const csrfToken = cookieToken || pageToken || "";
-
-  extensionLogger?.logInfo("[UPLOAD_TRACKING] Seller Central auth refresh completed", {
-    tabId: tab.id,
-    url: pageHint?.href,
-    title: pageHint?.title,
-    cookieTokenFound: !!cookieToken,
-    pageTokenFound: !!pageToken,
-  });
-
-  if (!csrfToken) {
-    throw createAmazonUploadError(
-      "AMAZON_CSRF_MISSING",
-      "Amazon Seller Central CSRF token is missing. Log in to Seller Central, refresh the feeds page, then retry the tracking upload.",
-      { pageHint }
-    );
-  }
-
-  return csrfToken;
-}
-
-const AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE = "America/Los_Angeles";
-
-function formatDateYmdInTimeZone(date = new Date(), timeZone = AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE) {
-  const d = date instanceof Date ? date : new Date(date);
-  const safeDate = Number.isNaN(d.getTime()) ? new Date() : d;
-
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(safeDate);
-
-  const byType = Object.fromEntries(parts.map((p) => [p.type, p.value]));
-  return `${byType.year}-${byType.month}-${byType.day}`;
-}
-
-function compareYmd(a = "", b = "") {
-  return String(a || "").localeCompare(String(b || ""));
-}
-
-function normalizeShipDateForAmazonConfirmShipment(value = new Date(), options = {}) {
-  const now = options.now instanceof Date ? options.now : new Date();
-  const marketplaceToday = formatDateYmdInTimeZone(
-    now,
-    AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE
-  );
-
-  const raw = String(value || "").trim();
-  let candidate = "";
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    candidate = raw;
-  } else {
-    const parsed = value instanceof Date ? value : new Date(raw || now);
-    candidate = Number.isNaN(parsed.getTime())
-      ? marketplaceToday
-      : formatDateYmdInTimeZone(parsed, AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE);
-  }
-
-  if (compareYmd(candidate, marketplaceToday) > 0) {
-    return marketplaceToday;
-  }
-
-  return candidate || marketplaceToday;
-}
-
-function isHtmlResponse(contentType = "", text = "") {
-  const ct = String(contentType || "").toLowerCase();
-  const body = String(text || "").trimStart().toLowerCase();
-  return ct.includes("text/html") || body.startsWith("<!doctype html") || body.startsWith("<html") || body.includes("<html");
-}
-
-function classifyAmazonUploadFailure(response, responseText = "") {
-  const contentType = response.headers.get("content-type") || "";
-  const bodyAndUrl = `${response?.url || ""}\n${responseText || ""}`;
-  const authLike = /signin|sign-in|login|authentication|captcha|session expired|unauthorized|forbidden/i.test(bodyAndUrl);
-  if (response.status === 0) return "AMAZON_UPLOAD_CONTEXT_BLOCKED";
-  if (response.status === 401 || response.status === 403) return "AMAZON_AUTH_REQUIRED";
-  if (isHtmlResponse(contentType, responseText) && authLike) return "AMAZON_AUTH_REQUIRED";
-  if (response.status === 400 && isHtmlResponse(contentType, responseText)) return "AMAZON_UPLOAD_BAD_REQUEST_HTML";
-  if (response.status === 400) return "AMAZON_UPLOAD_BAD_REQUEST";
-  if (response.status === 500) return "AMAZON_UPLOAD_SERVER_ERROR";
-  return "AMAZON_UPLOAD_FAILED";
-}
-
-function isUploadFeedAuthOrCsrfError(error = {}) {
-  const code = error?.code || "";
-  const status = Number(error?.status || 0);
-  if (["AMAZON_AUTH_REQUIRED", "AMAZON_UPLOAD_CSRF_FORM_FIELD_MISSING", "AMAZON_UPLOAD_CSRF_SEED_REQUIRED"].includes(code)) return true;
-  if (status === 401 || status === 403) return true;
-  const responseText = String(error?.responseText || "");
-  if (responseText && /signin|sign-in|login|authentication|captcha|session expired|unauthorized|forbidden|csrf|token/i.test(responseText)) return true;
-  return false;
-}
-
-async function getSellerCentralUploadPagePreflight(context = {}) {
-  const tab = await findOrOpenSellerCentralFeedsTab();
-  if (!tab?.id) {
-    return {
-      ok: false,
-      tabId: null,
-      finalUrl: "",
-      pageTitle: "",
-      tabStatus: "",
-      feedsPage: false,
-      isLoginPage: false,
-      isOtpPage: false,
-      isCaptchaPage: false,
-      isMarketplaceSelector: false,
-      isSellerCentralPage: false,
-      allowUpload: false,
-      error: "Unable to open Seller Central feeds tab",
-      context,
-    };
-  }
-
-  await waitForSellerCentralTabComplete(tab.id);
-  await delayMs(1500);
-  const currentTab = await chrome.tabs.get(tab.id).catch(() => tab);
-
-  let pageInfo = {};
-  try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => ({
-        href: location.href,
-        title: document.title,
-        readyState: document.readyState,
-        bodyText: (document.body?.innerText || "").slice(0, 1200),
-      }),
-    });
-    pageInfo = res?.result || {};
-  } catch (error) {
-    pageInfo = { error: error?.message || String(error) };
-  }
-
-  const finalUrl = pageInfo.href || currentTab?.url || "";
-  const pageTitle = pageInfo.title || currentTab?.title || "";
-  let snifferInstalled = false;
-  try {
-    const snifferResult = await installUploadFeedCsrfSniffer(tab.id);
-    snifferInstalled = !!snifferResult?.ok;
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer installed", {
-      tabId: tab.id,
-      finalUrl,
-      pageTitle,
-      snifferInstalled,
-    }, snifferInstalled ? "success" : "error");
-  } catch (error) {
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer install failed", {
-      tabId: tab.id,
-      finalUrl,
-      pageTitle,
-      error: error?.message || String(error),
-    }, "error");
-  }
-  const bodyText = String(pageInfo.bodyText || "");
-  const haystack = `${finalUrl}\n${pageTitle}\n${bodyText}`.toLowerCase();
-  const feedsPage = finalUrl.includes(AMAZON_UPLOADFEED_PAGE_URL);
-  const isLoginPage = /signin|sign-in|ap\/signin|login|password|passkey|authentication/.test(haystack);
-  const isOtpPage = /otp|one time password|one-time password|two-step|two step|verification code/.test(haystack);
-  const isCaptchaPage = /captcha|enter the characters|type the characters/.test(haystack);
-  const isMarketplaceSelector = /marketplace|select.*marketplace|choose.*marketplace|seller central.*country/.test(haystack) && !feedsPage;
-  const isSellerCentralPage = finalUrl.includes("sellercentral.amazon.com");
-  const allowUpload = feedsPage && isSellerCentralPage && !isLoginPage && !isOtpPage && !isCaptchaPage && !isMarketplaceSelector;
-
-  return {
-    ok: allowUpload,
-    tabId: tab.id,
-    finalUrl,
-    pageTitle,
-    tabStatus: currentTab?.status || pageInfo.readyState || "",
-    feedsPage,
-    isLoginPage,
-    isOtpPage,
-    isCaptchaPage,
-    isMarketplaceSelector,
-    isSellerCentralPage,
-    allowUpload,
-    snifferInstalled,
-  };
-}
-
-async function getUploadFeedReadinessStatus(options = {}) {
-  const requireSocket = !!options.requireSocket;
-  const socketConnected = !!socket?.connected;
-  let preflight = options.preflight || null;
-
-  if (!options.skipSellerCentralPreflight && !preflight) {
-    preflight = await getSellerCentralUploadPagePreflight({ reason: "readiness_status" });
-  }
-
-  const sellerCentralReady = options.skipSellerCentralPreflight && !preflight ? true : !!preflight?.allowUpload;
-  const sellerCentralTabId = preflight?.tabId || null;
-  const sellerCentralUrl = preflight?.finalUrl || "";
-  const sellerCentralTitle = preflight?.pageTitle || "";
-  const needLogin = !!(preflight && (
-    preflight.isLoginPage ||
-    preflight.isOtpPage ||
-    preflight.isCaptchaPage ||
-    preflight.isMarketplaceSelector ||
-    !preflight.allowUpload
-  ));
-
-  const cacheStatus = await getUploadFeedCsrfCacheStatus();
-  const csrfCacheValid = !!cacheStatus.valid;
-  const needCsrfSeed = sellerCentralReady && !csrfCacheValid;
-  const socketOk = !requireSocket || socketConnected;
-  const ok = socketOk && sellerCentralReady && csrfCacheValid && !cacheStatus.isTestToken;
-
-  let message = "UploadFeed is ready.";
-  if (!socketOk) {
-    message = "Socket is disconnected.";
-  } else if (needLogin) {
-    message = "Seller Central feeds page is not ready. Log in and clear any OTP, captcha, or marketplace selector.";
-  } else if (needCsrfSeed) {
-    message = "Open Seller Central feeds page and perform one manual upload to seed uploadFeed csrfToken.";
-  }
-
-  return {
-    ok,
-    socketConnected,
-    sellerCentralReady,
-    sellerCentralTabId,
-    sellerCentralUrl,
-    sellerCentralTitle,
-    csrfCacheValid,
-    csrfTokenFound: cacheStatus.tokenFound,
-    csrfTokenLength: cacheStatus.tokenLength,
-    csrfSource: cacheStatus.source,
-    csrfAgeMs: cacheStatus.ageMs,
-    csrfAgeMin: cacheStatus.ageMin,
-    isTestToken: cacheStatus.isTestToken,
-    needLogin,
-    needCsrfSeed,
-    message,
-  };
-}
-
-// TODO Phase 2: add throttled uploadFeed session warm-up, identity-scoped CSRF cache metadata,
-// an upload tracking lock, and Amazon uploadFeed batchId persistence after Phase 1 runs cleanly.
-
-/*
- * Expected manual request contract:
- * POST /order-reports-and-feeds/api/uploadFeed
- * FormData:
- * - feedFile
- * - feedName=confirmShipment
- * - feedVersion=new
- * - csrfToken=<long token>
-  */
-async function uploadToAmazonFromSellerCentralTab(stableFileObj, uploadParams = {}) {
-  const tab = await findOrOpenSellerCentralFeedsTab();
-  if (!tab?.id) {
-    return {
-      ok: false,
-      status: 0,
-      code: "AMAZON_UPLOAD_CONTEXT_BLOCKED",
-      statusText: "Seller Central feeds tab is unavailable",
-      csrfIncluded: false,
-      csrfSource: "none",
-      csrfTokenLength: 0,
-      url: "",
-      contentType: "",
-      textPreview: "Unable to open Seller Central feeds tab",
-      jsonParseOk: false,
-      json: null,
-      world: "",
-    };
-  }
-
-  await waitForSellerCentralTabComplete(tab.id);
-  await delayMs(1000);
-  let snifferInstalled = false;
-  try {
-    const snifferResult = await installUploadFeedCsrfSniffer(tab.id);
-    snifferInstalled = !!snifferResult?.ok;
-  } catch (error) {
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer install failed before upload", {
-      tabId: tab.id,
-      error: error?.message || String(error),
-    }, "error");
-  }
-  const cachedCsrf = await getCachedUploadFeedCsrfToken();
-
-  const fileText = await stableFileObj.text();
-  const filename = stableFileObj.name || uploadParams.filename || "confirmShipment.txt";
-  const contentType = stableFileObj.type || uploadParams.contentType || "text/tab-separated-values; charset=utf-8";
-
-  const injectedUpload = async (fileTextArg, filenameArg, contentTypeArg, pathArg, cachedTokenArg, snifferInstalledArg) => {
-    const extractUploadFeedCsrfTokenInPage = () => {
-      const MIN_CSRF_LENGTH = 80;
-      const isValid = (value) => {
-        const token = String(value || "").trim();
-        if (!token) return false;
-        if (token.length < MIN_CSRF_LENGTH) return false;
-        if (/^(undefined|null|true|false)$/i.test(token)) return false;
-        return /^[A-Za-z0-9+/=_-]+$/.test(token);
-      };
-      const candidates = [];
-      const addCandidate = (value, source) => {
-        const token = String(value || "").trim();
-        if (isValid(token)) candidates.push({ csrfToken: token, csrfSource: source });
-      };
-      const selectors = [
-        'input[name="csrfToken"]',
-        'input[name="csrf-token"]',
-        'input[name="_csrf"]',
-        'input[name="csrf"]',
-        'meta[name="csrf-token"]',
-        'meta[name="csrfToken"]',
-        "[data-csrf-token]",
-        "[data-csrf]",
-      ];
-      for (const selector of selectors) {
-        try {
-          for (const el of Array.from(document.querySelectorAll(selector))) {
-            addCandidate(el.value || el.content || el.getAttribute("content") || el.getAttribute("data-csrf-token") || el.getAttribute("data-csrf"), "selector");
-          }
-        } catch { }
-      }
-      const keyLooksRelevant = (key) => /csrf|csrftoken|antiCsrf|anti-csrf|token/i.test(String(key || ""));
-      try {
-        for (const key of Object.keys(window)) {
-          if (keyLooksRelevant(key)) addCandidate(window[key], "window");
-          const value = window[key];
-          if (value && typeof value === "object") {
-            for (const nestedKey of Object.keys(value).slice(0, 200)) {
-              if (keyLooksRelevant(nestedKey)) addCandidate(value[nestedKey], "window");
-            }
-          }
-        }
-      } catch { }
-      const scriptText = Array.from(document.scripts || []).map((script) => script.textContent || "").join("\n").slice(0, 2000000);
-      const pageText = `${document.documentElement?.innerHTML || ""}\n${scriptText}`;
-      const regexes = [
-        /csrfToken["']?\s*[:=]\s*["']([^"']+)["']/gi,
-        /csrf-token["']?\s*[:=]\s*["']([^"']+)["']/gi,
-        /csrf_token["']?\s*[:=]\s*["']([^"']+)["']/gi,
-        /["']csrfToken["']\s*:\s*["']([^"']+)["']/gi,
-        /'csrfToken'\s*:\s*'([^']+)'/gi,
-      ];
-      for (const regex of regexes) {
-        let match;
-        while ((match = regex.exec(pageText))) addCandidate(match[1], "scriptRegex");
-      }
-      const best = candidates.sort((a, b) => b.csrfToken.length - a.csrfToken.length)[0];
-      return {
-        csrfToken: best?.csrfToken || "",
-        csrfSource: best?.csrfSource || "none",
-        csrfTokenLength: best?.csrfToken?.length || 0,
-      };
-    };
-    const tokenResult = extractUploadFeedCsrfTokenInPage();
-    const isValidUploadFeedToken = (value) => {
-      const token = String(value || "").trim();
-      if (!token) return false;
-      if (token.length < 80) return false;
-      if (/^(undefined|null|true|false)$/i.test(token)) return false;
-      return /^[A-Za-z0-9+/=_-]+$/.test(token);
-    };
-    const liveToken = tokenResult.csrfToken || "";
-    const cachedToken = String(cachedTokenArg || "").trim();
-    const liveExtractionFound = isValidUploadFeedToken(liveToken);
-    const cachedTokenFound = isValidUploadFeedToken(cachedToken);
-    const csrfToken = liveExtractionFound ? liveToken : cachedTokenFound ? cachedToken : "";
-    const csrfSource = liveExtractionFound ? (tokenResult.csrfSource || "none") : cachedTokenFound ? "cachedSnifferToken" : "none";
-    const csrfTokenLength = csrfToken.length;
-    if (!csrfToken || csrfTokenLength < 80) {
-      return {
-        ok: false,
-        status: 0,
-        code: "AMAZON_UPLOAD_CSRF_FORM_FIELD_MISSING",
-        statusText: "Valid uploadFeed csrfToken FormData field is missing",
-        csrfIncluded: false,
-        csrfSource: "none",
-        csrfTokenLength: 0,
-        url: location.href,
-        finalUrl: location.href,
-        pageTitle: document.title,
-        readyState: document.readyState,
-        isSellerCentralPage: location.href.includes("sellercentral.amazon.com"),
-        isFeedsPage: location.href.includes("/order-reports-and-feeds/feeds"),
-        liveExtractionFound,
-        cachedTokenFound,
-        snifferInstalled: !!snifferInstalledArg,
-        instruction: "Open Seller Central feeds page and perform one manual upload to let the extension capture uploadFeed csrfToken.",
-        contentType: "",
-        textPreview: "No valid csrfToken found in Seller Central page context",
-        jsonParseOk: false,
-        json: null,
-      };
-    }
-
-    const uploadFile = new File([fileTextArg], filenameArg, { type: contentTypeArg || "text/tab-separated-values; charset=utf-8" });
-    const formData = new FormData();
-    formData.append("feedFile", uploadFile);
-    formData.append("feedName", "confirmShipment");
-    formData.append("feedVersion", "new");
-    formData.append("csrfToken", csrfToken);
-
-    const res = await fetch(pathArg, {
-      method: "POST",
-      credentials: "include",
-      headers: { accept: "*/*" },
-      body: formData,
-    });
-
-    const responseContentType = res.headers.get("content-type") || "";
-    const textBody = await res.text().catch(() => "");
-    let json = null;
-    let jsonParseOk = false;
-    try {
-      json = JSON.parse(textBody);
-      jsonParseOk = true;
-    } catch { }
-
-    return {
-      ok: res.ok,
-      status: res.status,
-      statusText: res.statusText,
-      url: res.url,
-      redirected: res.redirected,
-      type: res.type,
-      contentType: responseContentType,
-      textPreview: textBody.slice(0, 1000),
-      jsonParseOk,
-      json,
-      csrfIncluded: true,
-      csrfSource,
-      csrfTokenLength,
-      liveExtractionFound,
-      cachedTokenFound,
-      snifferInstalled: !!snifferInstalledArg,
-    };
-  };
-
-  const runInjection = async (world) => {
-    const options = {
-      target: { tabId: tab.id },
-      func: injectedUpload,
-      args: [fileText, filename, contentType, AMAZON_UPLOADFEED_URL_PATH, cachedCsrf?.token || "", snifferInstalled],
-    };
-    if (world) options.world = world;
-    const [res] = await chrome.scripting.executeScript(options);
-    return { ...(res?.result || {}), world: world || "ISOLATED" };
-  };
-
-  try {
-    return await runInjection("MAIN");
-  } catch (error) {
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] MAIN world injection failed; using fallback isolated world", {
-      error: error?.message || String(error),
-      filename,
-    }, "error");
-    return await runInjection();
-  }
-}
-
-function sellerCentralTabUploadResultToResponse(result = {}) {
-  const contentType = result.contentType || "";
-  const textBody = result.textPreview || "";
-  return {
-    ok: !!result.ok,
-    status: Number(result.status || 0),
-    statusText: result.statusText || "",
-    url: result.url || "",
-    redirected: !!result.redirected,
-    type: result.type || "",
-    headers: {
-      get(name) {
-        return String(name || "").toLowerCase() === "content-type" ? contentType : "";
-      },
-      entries() {
-        return contentType ? [["content-type", contentType]][Symbol.iterator]() : [][Symbol.iterator]();
-      },
-    },
-    async json() {
-      if (result.jsonParseOk) return result.json;
-      return JSON.parse(textBody || "null");
-    },
-    async text() {
-      return textBody;
-    },
-  };
-}
-async function amazonHeaders() {
-  const a2z = await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z");
-  const sessionToken = await getCookie(`${SC_BASE}/`, "session-token");
-
-  const h = {
-    accept: "*/*",
-    "accept-encoding": "gzip, deflate, br, zstd",
-    "accept-language": "vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5",
-    "origin": "https://sellercentral.amazon.com",
-    "referer": `${SC_BASE}/order-reports-and-feeds/feeds`,
-    "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-  };
-
-  // Add CSRF token from anti-csrftoken-a2z cookie (not x-amz-csrf)
-  if (a2z) h["anti-csrftoken-a2z"] = a2z;
-
-  return h;
-}
-
+async function getCookie(url, name) { const cookie = await chrome.cookies.get({ url, name }); return cookie?.value || ""; }
+async function amazonHeaders() { const a2z = await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z"); return { accept: "*/*", origin: SC_BASE, referer: `${SC_BASE}/order-reports-and-feeds/feeds`, ...(a2z ? { "anti-csrftoken-a2z": a2z } : {}) }; }
 /* ---------- Fetch helpers ---------- */
 function isJson(res) {
   const ct = (res.headers.get("content-type") || "").toLowerCase();
@@ -1871,23 +276,9 @@ function isTsvish(res) {
   );
 }
 async function requestOnce(url, init = {}) {
-  if (String(url || "").includes(AMAZON_UPLOADFEED_URL_PATH)) {
-    const message = "uploadFeed must be called from Seller Central page context, not requestOnce/background fetch.";
-    logUploadTrackingDiagnostic(
-      "[UPLOAD_TRACKING] Blocked background uploadFeed request; use sellerCentralTabPageContext",
-      { url: String(url || ""), method: init?.method || "GET" },
-      "error"
-    );
-    throw createAmazonUploadError(
-      "AMAZON_UPLOADFEED_BACKGROUND_FORBIDDEN",
-      message,
-      { url: String(url || ""), retryable: false }
-    );
-  }
   const headers = { ...(await amazonHeaders()), ...(init.headers || {}) };
   return fetch(url, {
     credentials: "include",
-    redirect: "manual",
     ...init,
     headers,
   });
@@ -1898,7 +289,6 @@ async function getCfg(keys = []) {
   const all = await chrome.storage.local.get([
     "ingestUrl",
     "ingestToken",
-    "shopId",
     "marketplaceCode",
     "activeEnvironment",
     "ingestEnvironments",
@@ -1911,413 +301,45 @@ async function getCfg(keys = []) {
     "adsMarketplaceId",
     "adsCsrfData",
     "adsCsrfToken",
+    "adsReportingCsrfToken",
     "adsHeaderLastSeen",
     // Auto
     "autoEnabled",
     "autoUpload_enabled", "autoUpload_interval",
     ...keys,
   ]);
-  const environment = all.activeEnvironment || "production";
+  const environment = "development";
   const environmentConfig = all.ingestEnvironments?.[environment];
   if (environmentConfig) {
     all.ingestUrl = environmentConfig.ingestUrl || all.ingestUrl;
-    all.shopId = environmentConfig.shopId || all.shopId;
     all.ingestToken = environmentConfig.ingestToken || all.ingestToken;
     all.marketplaceCode = environmentConfig.marketplaceCode || all.marketplaceCode;
   }
+  all.ingestUrl = resolveDevelopmentApiUrl(all.ingestUrl);
   all.marketplaceCode = (all.marketplaceCode || "US").trim().toUpperCase();
   return all;
 }
-function resolveCarrierInfo(tracking = "") {
-  const normalized = String(tracking || "").trim().toUpperCase();
 
-  if (normalized.startsWith("4PX")) {
-    return { carrierCode: "4PX", shipMethod: "4PX-Global Express" };
-  }
-
-  if (normalized.startsWith("UK") || normalized.startsWith("UL")) {
-    return { carrierCode: "Yanwen", shipMethod: "Yanwen Air Economy Mail General" };
-  }
-  if (normalized.startsWith("YT")) {
-    return { carrierCode: "YunExpress", shipMethod: "YunExpress Global Direct line (standard)-Tracked" };
-  }
-  return { carrierCode: "USPS", shipMethod: "USPS First Class" };
-}
-
-const CONFIRM_SHIPMENT_TSV_EOL = "\r\n";
-
-function joinConfirmShipmentTsvLines(lines = []) {
-  return lines.map(line => String(line || "").replace(/\r?\n/g, "")).join(CONFIRM_SHIPMENT_TSV_EOL) + CONFIRM_SHIPMENT_TSV_EOL;
-}
-
-function auditTsvLineBreaks(tsvContent = "") {
-  const text = String(tsvContent || "");
-  const lines = text.split(/\r?\n/);
-  return {
-    hasCRLF: /\r\n/.test(text),
-    crlfCount: (text.match(/\r\n/g) || []).length,
-    lfCount: (text.match(/(?<!\r)\n/g) || []).length,
-    lineCount: lines.filter(Boolean).length,
-    headerLine: lines[0] || "",
-    firstDataLine: lines[1] || "",
-    headerEndsWithShipMethod: (lines[0] || "").endsWith("\tship-method") || (lines[0] || "").endsWith("ship-method"),
-    headerDataConcatenated: /ship-method\d{3}-\d{7}-\d{7}/.test(text)
-  };
-}
-
-function validateConfirmShipmentTsv(tsvContent = "") {
-  const requiredHeaders = ["order-id", "ship-date", "carrier-code", "tracking-number", "ship-method"];
-  const trimmedLines = String(tsvContent || "")
-    .split(/\r?\n/)
-    .map((line) => line.replace(/\r$/, ""))
-    .filter((line) => line.trim());
-
-  if (trimmedLines.length < 2) {
-    throw createAmazonUploadError(
-      "AMAZON_TSV_VALIDATION_FAILED",
-      "Confirm shipment TSV must include a header row and at least one tracking row."
-    );
-  }
-
-  const headers = trimmedLines[0].split("\t").map((header) => header.trim());
-  const missingHeaders = requiredHeaders.filter((header) => !headers.includes(header));
-  if (missingHeaders.length) {
-    throw createAmazonUploadError(
-      "AMAZON_TSV_VALIDATION_FAILED",
-      `Confirm shipment TSV is missing required headers: ${missingHeaders.join(", ")}.`
-    );
-  }
-
-  const indexByHeader = Object.fromEntries(headers.map((header, index) => [header, index]));
-  const carrierBreakdown = {};
-  const invalidRows = [];
-  const normalizedShipDateRows = [];
-  const shipDateNormalizationDetails = [];
-  const marketplaceToday = formatDateYmdInTimeZone(new Date(), AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE);
-  const shipDateIndex = indexByHeader["ship-date"];
-
-  const normalizedRows = trimmedLines.slice(1).map((line, rowIndex) => {
-    const cols = line.split("\t").map((col) => col.trim());
-    const orderId = cols[indexByHeader["order-id"]] || "";
-    const trackingNumber = cols[indexByHeader["tracking-number"]] || "";
-    const carrierCode = cols[indexByHeader["carrier-code"]] || "UNKNOWN";
-    const originalShipDate = cols[shipDateIndex] || "";
-    let normalizedShipDate = normalizeShipDateForAmazonConfirmShipment(originalShipDate);
-    if (!originalShipDate || !/^\d{4}-\d{2}-\d{2}$/.test(originalShipDate) || originalShipDate !== normalizedShipDate) {
-      normalizedShipDateRows.push(rowIndex + 2);
-      shipDateNormalizationDetails.push({
-        rowNumber: rowIndex + 2,
-        originalShipDate,
-        normalizedShipDate,
-        clampedToMarketplaceToday: compareYmd(originalShipDate, marketplaceToday) > 0 && normalizedShipDate === marketplaceToday,
-      });
-    }
-    cols[shipDateIndex] = normalizedShipDate;
-
-    if (!orderId || !trackingNumber) {
-      invalidRows.push(rowIndex + 2);
-    }
-
-    carrierBreakdown[carrierCode] = (carrierBreakdown[carrierCode] || 0) + 1;
-    return headers.map((_, index) => cols[index] || "").join("\t");
-  });
-
-  if (invalidRows.length) {
-    throw createAmazonUploadError(
-      "AMAZON_TSV_VALIDATION_FAILED",
-      `Confirm shipment TSV has empty order-id or tracking-number on row(s): ${invalidRows.slice(0, 20).join(", ")}.`
-    );
-  }
-
-  extensionLogger?.logInfo("[UPLOAD_TRACKING] TSV validation passed", {
-    rows: normalizedRows.length,
-    carrierBreakdown,
-    shipDateNormalizedRows: normalizedShipDateRows.length,
-  });
-  debugLog(`[UPLOAD_TRACKING] Carrier breakdown: ${JSON.stringify(carrierBreakdown)}`, "info");
-  if (normalizedShipDateRows.length) {
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] ship-date normalized for Amazon marketplace timezone", {
-      rowsNormalized: normalizedShipDateRows.length,
-      rowNumbers: normalizedShipDateRows.slice(0, 20).join(","),
-      marketplaceTimeZone: AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE,
-      marketplaceToday,
-      examples: shipDateNormalizationDetails.slice(0, 5),
-    });
-  }
-
-  const outputLines = [
-    headers.join("\t"),
-    ...normalizedRows
-  ];
-
-  return {
-    content: joinConfirmShipmentTsvLines(outputLines),
-    rows: normalizedRows.length,
-    carrierBreakdown,
-    shipDateNormalizedRows: normalizedShipDateRows,
-    shipDateNormalizationDetails,
-    shipDateFutureClampedRows: shipDateNormalizationDetails
-      .filter((row) => row.clampedToMarketplaceToday)
-      .map((row) => row.rowNumber),
-    marketplaceToday,
-    marketplaceTimeZone: AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE,
-    lineEnding: "CRLF"
-  };
-}
-
-async function uploadtracking(context = {}) {
-  const startedAt = Date.now();
-
-  if (!extensionLogger) await initializeLogger();
-
-  const { ingestUrl, shopId, ingestToken, marketplaceCode } = await getCfg();
-  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
-  if (!shopId || !ingestToken) throw new Error("Missing Shop ID or API Access Token (Options)");
-  if (!shopId) throw new Error("Missing shopId (Options)");
-
-  const { checkOrdersStatusUrl } = deriveApiUrls(ingestUrl);
-  const url = `${checkOrdersStatusUrl}?machineId=${encodeURIComponent(shopId)}&limit=1000`;
-
-  extensionLogger?.logInfo("[UPLOAD_TRACKING] Fetching order status from API", {
-    shopId,
-    url,
-  });
-
-  try {
-    const data = await checkOrdersStatus({ ingestUrl, shopId, token: ingestToken });
-    const orders = data?.orders || [];
-
-    // Lọc các đơn chưa submit lên Amazon
-    const pendingOrders = orders.filter(
-      (o) => o.submittedToAmazon === false && o.hasTracking === true
-    );
-
-    extensionLogger?.logInfo("[UPLOAD_TRACKING] pendingOrders", { pendingOrders });
-
-    extensionLogger?.logInfo("[UPLOAD_TRACKING] check-orders-status fetched", {
-      shopId,
-      totalCount: data?.totalCount ?? orders.length,
-      stats: data?.stats,
-      pendingCount: pendingOrders.length,
-      pendingOrders: pendingOrders.map((o) => ({
-        orderId: o.orderId,
-        tracking: o.tracking,
-        status: o.status,
-      })),
-    });
-
-    debugLog(
-      `✅ [UPLOAD_TRACKING] Fetched ${orders.length} orders, ${pendingOrders.length} pending upload`,
-      "success"
-    );
-
-    if (pendingOrders.length === 0) {
-      debugLog("⏸️ [UPLOAD_TRACKING] No pending orders to upload", "info");
-      extensionLogger?.logInfo("[UPLOAD_TRACKING] No pending orders to upload", { shopId });
-      return { ...data, pendingOrders };
-    }
-
-    // Build TSV content
-    const tsvLines = pendingOrders.map((o) => {
-      const tracking = String(o.tracking || "").trim();
-      const shipDate = normalizeShipDateForAmazonConfirmShipment(new Date());
-      const { carrierCode, shipMethod } = resolveCarrierInfo(tracking);
-
-      return `${o.orderId}\t${shipDate}\t${carrierCode}\t${tracking}\t${shipMethod}`;
-    });
-
-    const rawTsvContent =
-      joinConfirmShipmentTsvLines([
-        "order-id\tship-date\tcarrier-code\ttracking-number\tship-method",
-        ...tsvLines
-      ]);
-    const validatedTsv = validateConfirmShipmentTsv(rawTsvContent);
-    const tsvContent = validatedTsv.content;
-
-    const filename = `tracking-auto-${Date.now()}.txt`;
-    const fileObj = new File(
-      [new Blob([tsvContent], { type: "text/tab-separated-values; charset=utf-8" })],
-      filename
-    );
-
-    debugLog(`📄 [UPLOAD_TRACKING] Built TSV: ${filename} (${pendingOrders.length} orders)`, "info");
-
-    extensionLogger?.logInfo("[UPLOAD_TRACKING] TSV built, calling uploadToAmazon", {
-      filename,
-      ordersCount: pendingOrders.length,
-      fileSize: tsvContent.length,
-      carrierBreakdown: validatedTsv.carrierBreakdown,
-    });
-
-    await uploadToAmazon(fileObj, {
-      batchId: `auto_${Date.now()}`,
-      ordersCount: pendingOrders.length,
-      carrierCode: "Mixed",
-      shipMethod: "Mixed",
-      shipDate: normalizeShipDateForAmazonConfirmShipment(new Date()),
-    });
-
-    const batchData = await createShippingBatch({
-      ingestUrl,
-      token: ingestToken,
-      payload: {
-        machineId: shopId,
-        orders: pendingOrders.map((o) => ({
-          orderId: o.orderId,
-          shopId: o.shopId,
-        })),
-        label: `Auto Upload - Shop ${shopId} - ${pendingOrders.length} orders`,
-        autoUpload: true,
-      },
-    });
-
-    debugLog(
-      `✅ [UPLOAD_TRACKING] create-from-orders: ${JSON.stringify(batchData).slice(0, 200)}`,
-      "success"
-    );
-
-    extensionLogger?.logTaskCompleted(
-      {
-        taskType: "UPLOAD_TRACKING",
-        batchId: batchData?.batchId,
-        ordersCount: pendingOrders.length,
-      },
-      {
-        duration: Date.now(),
-        response: batchData,
-      },
-      `[UPLOAD_TRACKING] create-from-orders success — ${pendingOrders.length} orders submitted`
-    );
-
-    return { ...data, pendingOrders };
-  } catch (error) {
-    debugLog(`❌ [UPLOAD_TRACKING] check-orders-status error: ${error.message}`, "error");
-    extensionLogger?.logError(error, { shopId, url }, "[UPLOAD_TRACKING] check-orders-status failed");
-    throw error;
-  }
-}
-/* ---------- Identity ---------- */
-// async function ensureIdentity() {
-//   let { clientId, clientLabel } = await chrome.storage.local.get([
-//     "clientId",
-//     "clientLabel",
-//   ]);
-//   if (!clientId) {
-//     clientId =
-//       "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-//     await chrome.storage.local.set({ clientId });
-//   }
-//   clientLabel = "Machine-" + clientId.slice(-4);
-//   await chrome.storage.local.set({ clientLabel });
-//   return { clientId, clientLabel };
-// }
 async function ensureIdentity() {
-  // Lấy shopId để làm clientId
-  const { shopId } = await chrome.storage.local.get(["shopId"]);
-
-  if (shopId) {
-    // ✅ FIX: Sử dụng shopId làm clientId
-    const clientId = shopId;
-    const clientLabel = `Machine-${shopId.slice(-4)}`;
-
-    // Lưu vào storage
-    await chrome.storage.local.set({
-      clientId: clientId,
-      clientLabel: clientLabel
-    });
-
-    console.log('🔧 [FIX] Using shopId as clientId:', clientId);
-
-    // Initialize logger if not already done
-    if (!extensionLogger) {
-      const { ingestUrl } = await getCfg();
-      if (ingestUrl && shopId) {
-        extensionLogger = new ExtensionLogger(
-          clientId,
-          shopId,
-          clientLabel,
-          ingestUrl
-        );
-        console.log('[EXT-LOG] Logger initialized:', { clientId, shopId, clientLabel, ingestUrl });
-      }
-    }
-
-    return { clientId, clientLabel };
-  }
-
-  // Fallback nếu không có shopId
-  let { clientId, clientLabel } = await chrome.storage.local.get([
-    "clientId",
-    "clientLabel"
-  ]);
-
-  if (!clientId) {
-    clientId = "cid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-    await chrome.storage.local.set({ clientId });
-  }
-
-  clientLabel = "Machine-" + clientId.slice(-4);
-  await chrome.storage.local.set({ clientLabel });
-
-  // Initialize logger if not already done
-  if (!extensionLogger) {
-    const { ingestUrl, shopId: fallbackShopId } = await getCfg();
-    if (ingestUrl && fallbackShopId) {
-      extensionLogger = new ExtensionLogger(
-        clientId,
-        fallbackShopId,
-        clientLabel,
-        ingestUrl
-      );
-      console.log('[EXT-LOG] Logger initialized (fallback):', { clientId, shopId: fallbackShopId, clientLabel, ingestUrl });
-    }
-  }
-
+  let { clientId, clientLabel } = await chrome.storage.local.get(["clientId", "clientLabel"]);
+  if (!clientId) clientId = `ext-${crypto.randomUUID()}`;
+  if (!clientLabel) clientLabel = `Chrome ${clientId.slice(-6)}`;
+  await chrome.storage.local.set({ clientId, clientLabel });
   return { clientId, clientLabel };
 }
-
-/* ---------- Tiny TSV helper ---------- */
-function parseTSV(tsv) {
-  const clean = tsv.replace(/^\uFEFF/, "");
-  const lines = clean.split(/\r?\n/).filter(Boolean);
-  if (!lines.length) return { rows: [] };
-  const headers = lines[0].split("\t");
-  const rows = lines.slice(1).map((l) => {
-    const c = l.split("\t");
-    const o = {};
-    headers.forEach(
-      (h, i) => (o[h.trim().toLowerCase()] = (c[i] ?? "").trim())
-    );
-    return o;
-  });
-  return { rows };
-}
-
 /* ===============================
    ORDERS: xin ref + kiểm tra + tải
    ============================== */
-function buildNewOrdersPayload() {
+function buildNewOrdersPayload(numDays = 1) {
   return {
-    type: "newOrdersReport",
+    type: "fbmOrdersReport",
     reportVersion: "new",
     includeSalesChannel: false,
-    // Rolling 7 days avoids missed orders from Amazon/Pacific timezone and report delay; backend must upsert/dedupe by order id.
-    numDays: "7",
+    numDays: String([1, 2, 7, 15, 30].includes(Number(numDays)) ? numDays : 1),
     numMonth: "0",
     numYear: "2015",
   };
 }
-function buildFBMOrdersPayload() {
-  return {
-    type: "fbmUnshippedOrdersReport",
-    reportVersion: "new",
-    includeSalesChannel: false,
-    numDays: "1",
-    numMonth: "0",
-    numYear: "2015",
-  };
-}
-
 async function requestReferenceIdNew(body) {
   // Initialize logger if not exists
   if (!extensionLogger) {
@@ -2460,13 +482,13 @@ async function downloadByDocumentId(documentId) {
 }
 
 /* ===============================
-   Poll helper (10s x 5) + chống trùng ref
+   Poll helper (10s x 18) + chống trùng ref
    =============================== */
 const activeRefs = new Map();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function pollUntilReady(
   referenceId,
-  { intervalMs = 10000, maxAttempts = 5 } = {}
+  { intervalMs = 10000, maxAttempts = 5, onAttempt } = {}
 ) {
   // Initialize logger if not exists
   if (!extensionLogger) {
@@ -2487,6 +509,7 @@ async function pollUntilReady(
     }
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await onAttempt?.(attempt, maxAttempts);
       // Log each polling attempt
       if (extensionLogger) {
         await extensionLogger.logInfo(`[AMAZON_API] Amazon report polling attempt ${attempt}/${maxAttempts}`, {
@@ -2556,16 +579,17 @@ async function pollUntilReady(
 /* ===============================
    Push file về backend (REST import/report/ads)
    =============================== */
-async function runImportNewOrders(referenceOverride) {
-  const { ingestUrl, shopId, ingestToken } = await getCfg();
+async function runImportNewOrders(referenceOverride, numDays) {
+  const { ingestUrl, ingestToken, marketplaceCode } = await getCfg();
   if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
   const { importNewUrl } = deriveApiUrls(ingestUrl);
 
   let referenceId = referenceOverride;
   if (!referenceId) {
-    const newOrdersPayload = buildNewOrdersPayload();
-    console.log("[IMPORT_ORDERS] Requesting New Orders report with rolling window: 7 days");
-    extensionLogger?.logInfo("[IMPORT_ORDERS] Requesting New Orders report with rolling window: 7 days", {
+    await setOrderImportProgress('REQUESTING_REPORT', 'Requesting Amazon report');
+    const newOrdersPayload = buildNewOrdersPayload(numDays);
+    console.log(`[IMPORT_ORDERS] Requesting New Orders report with rolling window: ${newOrdersPayload.numDays} days`);
+    extensionLogger?.logInfo(`[IMPORT_ORDERS] Requesting New Orders report with rolling window: ${newOrdersPayload.numDays} days`, {
       numDays: newOrdersPayload.numDays,
     });
 
@@ -2587,9 +611,12 @@ async function runImportNewOrders(referenceOverride) {
   }
   if (!referenceId) throw new Error("No referenceId found for NEW orders.");
 
+  await setOrderImportProgress('WAITING_FOR_REPORT', 'Waiting for Amazon report', { referenceId, attempt: 0, maxAttempts: REPORT_POLL_MAX_ATTEMPTS });
+
   const st = await pollUntilReady(referenceId, {
     intervalMs: 10000,
-    maxAttempts: 5,
+    maxAttempts: REPORT_POLL_MAX_ATTEMPTS,
+    onAttempt: (attempt, maxAttempts) => setOrderImportProgress('WAITING_FOR_REPORT', 'Waiting for Amazon report', { referenceId, attempt, maxAttempts }),
   });
 
   let tsv,
@@ -2599,6 +626,7 @@ async function runImportNewOrders(referenceOverride) {
     tsv = st.tsv;
     rows = parseTSV(tsv).rows.length;
   } else {
+    await setOrderImportProgress('DOWNLOADING_REPORT', 'Downloading Amazon report', { referenceId });
     const r = await downloadByDocumentId(st.documentId);
     tsv = r.tsv;
     documentId = r.documentId;
@@ -2606,7 +634,6 @@ async function runImportNewOrders(referenceOverride) {
   }
 
   const fd = new FormData();
-  fd.append("shopId", shopId);
   fd.append("marketplaceCode", marketplaceCode || "US");
   fd.append("originalFilename", `orders-new-${referenceId}.txt`);
   fd.append(
@@ -2628,6 +655,7 @@ async function runImportNewOrders(referenceOverride) {
 
   let ingest;
   try {
+    await setOrderImportProgress('UPLOADING_TO_BE', 'Uploading report to LNG', { referenceId, rows });
     ingest = await postOrderImport({ url: importNewUrl, token: ingestToken, formData: fd });
   } catch (error) {
     const hint = importNewOrigin
@@ -2646,61 +674,13 @@ async function runImportNewOrders(referenceOverride) {
         importNewUrl,
         importNewOrigin,
         hasImportNewHostPermission,
-        shopId,
         hasIngestToken: !!ingestToken,
       },
       "[IMPORT_ORDERS] Backend upload fetch failed before HTTP response"
     );
     throw wrapped;
   }
-  return { ok: true, rows, documentId, referenceId, ingest };
-}
-
-// Confirm Shipping
-async function runImportFBMOrders(referenceOverride, machineId, label) {
-  const { ingestUrl, ingestToken, refNewOrders } = await getCfg();
-  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
-  const { importFBMUrl } = deriveApiUrls(ingestUrl);
-
-  let referenceId = referenceOverride;
-  if (!referenceId) {
-    try {
-      referenceId = await requestReferenceIdNew(buildFBMOrdersPayload());
-    } catch (e) {
-      referenceId = refNewOrders;
-    }
-  }
-  if (!referenceId) throw new Error("No referenceId found for FBM orders.");
-
-  const st = await pollUntilReady(referenceId, {
-    intervalMs: 10000,
-    maxAttempts: 5,
-  });
-
-  let tsv,
-    documentId = null,
-    rows = 0;
-  if (st.direct) {
-    tsv = st.tsv;
-    rows = parseTSV(tsv).rows.length;
-  } else {
-    const r = await downloadByDocumentId(st.documentId);
-    tsv = r.tsv;
-    documentId = r.documentId;
-    rows = r.rows;
-  }
-
-  const fd = new FormData();
-  fd.append(
-    "file",
-    new Blob([tsv], { type: "text/plain" }),
-    `orders-FBM-${referenceId}.txt`
-  );
-  fd.append("machineId", machineId);
-  fd.append("label", label);
-
-  const ingest = await postFbmImport({ url: importFBMUrl, token: ingestToken, formData: fd });
-
+  await setOrderImportProgress('COMPLETED', 'Order import completed', { referenceId, rows });
   return { ok: true, rows, documentId, referenceId, ingest };
 }
 
@@ -2727,6 +707,22 @@ async function ensureAdsTab() {
   return tab.id;
 }
 
+async function ensureAdsReportingTab() {
+  const tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
+  let tab = tabs.find((candidate) => candidate.url?.includes("/reporting"));
+
+  if (!tab) {
+    debugLog("🌐 [ADS-TAB] Opening Amazon Ads Reporting page...", "info");
+    extensionLogger?.logInfo("[ADS-TAB] Opening Amazon Ads Reporting page");
+    tab = await chrome.tabs.create({ url: `${ADS_BASE}/reporting`, active: true });
+  } else {
+    debugLog(`🌐 [ADS-TAB] Reusing Amazon Ads Reporting tab: ${tab.id}`, "info");
+    extensionLogger?.logInfo("[ADS-TAB] Reusing Amazon Ads Reporting tab", { tabId: tab.id });
+  }
+
+  return tab.id;
+}
+
 async function injectAdsMainWorldSniffer(tabId) {
   try {
     await chrome.scripting.executeScript({
@@ -2745,13 +741,19 @@ async function injectAdsMainWorldSniffer(tabId) {
           "amazon-advertising-api-marketplaceid": "adsMarketplaceId",
           "amazon-advertising-api-csrf-data": "adsCsrfData",
           "amazon-advertising-api-csrf-token": "adsCsrfToken",
+          "x-csrf-token": "adsReportingCsrfToken",
         };
 
         function normalizeHeaders(headers) {
           const out = {};
           if (!headers) return out;
           try {
-            if (headers instanceof Headers) {
+            if (typeof headers === "string") {
+              headers.split(/\r?\n/).forEach((line) => {
+                const separator = line.indexOf(":");
+                if (separator > 0) out[line.slice(0, separator).trim().toLowerCase()] = line.slice(separator + 1).trim();
+              });
+            } else if (headers instanceof Headers) {
               headers.forEach((v, k) => (out[String(k).toLowerCase()] = String(v)));
             } else if (Array.isArray(headers)) {
               headers.forEach(([k, v]) => (out[String(k).toLowerCase()] = String(v)));
@@ -2797,7 +799,13 @@ async function injectAdsMainWorldSniffer(tabId) {
               publish(merged);
             }
           } catch (_) { }
-          return nativeFetch.apply(this, arguments);
+          return nativeFetch.apply(this, arguments).then((response) => {
+            try {
+              const url = typeof input === "string" ? input : input?.url;
+              if (url && shouldCapture(url)) publish(response.headers);
+            } catch (_) { }
+            return response;
+          });
         };
 
         const nativeOpen = XMLHttpRequest.prototype.open;
@@ -2821,6 +829,7 @@ async function injectAdsMainWorldSniffer(tabId) {
           try {
             if (this.__apoAdsUrl && shouldCapture(this.__apoAdsUrl)) {
               publish(this.__apoAdsHeaders || {});
+              this.addEventListener("loadend", () => publish(this.getAllResponseHeaders()));
             }
           } catch (_) { }
           return nativeSend.apply(this, arguments);
@@ -3002,249 +1011,443 @@ async function fetchAdsJsonCS(payload, options = {}) {
   throw lastError || new Error("retrieveReport failed after auth retry");
 }
 
-function buildCampaignSpendPayload({
-  startDate,
-  endDate,
-  size,
-  offset,
-  timeUnit = "DAILY",
-  isCheckCampain = false,
-}) {
-  const valueFilter = isCheckCampain
-    ? ["ENABLED", "PAUSED"]
-    : ["ENABLED", "PAUSED", "ARCHIVED"];
-  return {
-    reportConfig: {
-      reportId: "CrossProgramCampaignReport",
-      currencyOfView: "USD",
-      endDate,
-      fields: ["campaignName", "spend", "state"],
-      filter: {
-        and: [
-          {
-            comparisonOperator: "IN",
-            field: "state",
-            not: false,
-            values: valueFilter,
-          },
-        ],
-      },
-      offsetPagination: { size, offset },
-      startDate,
-      timeUnits: [timeUnit],
-    },
-  };
+async function adsReportingViaContentScript(operation, payload, options = {}) {
+  const tabId = await ensureAdsReportingTab();
+  await ensureAdsBridgeInjected(tabId);
+  const response = await chrome.tabs.sendMessage(tabId, {
+    type: 'ADS_REPORTING_REQUEST',
+    operation,
+    payload,
+    options,
+  });
+  if (!response?.ok) throw createAdsError(response?.message || `Amazon Ads ${operation} failed`, response?.status || 0);
+  return response.data;
 }
 
-async function fetchAllCampaignSpend(
-  startDate,
-  endDate,
-  pageSize = 300,
-  isCheckCampain = false,
-  options = {}
-) {
-  // Initialize logger if not exists
-  if (!extensionLogger) {
-    await initializeLogger();
-  }
+function reportConfigurations(response) {
+  return response?.reportConfigurations || response?.data?.reportConfigurations || [];
+}
 
-  // Log Amazon Ads API request start
-  if (extensionLogger) {
-    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Starting Amazon Ads API request', {
-      startDate: startDate,
-      endDate: endDate,
-      pageSize: pageSize,
-      isCheckCampain: isCheckCampain,
-      endpoint: 'Amazon Ads Campaign Spend API',
-      timestamp: new Date().toISOString()
-    });
-  }
+async function createAndRunAdsReport(reportDate, lock) {
+  const { adsAdvertiserId } = await getCfg();
+  const queryPayload = { maxResults: 50, sort: [{ by: 'latestScheduledReportLastUpdatedDateTime', direction: 'DESCENDING' }] };
+  const templates = reportConfigurations(await adsReportingViaContentScript('QUERY_CONFIGURATIONS', queryPayload, lock));
+  const template = findCsvReportTemplate(templates);
+  if (!template) throw new Error('Amazon Ads CSV report template is unavailable. Create a Campaign report with Campaign name and Total cost first.');
 
+  const accountId = adsAdvertiserId || template.linkedAccounts?.[0]?.advertiserAccountId;
+  if (!accountId) throw new Error('Amazon Ads advertiser account is unavailable. Open the Campaign Manager tab and try again.');
+  const created = await adsReportingViaContentScript('CREATE_CONFIGURATION', {
+    accessRequestedAccounts: [{ advertiserAccountId: accountId }],
+    reportConfigurations: [buildOneOffReportConfig(template, reportDate)],
+  }, lock);
+  const configurationId = reportConfigurationId(created);
+  if (!configurationId) throw new Error('Amazon Ads did not return a report configuration ID.');
+
+  await adsReportingViaContentScript('RUN_CONFIGURATION', {
+    accessRequestedAccounts: [{ advertiserAccountId: accountId }],
+    scheduledReports: [{ reportConfigurationId: configurationId }],
+  }, lock);
+  return configurationId;
+}
+
+async function waitForAdsReport(configurationId, lock) {
+  const queryPayload = { maxResults: 50, sort: [{ by: 'latestScheduledReportLastUpdatedDateTime', direction: 'DESCENDING' }] };
+  for (let attempt = 1; attempt <= REPORT_POLL_MAX_ATTEMPTS; attempt += 1) {
+    const configurations = reportConfigurations(await adsReportingViaContentScript('QUERY_CONFIGURATIONS', queryPayload, lock));
+    const report = configurations.find((item) => item.reportConfigurationId === configurationId);
+    const status = report?.latestScheduledReportStatus;
+    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Amazon Ads report polling', { attempt, maxAttempts: REPORT_POLL_MAX_ATTEMPTS, status: status || 'PENDING' });
+    if (status === 'COMPLETED') return report;
+    if (shouldFailReportStatus(status)) throw new Error(`Amazon Ads report ${String(status).toLowerCase()}.`);
+    if (isTerminalReportStatus(status)) throw new Error(`Amazon Ads report ${String(status).toLowerCase()}.`);
+    if (attempt < REPORT_POLL_MAX_ATTEMPTS) await delayMs(REPORT_POLL_INTERVAL_MS);
+  }
+  throw new Error('Amazon Ads report did not complete within three minutes.');
+}
+
+async function downloadAdsReportCsv(configurationId, lock) {
+  const tabId = await ensureAdsReportingTab();
+  await ensureAdsBridgeInjected(tabId);
+  const response = await chrome.tabs.sendMessage(tabId, { type: 'ADS_DOWNLOAD_LATEST_REPORT', configurationId, options: lock });
+  if (!response?.downloadUrl) throw new Error(response?.message || 'Amazon Ads Download latest is unavailable. Open the Amazon Reporting tab and try again.');
   try {
-    const firstJson = await fetchAdsJsonCS(
-      buildCampaignSpendPayload({
-        startDate,
-        endDate,
-        size: Math.max(1, Math.min(pageSize, 300)),
-        offset: 0,
-        isCheckCampain,
-      }),
-      { ...options, isCheckCampain, pageOffset: 0, pageSize: Math.max(1, Math.min(pageSize, 300)) }
-    );
+    const download = await fetch(response.downloadUrl);
+    if (!download.ok) throw new Error(`Amazon Ads CSV download failed (${download.status}).`);
+    return await download.blob();
+  } finally {
+    response.downloadUrl = null;
+  }
+}
 
-    const report0 = firstJson?.report || firstJson?.data?.report || {};
-    const count = report0?.numberOfRecords ?? 0;
-    const rows1 = Array.isArray(report0?.data) ? report0.data : [];
+async function runExportAdsSpend({ dateFrom, dateTo }) {
+  if ((await getCfg()).ingestUrl !== DEFAULT_ENVIRONMENTS.development.ingestUrl) throw new Error("Ads import is restricted to Development");
+  return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked({ dateFrom, dateTo }, lock));
+}
 
-    // Log first page results
-    if (extensionLogger) {
-      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Amazon Ads API first page response', {
-        totalRecords: count,
-        firstPageRows: rows1.length,
-        startDate: startDate,
-        endDate: endDate,
-        timestamp: new Date().toISOString()
+async function fetchTransactionsCsvFromAmazon({ dateFrom, dateTo }) {
+  return fetchAmazonTransactionsCsv({ dateFrom, dateTo });
+}
+
+async function sha256Key(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  return `sha256:${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+}
+
+const financeImportSleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function waitForFinanceImport({ base, batchId, token, context, kind = 'Finance' }) {
+  let delay = 2000;
+  let lastStatus = null;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const response = await getJson(`${base}/api/finance/import-batches/${batchId}`, token);
+    const batch = response?.data || response;
+    const recalcStatus = batch.recalculationStatus || "NOT_REQUIRED";
+    const combinedStatus = `${batch.status}:${recalcStatus}`;
+    if (combinedStatus !== lastStatus) {
+      lastStatus = combinedStatus;
+      await extensionLogger.logInfo(`${kind} import status updated`, {
+        ...context, batchId, status: batch.status, recalculationStatus: recalcStatus,
       });
     }
-
-    if (count === 0 || rows1.length === 0) {
-      // Log no data found
-      if (extensionLogger) {
-        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] No campaign spend data found', {
-          startDate: startDate,
-          endDate: endDate,
-          totalRecords: count,
-          timestamp: new Date().toISOString()
-        });
+    if (["COMPLETED", "PARTIAL_FAILED", "FAILED"].includes(batch.status)) {
+      if (batch.status === "COMPLETED" && ["PROCESSING"].includes(recalcStatus)) {
+        await financeImportSleep(delay);
+        delay = Math.min(delay + 1000, 10000);
+        continue;
       }
-      return [];
+      if (batch.status !== "COMPLETED") throw new Error(`${kind} import ${batch.status.toLowerCase()}`);
+      if (recalcStatus === "PARTIAL_FAILED") throw new Error(`${kind} profit recalculation partially failed`);
+      return batch;
     }
+    await financeImportSleep(delay);
+    delay = Math.min(delay + 1000, 10000);
+  }
+  throw new Error(`${kind} import polling timed out`);
+}
 
-    const totalPages = Math.ceil(count / pageSize);
-    let all = rows1;
-
-    // Log pagination info
-    if (extensionLogger && totalPages > 1) {
-      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Fetching additional pages from Amazon Ads API', {
-        totalPages: totalPages,
-        totalRecords: count,
-        pageSize: pageSize,
-        startDate: startDate,
-        endDate: endDate,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    for (let page = 1; page < totalPages; page++) {
-      const js = await fetchAdsJsonCS(
-        buildCampaignSpendPayload({
-          startDate,
-          endDate,
-          size: pageSize,
-          offset: page * pageSize,
-          isCheckCampain,
-        }),
-        { ...options, isCheckCampain, pageOffset: page * pageSize, pageSize }
-      );
-      const report = js?.report || js?.data?.report || {};
-      const more = Array.isArray(report?.data) ? report.data : [];
-
-      // Log each page fetch
-      if (extensionLogger) {
-        await extensionLogger.logInfo(`[IMPORT_ADS_SPEND] Amazon Ads API page ${page + 1}/${totalPages} response`, {
-          pageRows: more.length,
-          totalFetched: all.length + more.length,
-          totalRecords: count,
-          timestamp: new Date().toISOString()
-        });
+async function extractSettlementDownloadCandidates({ dateFrom, dateTo, autoDiscover = false } = {}) {
+  const diagnostics = { elementCount: 0, downloadElementCount: 0, rowFound: false, controlCount: 0, toggleFound: false, referenceIdFound: false };
+  const allElements = (root) => {
+    const elements = [];
+    const visit = (node) => {
+      for (const element of node.querySelectorAll('*')) {
+        elements.push(element);
+        if (element.shadowRoot) visit(element.shadowRoot);
       }
+    };
+    visit(root);
+    return elements;
+  };
 
-      if (!more.length) break;
-      all = all.concat(more);
-    }
+  const collect = () => {
+    const elements = allElements(document);
+    diagnostics.elementCount = elements.length;
+    const links = elements.filter((element) => {
+      const attributes = ['href', 'data-href', 'data-url', 'onclick'];
+      return attributes.some((attribute) => String(element.getAttribute(attribute) || '').includes('/payments/reports/download'));
+    });
+    diagnostics.downloadElementCount = links.length;
+    return links.map((link) => {
+      const raw = link.href || link.getAttribute('href') || link.getAttribute('data-href') || link.getAttribute('data-url') || link.getAttribute('onclick') || '';
+      const href = raw.match(/(?:https?:\/\/[^'"\s]+)?\/payments\/reports\/download[^'"\s)]*/)?.[0] || raw;
+      let isFlatFileV2 = false;
+      try {
+        const url = new URL(href, location.href);
+        isFlatFileV2 = url.searchParams.get('contentType') === 'text/xls'
+          && /\.txt$/i.test(url.searchParams.get('fileName') || '');
+      } catch { /* Ignore malformed links; they are filtered below. */ }
+      const row = link.closest('tr,[role="row"]') || (() => {
+        let node = link.parentElement;
+        for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+          if ((node.innerText || '').match(/\d{1,2}\/\d{1,2}\/\d{4}/g)?.length >= 2) return node;
+        }
+        return link.parentElement;
+      })();
+      return {
+        href,
+        isFlatFileV2,
+        periodText: row?.innerText || link.parentElement?.innerText || '',
+      };
+    }).filter((candidate) => candidate.href && candidate.isFlatFileV2);
+  };
 
-    const processedData = all.map((r) => ({
-      campaignName: r.campaignName ?? "",
-      date: startDate,
-      spend: Number(r.spend ?? 0),
-      state: r.state ?? "",
-    }));
+  const existing = collect();
+  if (existing.length && !autoDiscover) return { candidates: existing, diagnostics };
+  if ((!dateFrom || !dateTo) && !autoDiscover) return { candidates: existing, diagnostics };
+  if (!dateFrom || !dateTo) {
+    const rows = allElements(document)
+      .filter((candidate) => candidate.matches('tr,[role="row"]') && !/\bPresent\b/i.test(candidate.innerText || ''))
+      .map((row) => {
+        const dates = ((row.innerText || '').match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || []).map((value) => {
+          const [month, day, year] = value.split('/');
+          return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        });
+        return { row, dates };
+      })
+      .filter(({ row, dates }) => dates.length >= 2 && allElements(row).some((element) => element.matches('kat-dropdown-button')))
+      .sort((left, right) => right.dates[1].localeCompare(left.dates[1]));
+    if (!rows.length) return { candidates: existing, diagnostics };
+    [dateFrom, dateTo] = rows[0].dates;
+  }
 
-    // Log successful completion
-    if (extensionLogger) {
-      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Amazon Ads API data fetch completed', {
-        totalCampaigns: processedData.length,
-        totalSpend: processedData.reduce((sum, r) => sum + r.spend, 0),
-        startDate: startDate,
-        endDate: endDate,
-        pagesProcessed: totalPages,
-        timestamp: new Date().toISOString()
+  const dates = [dateFrom, dateTo];
+  // ponytail: one DOM scan per manual import; add a page-specific adapter only if Amazon virtualizes these rows.
+  const periodCandidates = allElements(document)
+    .filter((candidate) => {
+      const matches = (candidate.innerText || '').match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || [];
+      const normalized = matches.map((value) => {
+        const [month, day, year] = value.split('/');
+        return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
       });
-    }
+      return normalized.length >= 2 && dates.every((date) => normalized.includes(date));
+    })
+    .sort((left, right) => (left.innerText || '').length - (right.innerText || '').length);
+  const row = periodCandidates.find((candidate) => allElements(candidate).some((element) => element.matches('kat-dropdown-button')))
+    || periodCandidates.find((candidate) => allElements(candidate).some((element) => element.matches('button,[role="button"],a,[data-action],[data-testid]')));
+  diagnostics.rowFound = !!row;
+  if (!row) return { candidates: existing, diagnostics };
 
-    return processedData;
+  const controls = allElements(row).filter((element) => {
+    const classes = String(element.className || '').toLowerCase();
+    return element.matches('button,[role="button"],[aria-haspopup],[aria-expanded],[data-action],[data-testid]')
+      || /dropdown|menu|caret|down-arrow/.test(classes);
+  });
+  const dropdownHost = allElements(row).find((element) => element.matches('kat-dropdown-button'));
+  const dropdownElements = dropdownHost?.shadowRoot
+    ? [dropdownHost, ...allElements(dropdownHost.shadowRoot)]
+    : [];
+  const actionButton = dropdownElements.find((element) => element.matches('button[data-action]'));
+  const referenceId = actionButton?.getAttribute('data-action') || '';
+  if (/^\d+$/.test(referenceId)) {
+    const href = new URL('/payments/reports/download', location.origin);
+    href.searchParams.set('referenceId', referenceId);
+    href.searchParams.set('contentType', 'text/xls');
+    href.searchParams.set('fileName', `${referenceId}.txt`);
+    href.searchParams.set('ref_', 'xx_myp_allstmts_download');
+    diagnostics.referenceIdFound = true;
+    return {
+      candidates: [{ href: href.href, isFlatFileV2: true, periodText: row.innerText || '' }],
+      diagnostics,
+    };
+  }
+  const dropdownHeader = dropdownHost?.shadowRoot?.querySelector('.button-group-header');
+  diagnostics.controlCount = controls.length + dropdownElements.length;
+  const toggle = controls.find((control) => {
+    const label = `${control.getAttribute('aria-label') || ''} ${control.getAttribute('title') || ''} ${control.textContent || ''}`.toLowerCase();
+    const classes = String(control.className || '').toLowerCase();
+    return control.hasAttribute('aria-haspopup') || /dropdown|menu|caret|down-arrow/.test(`${label} ${classes}`);
+  }) || dropdownElements.find((element) => {
+    const label = `${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''} ${element.textContent || ''} ${element.getAttribute('part') || ''} ${element.className || ''}`.toLowerCase();
+    return element.hasAttribute('aria-haspopup') || element.hasAttribute('aria-expanded') || /dropdown|menu|caret|down-arrow/.test(label);
+  }) || dropdownElements.filter((element) => element.matches('button,[role="button"]')).at(-1) || dropdownHeader || dropdownHost;
+  diagnostics.toggleFound = !!toggle;
+  if (!toggle) return { candidates: existing, diagnostics };
+  toggle.click();
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  return { candidates: collect(), diagnostics };
+}
 
+function settlementPeriodDates(periodText) {
+  const dates = (periodText.match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || []).map((value) => {
+    const [month, day, year] = value.split('/');
+    return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  });
+  return dates.length >= 2 ? { dateFrom: dates[0], dateTo: dates[1] } : null;
+}
+
+async function ensureSettlementStatementsTab() {
+  const tabs = await chrome.tabs.query({ url: `${SC_BASE}/payments/*` });
+  const statementTabs = tabs.filter((candidate) => candidate.url?.includes('/payments/past-settlements'));
+  const [focusedTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  let tab = (focusedTab?.url?.includes('/payments/past-settlements') ? focusedTab : null)
+    || statementTabs.find((candidate) => candidate.active)
+    || statementTabs[0];
+  if (!tab) tab = await chrome.tabs.create({ url: ALL_STATEMENTS_URL, active: false });
+  if (!tab?.id) throw new Error('SELLER_CENTRAL_AUTH_REQUIRED: Amazon All Statements could not be opened');
+  await waitForTabComplete(tab.id, 'Amazon All Statements did not finish loading');
+  const loaded = await chrome.tabs.get(tab.id);
+  if (!loaded.url?.includes('/payments/past-settlements')) {
+    throw new Error('SELLER_CENTRAL_AUTH_REQUIRED: Sign in to Seller Central on the VPS, then retry');
+  }
+  await delayMs(750);
+  return loaded;
+}
+
+async function findSettlementDownload({ dateFrom, dateTo, autoDiscover = false } = {}) {
+  const tab = await ensureSettlementStatementsTab();
+
+  let execution;
+  try {
+    execution = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: extractSettlementDownloadCandidates,
+      args: [autoDiscover ? { dateFrom, dateTo, autoDiscover } : { dateFrom, dateTo }],
+    });
   } catch (error) {
-    // Log Amazon Ads API error
-    if (extensionLogger) {
-      await extensionLogger.logError(error, {
-        startDate: startDate,
-        endDate: endDate,
-        pageSize: pageSize,
-        isCheckCampain: isCheckCampain,
-        endpoint: 'Amazon Ads Campaign Spend API'
-      }, '[IMPORT_ADS_SPEND] Amazon Ads API request failed');
-    }
+    throw new Error(`Cannot inspect Amazon All Statements: ${error?.message || String(error)}`);
+  }
+  const inspected = execution?.[0]?.result || {};
+  const candidates = Array.isArray(inspected) ? inspected : inspected.candidates || [];
+  if (!candidates.length) {
+    const diagnostics = Array.isArray(inspected) ? {} : inspected.diagnostics || {};
+    throw new Error(`No settlement download link found${dateFrom && dateTo ? ` for ${dateFrom} to ${dateTo}` : ''}. DOM elements=${diagnostics.elementCount || 0}, download nodes=${diagnostics.downloadElementCount || 0}, row=${diagnostics.rowFound ? 'yes' : 'no'}, controls=${diagnostics.controlCount || 0}, toggle=${diagnostics.toggleFound ? 'yes' : 'no'}, referenceId=${diagnostics.referenceIdFound ? 'yes' : 'no'}`);
+  }
+  const selected = autoDiscover ? candidates[0] : selectSettlementDownload(candidates, { dateFrom, dateTo });
+  const period = settlementPeriodDates(selected.periodText || '');
+  if (autoDiscover && !period) throw new Error('Settlement period could not be read from Amazon All Statements');
+  const url = new URL(selected.href);
+  if (url.origin !== SC_BASE || url.pathname !== '/payments/reports/download') {
+    throw new Error('Amazon settlement download link is not trusted');
+  }
+  return { ...selected, href: url.href, referenceId: getSettlementReferenceId(url.href), tabId: tab.id, ...(period || {}) };
+}
+
+async function fetchSettlementsTxtFromAmazon({ dateFrom, dateTo, descriptor: providedDescriptor } = {}) {
+  const descriptor = providedDescriptor || await findSettlementDownload({ dateFrom, dateTo });
+  const response = await fetch(descriptor.href, { credentials: 'include' });
+  if (!response.ok) throw new Error(`Amazon settlement download failed (${response.status})`);
+  const text = await response.text();
+  const summary = validateSettlementText(text);
+  return { ...descriptor, text, summary };
+}
+
+async function readSettlementImportHistory() {
+  const stored = await chrome.storage.local.get(SETTLEMENT_IMPORT_HISTORY_KEY);
+  return stored[SETTLEMENT_IMPORT_HISTORY_KEY] || {};
+}
+
+async function writeSettlementImportHistory(history) {
+  await chrome.storage.local.set({ [SETTLEMENT_IMPORT_HISTORY_KEY]: history });
+}
+
+async function recordSettlementImport(referenceId, entry) {
+  const history = await readSettlementImportHistory();
+  history[referenceId] = { ...history[referenceId], ...entry };
+  await writeSettlementImportHistory(history);
+}
+
+async function runImportTransactions({ dateFrom, dateTo } = {}) {
+  const { ingestUrl, ingestToken, marketplaceCode } = await getCfg();
+  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
+  if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
+
+  const context = { dateFrom, dateTo, taskId: `transactions_${dateFrom}_${dateTo}` };
+  await extensionLogger.logTaskProcessing(context, 'Transaction task started');
+  try {
+    const { transactionsImportUrl } = deriveApiUrls(ingestUrl);
+    const csv = await fetchTransactionsCsvFromAmazon({ dateFrom, dateTo });
+    const idempotencyKey = await sha256Key(`TRANSACTIONS|${dateFrom}|${dateTo}|${csv}`);
+    const result = await postFileTo(transactionsImportUrl, {
+      salesChannelCode: "AMAZON",
+      marketplaceCode: marketplaceCode || "US",
+      dryRun: "false",
+      sourceRef: `transactions-${dateFrom}-${dateTo}.csv`,
+      file: { name: `transactions-${dateFrom}-${dateTo}.csv`, text: csv },
+    }, ingestToken, { idempotencyKey });
+    const batchId = result?.data?.importBatchId;
+    const completed = batchId ? await waitForFinanceImport({
+      base: deriveApiUrls(ingestUrl).base,
+      batchId,
+      token: ingestToken,
+      context,
+      kind: 'Transaction',
+    }) : result;
+    await extensionLogger.logTaskCompleted(context, completed, 'Transaction task completed');
+    return completed;
+  } catch (error) {
+    await extensionLogger.logTaskFailed(context, error, 'Transaction task failed');
     throw error;
   }
 }
 
-function csvCell(value) {
-  const text = String(value ?? "");
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDescriptor } = {}) {
+  if (settlementImportLock.running) {
+    throw new Error('Settlement import already running; wait for the current import to finish');
+  }
+  const { ingestUrl, ingestToken, marketplaceCode } = await getCfg();
+  if (!ingestUrl || !ingestToken) throw new Error("Missing ingestUrl or ingestToken (Options)");
+
+  settlementImportLock.running = true;
+  let referenceId = null;
+  let context = { dateFrom: dateFrom || null, dateTo: dateTo || null, taskId: 'settlements_scheduled' };
+  try {
+    const descriptor = providedDescriptor || await findSettlementDownload({ dateFrom, dateTo });
+    const resolvedDateFrom = dateFrom || descriptor.dateFrom;
+    const resolvedDateTo = dateTo || descriptor.dateTo;
+    if (!resolvedDateFrom || !resolvedDateTo) throw new Error("dateFrom and dateTo are required");
+    context = { dateFrom: resolvedDateFrom, dateTo: resolvedDateTo, taskId: `settlements_${resolvedDateFrom}_${resolvedDateTo}` };
+    await extensionLogger.logTaskProcessing(context, 'Settlement task started');
+    referenceId = descriptor.referenceId;
+    const { settlementsImportUrl, base } = deriveApiUrls(ingestUrl);
+    const completion = await getJson(
+      `${base}/api/finance/imports/settlements/${encodeURIComponent(referenceId)}/completed`,
+      ingestToken,
+    );
+    const completedSkip = settlementImportDecision({
+      completed: completion?.data?.completed === true,
+      referenceId,
+    });
+    if (completedSkip) {
+      await extensionLogger.logTaskCompleted(context, completedSkip, 'Settlement task skipped (already imported)');
+      return completedSkip;
+    }
+    const history = await readSettlementImportHistory();
+    const previous = history[referenceId];
+    if (previous?.status === 'COMPLETED' && previous.batchId) {
+      const skipped = { ok: true, skipped: true, reason: 'SETTLEMENT_ALREADY_IMPORTED', referenceId, batchId: previous.batchId };
+      await extensionLogger.logTaskCompleted(context, skipped, 'Settlement task skipped (already imported)');
+      return skipped;
+    }
+    if (previous?.status === 'PROCESSING' && previous.batchId) {
+      const skipped = { ok: true, skipped: true, reason: 'SETTLEMENT_ALREADY_PROCESSING', referenceId, batchId: previous.batchId };
+      await extensionLogger.logTaskCompleted(context, skipped, 'Settlement task skipped (already processing)');
+      return skipped;
+    }
+    if (!canStartSettlementImport(previous)) {
+      const skipped = { ok: true, skipped: true, reason: 'SETTLEMENT_COOLDOWN', referenceId, retryAfterMs: SETTLEMENT_IMPORT_COOLDOWN_MS };
+      await extensionLogger.logTaskCompleted(context, skipped, 'Settlement task skipped (cooldown)');
+      return skipped;
+    }
+
+    await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'FETCHING', dateFrom: resolvedDateFrom, dateTo: resolvedDateTo });
+    const { text, summary } = await fetchSettlementsTxtFromAmazon({ dateFrom: resolvedDateFrom, dateTo: resolvedDateTo, descriptor });
+    const idempotencyKey = await sha256Key(`SETTLEMENTS|${referenceId}|${text}`);
+    const result = await postFileTo(settlementsImportUrl, {
+      salesChannelCode: "AMAZON",
+      marketplaceCode: marketplaceCode || "US",
+      dryRun: "false",
+      sourceRef: `settlements-${referenceId}.txt`,
+      file: { name: `settlements-${referenceId}.txt`, text },
+    }, ingestToken, { idempotencyKey });
+    const batchId = result?.data?.importBatchId;
+    await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'PROCESSING', batchId, rowCount: summary.rowCount });
+    const completed = batchId ? await waitForFinanceImport({
+      base,
+      batchId,
+      token: ingestToken,
+      context: { ...context, referenceId },
+      kind: 'Settlement',
+    }) : result;
+    await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'COMPLETED', batchId, rowCount: summary.rowCount });
+    await extensionLogger.logTaskCompleted(context, completed, 'Settlement task completed');
+    return { ...completed, referenceId, rowCount: summary.rowCount };
+  } catch (error) {
+    if (referenceId) await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'FAILED', error: error?.message || String(error) });
+    await extensionLogger.logTaskFailed(context, error, 'Settlement task failed');
+    throw error;
+  } finally {
+    settlementImportLock.running = false;
+  }
 }
 
-function campaignRowsToCsv(rows) {
-  const header = "Date,Campaign Name,Spend";
-  const lines = rows.map((r) =>
-    [
-      r.date,
-      r.campaignName,
-      r.spend,
-    ].map(csvCell).join(",")
-  );
-  return [header, ...lines].join("\n");
+async function runScheduledSettlementImport() {
+  const descriptor = await findSettlementDownload({ autoDiscover: true });
+  return runImportSettlements({ dateFrom: descriptor.dateFrom, dateTo: descriptor.dateTo, descriptor });
 }
 
-async function runExportAdsSpend(date) {
-  return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked(date, lock));
-}
-
-async function fetchTransactionsCsvFromAmazon() {
-  throw new Error("Amazon Transactions export is not implemented yet");
-}
-
-async function fetchSettlementsTxtFromAmazon() {
-  throw new Error("Amazon Settlements export is not implemented yet");
-}
-
-async function runImportTransactions({ dateFrom, dateTo } = {}) {
-  const { ingestUrl, ingestToken, shopId, marketplaceCode } = await getCfg();
-  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
-  if (!shopId) throw new Error("Missing shopId (Options)");
-  if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
-
-  const { transactionsImportUrl } = deriveApiUrls(ingestUrl);
-  const csv = await fetchTransactionsCsvFromAmazon({ dateFrom, dateTo });
-  return postFileTo(transactionsImportUrl, {
-    shopId,
-    salesChannelCode: "AMAZON",
-    marketplaceCode: marketplaceCode || "US",
-    dryRun: "false",
-    sourceRef: `transactions-${dateFrom}-${dateTo}.csv`,
-    file: { name: `transactions-${dateFrom}-${dateTo}.csv`, text: csv },
-  }, ingestToken);
-}
-
-async function runImportSettlements({ dateFrom, dateTo } = {}) {
-  const { ingestUrl, ingestToken, shopId, marketplaceCode } = await getCfg();
-  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
-  if (!shopId) throw new Error("Missing shopId (Options)");
-  if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
-
-  const { settlementsImportUrl } = deriveApiUrls(ingestUrl);
-  const text = await fetchSettlementsTxtFromAmazon({ dateFrom, dateTo });
-  return postFileTo(settlementsImportUrl, {
-    shopId,
-    salesChannelCode: "AMAZON",
-    marketplaceCode: marketplaceCode || "US",
-    dryRun: "false",
-    sourceRef: `settlements-${dateFrom}-${dateTo}.txt`,
-    file: { name: `settlements-${dateFrom}-${dateTo}.txt`, text },
-  }, ingestToken);
-}
-
-async function runExportAdsSpendLocked(date, lock = {}) {
+async function runExportAdsSpendLocked({ dateFrom, dateTo }, lock = {}) {
   const startTime = Date.now();
 
   // Initialize logger if not exists
@@ -3257,20 +1460,20 @@ async function runExportAdsSpendLocked(date, lock = {}) {
     await extensionLogger.logTaskProcessing({
       taskId: `ads_export_${Date.now()}`,
       taskType: 'IMPORT_ADS_SPEND',
-      batchId: `ads_${date}`,
+      batchId: `ads_${dateFrom}_${dateTo}`,
       ordersCount: 0,
-      filename: `ads-spend-${date}.csv`
-    }, `[IMPORT_ADS_SPEND] Starting ads spend export for date: ${date}`);
+      filename: `ads-spend-${dateFrom}-${dateTo}.csv`
+    }, `[IMPORT_ADS_SPEND] Starting ads spend export for ${dateFrom} to ${dateTo}`);
   }
 
-  const { ingestUrl, ingestToken, shopId, marketplaceCode } = await getCfg();
+  const { ingestUrl, ingestToken, marketplaceCode } = await getCfg();
   if (!ingestUrl) {
     const error = new Error("Missing ingestUrl (Options)");
     if (extensionLogger) {
       await extensionLogger.logTaskFailed({
         taskId: `ads_export_${startTime}`,
         taskType: 'IMPORT_ADS_SPEND',
-        batchId: `ads_${date}`
+        batchId: `ads_${dateFrom}_${dateTo}`
       }, error, '[IMPORT_ADS_SPEND] Ads export failed: Missing ingestUrl');
     }
     throw error;
@@ -3279,60 +1482,39 @@ async function runExportAdsSpendLocked(date, lock = {}) {
   const { adsSpendUrl } = deriveApiUrls(ingestUrl);
 
   // Đảm bảo Ads headers còn hạn trước khi gọi Ads API
-  await ensureFreshAdsHeaders({ ...lock, reason: "runExportAdsSpend" });
+  await ensureFreshAdsReportingHeaders();
 
-  if (!date) {
-    const error = new Error("date (YYYY-MM-DD) required");
+  if (!dateFrom || !dateTo) {
+    const error = new Error("dateFrom and dateTo (YYYY-MM-DD) are required");
     if (extensionLogger) {
       await extensionLogger.logTaskFailed({
         taskId: `ads_export_${startTime}`,
         taskType: 'IMPORT_ADS_SPEND',
-        batchId: `ads_${date}`
+        batchId: `ads_${dateFrom}_${dateTo}`
       }, error, '[IMPORT_ADS_SPEND] Ads export failed: Missing date parameter');
     }
     throw error;
   }
   try {
-    // Log fetching campaign data
-    if (extensionLogger) {
-      await extensionLogger.logInfo('Lấy dữ liệu chi phí campaign từ Amazon', {
-        date: date,
-        endpoint: 'Amazon Ads API',
-        timestamp: new Date().toISOString()
-      });
-    }
+    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Creating one-time Amazon Reporting CSV', { dateFrom, dateTo });
+    const configurationId = await createAndRunAdsReport(dateFrom, lock);
+    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Amazon Reporting CSV requested', { dateFrom, dateTo });
+    await waitForAdsReport(configurationId, lock);
+    const csv = await downloadAdsReportCsv(configurationId, lock);
+    const filename = `ads-report-${dateFrom}.csv`;
 
-    const rows = await fetchAllCampaignSpend(date, date, 300, false, lock);
-
-    // Log data processing
-    if (extensionLogger) {
-      await extensionLogger.logInfo('Xử lý dữ liệu chi phí campaign', {
-        rowCount: rows.length,
-        date: date,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    const csv = campaignRowsToCsv(rows);
-
-    // Log uploading to backend
-    if (extensionLogger) {
-      await extensionLogger.logInfo('Upload dữ liệu chi phí quảng cáo lên backend', {
-        url: adsSpendUrl,
-        fileSize: csv.length,
-        rowCount: rows.length,
-        filename: `ads-spend-${date}.csv`,
-        timestamp: new Date().toISOString()
-      });
-    }
+    await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Uploading original Amazon Reporting CSV', {
+      fileSize: csv.size,
+      filename,
+    });
 
     const ingestRes = await postFileTo(adsSpendUrl, {
-      shopId,
       salesChannelCode: "AMAZON",
       marketplaceCode: marketplaceCode || "US",
       dryRun: "false",
-      sourceRef: `ads-spend-${date}.csv`,
-      file: { name: `ads-spend-${date}.csv`, text: csv },
+      sourceRef: filename,
+      filename,
+      file: csv,
     }, ingestToken);
 
     const endTime = Date.now();
@@ -3342,17 +1524,17 @@ async function runExportAdsSpendLocked(date, lock = {}) {
       await extensionLogger.logTaskCompleted({
         taskId: `ads_export_${startTime}`,
         taskType: 'IMPORT_ADS_SPEND',
-        batchId: `ads_${date}`,
-        ordersCount: rows.length,
-        filename: `ads-spend-${date}.csv`
+        batchId: `ads_${dateFrom}_${dateTo}`,
+        ordersCount: 0,
+        filename
       }, {
         duration: endTime - startTime,
         memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
         cpuUsage: 0
-      }, `Xuất chi phí quảng cáo hoàn thành thành công cho ${date}`);
+      }, `Xuất chi phí quảng cáo hoàn thành thành công cho ${dateFrom} đến ${dateTo}`);
     }
 
-    return { ok: true, rows: rows.length, ingest: ingestRes };
+    return { ok: true, rows: ingestRes?.data?.rowCount || 0, ingest: ingestRes };
 
   } catch (error) {
     // Log task failed
@@ -3360,3163 +1542,91 @@ async function runExportAdsSpendLocked(date, lock = {}) {
       await extensionLogger.logTaskFailed({
         taskId: `ads_export_${startTime}`,
         taskType: 'IMPORT_ADS_SPEND',
-        batchId: `ads_${date}`,
+        batchId: `ads_${dateFrom}_${dateTo}`,
         ordersCount: 0,
-        filename: `ads-spend-${date}.csv`
-      }, error, `Xuất chi phí quảng cáo thất bại cho ${date}`);
+        filename: `ads-spend-${dateFrom}-${dateTo}.csv`
+      }, error, `Xuất chi phí quảng cáo thất bại cho ${dateFrom} đến ${dateTo}`);
     }
     throw error;
   }
 }
 
-/* ===============================
-   UPLOAD TRACKING - Upload file TXT lên Amazon
-   =============================== */
-
-function computeUploadTrackingChecksum(text = "") {
-  let hash = 5381;
-  const str = String(text || "");
-  for (let i = 0; i < str.length; i += 1) {
-    hash = ((hash << 5) + hash + str.charCodeAt(i)) >>> 0;
-  }
-  return hash.toString(16).padStart(8, "0");
+async function getBaseShopAndIdentity() { const config = await getCfg(); const { clientId, clientLabel } = await ensureIdentity(); return { base: deriveApiUrls(config.ingestUrl).base, clientId, clientLabel }; }
+async function gmailAdsDownloadKey(url) {
+  const bytes = new TextEncoder().encode(url);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((item) => item.toString(16).padStart(2, '0')).join('');
 }
-
-async function uploadToAmazon(fileObj, uploadParams = {}) {
-  const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
-  const startTime = Date.now();
-  const uploadTaskId = uploadParams?.taskId || uploadParams?.batchId || `upload_${startTime}`;
-  const uploadBatchId = uploadParams?.batchId || uploadTaskId;
-  let stableFileObj = fileObj;
-  let finalTsvHeader = "";
-  let finalTsvFirstDataLine = "";
-  let finalTsvLineCount = 0;
-  let finalTsvChecksum = "";
-  let finalTsvLength = 0;
-  let preflight = null;
-  let pageUploadResult = null;
-
-  if (!extensionLogger) await initializeLogger();
-
-  try {
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 00 uploadToAmazon entered", {
-      buildId: AMAZON_UPLOADFEED_BUILD_ID,
-      taskId: uploadTaskId,
-      batchId: uploadBatchId,
-      filename: stableFileObj?.name,
-      fileSize: stableFileObj?.size,
-    });
-
-    const originalTsv = typeof stableFileObj?.text === "function" ? await stableFileObj.text() : "";
-    const validatedTsv = validateConfirmShipmentTsv(originalTsv);
-    stableFileObj = new File([validatedTsv.content], stableFileObj.name, {
-      type: stableFileObj.type || "text/tab-separated-values; charset=utf-8",
-    });
-    const lineBreakAudit = auditTsvLineBreaks(validatedTsv.content);
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] ConfirmShipment TSV line break audit", {
-      hasCRLF: lineBreakAudit.hasCRLF,
-      crlfCount: lineBreakAudit.crlfCount,
-      lfCount: lineBreakAudit.lfCount,
-      lineCount: lineBreakAudit.lineCount,
-      headerLine: lineBreakAudit.headerLine,
-      firstDataLine: lineBreakAudit.firstDataLine,
-      headerDataConcatenated: lineBreakAudit.headerDataConcatenated,
-    }, lineBreakAudit.headerDataConcatenated ? "error" : "success");
-    if (lineBreakAudit.headerDataConcatenated) {
-      throw createAmazonUploadError(
-        "AMAZON_TSV_VALIDATION_FAILED",
-        "Confirm shipment TSV header and first data row are concatenated; missing newline after header.",
-        { lineBreakAudit }
-      );
-    }
-    await chrome.storage.local.set({
-      lastUploadTrackingFinalTsv: {
-        batchId: uploadBatchId,
-        taskId: uploadTaskId,
-        filename: stableFileObj.name,
-        content: validatedTsv.content,
-        contentJsonPreview: JSON.stringify(validatedTsv.content.slice(0, 500)),
-        lineBreakAudit,
-        rows: validatedTsv.rows,
-        tsvLength: validatedTsv.content.length,
-        tsvChecksum: computeUploadTrackingChecksum(validatedTsv.content),
-        createdAt: new Date().toISOString()
-      }
-    });
-    const finalLines = validatedTsv.content.replace(/\n$/, "").split(/\r?\n/);
-    finalTsvHeader = finalLines[0] || "";
-    finalTsvFirstDataLine = finalLines[1] || "";
-    finalTsvLineCount = finalLines.filter((line) => line.trim()).length;
-    finalTsvChecksum = computeUploadTrackingChecksum(validatedTsv.content);
-    finalTsvLength = validatedTsv.content.length;
-
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] ConfirmShipment ship-date audit", {
-      marketplaceTimeZone: AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE,
-      marketplaceToday: validatedTsv.marketplaceToday || formatDateYmdInTimeZone(new Date()),
-      finalTsvFirstDataLine,
-      shipDateFutureClampedRows: (validatedTsv.shipDateFutureClampedRows || []).join(","),
-    }, "info");
-
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 02 TSV validation complete", {
-      rows: validatedTsv.rows,
-      tsvLength: finalTsvLength,
-      tsvChecksum: finalTsvChecksum,
-      finalTsvHeader,
-      finalTsvFirstDataLine,
-    }, "success");
-
-    if (extensionLogger) {
-      await extensionLogger.logUploadStarted(
-        {
-          filename: stableFileObj.name,
-          fileSize: stableFileObj.size,
-          progress: 0,
-          carrier: uploadParams?.carrierCode,
-          shipMethod: uploadParams?.shipMethod,
-          ordersUploaded: 0,
-        },
-        {
-          taskId: uploadTaskId,
-          taskType: "UPLOAD_TRACKING",
-          batchId: uploadBatchId,
-        },
-        "Starting upload to Amazon Seller Central"
-      );
-    }
-
-    await postLogSingle({
-      base,
-      token: (await getCfg()).ingestToken,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: "auto",
-      level: "info",
-      message: `Starting upload to Amazon: ${stableFileObj.name}`,
-    });
-
-    preflight = await getSellerCentralUploadPagePreflight({ taskId: uploadTaskId, batchId: uploadBatchId });
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 07B Seller Central page preflight result", {
-      ok: preflight.ok,
-      tabId: preflight.tabId,
-      finalUrl: preflight.finalUrl,
-      pageTitle: preflight.pageTitle,
-      tabStatus: preflight.tabStatus,
-      feedsPage: preflight.feedsPage,
-      isLoginPage: preflight.isLoginPage,
-      isOtpPage: preflight.isOtpPage,
-      isCaptchaPage: preflight.isCaptchaPage,
-      isMarketplaceSelector: preflight.isMarketplaceSelector,
-      isSellerCentralPage: preflight.isSellerCentralPage,
-      allowUpload: preflight.allowUpload,
-      snifferInstalled: preflight.snifferInstalled,
-    }, preflight.allowUpload ? "success" : "error");
-
-    if (!preflight.allowUpload) {
-      throw createAmazonUploadError(
-        "AMAZON_AUTH_REQUIRED",
-        "Amazon Seller Central feeds page is not ready for upload. Log in, clear any OTP/captcha/marketplace selector, then retry.",
-        { preflight, retryable: true, userActionRequired: true }
-      );
-    }
-
-    const readiness = await getUploadFeedReadinessStatus({
-      skipSellerCentralPreflight: true,
-      preflight,
-    });
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed readiness before request", {
-      ok: readiness.ok,
-      sellerCentralReady: readiness.sellerCentralReady,
-      csrfCacheValid: readiness.csrfCacheValid,
-      csrfTokenFound: readiness.csrfTokenFound,
-      csrfTokenLength: readiness.csrfTokenLength,
-      csrfSource: readiness.csrfSource || "none",
-      csrfAgeMin: readiness.csrfAgeMin,
-      isTestToken: readiness.isTestToken,
-      needLogin: readiness.needLogin,
-      needCsrfSeed: readiness.needCsrfSeed,
-    }, readiness.ok ? "success" : "error");
-
-    if (!readiness.sellerCentralReady) {
-      throw createAmazonUploadError(
-        "AMAZON_AUTH_REQUIRED",
-        "Amazon Seller Central feeds page is not ready for upload. Log in, clear any OTP/captcha/marketplace selector, then retry.",
-        { preflight, retryable: true, userActionRequired: true }
-      );
-    }
-
-    if (!readiness.csrfCacheValid) {
-      if (readiness.csrfTokenFound) {
-        await clearUploadFeedCsrfCache("csrf_cache_invalid_before_upload", {
-          code: "AMAZON_UPLOAD_CSRF_SEED_REQUIRED",
-          status: 0,
-        });
-      }
-      throw createAmazonUploadError(
-        "AMAZON_UPLOAD_CSRF_SEED_REQUIRED",
-        "Open Seller Central feeds page and perform one manual upload to seed uploadFeed csrfToken.",
-        {
-          retryable: true,
-          userActionRequired: true,
-          event: "csrf_seed_required",
-        }
-      );
-    }
-
-    const cookieFlags = {
-      sessionId: !!(await getCookie(`${SC_BASE}/`, "session-id")),
-      sessionToken: !!(await getCookie(`${SC_BASE}/`, "session-token")),
-      ubidMain: !!(await getCookie(`${SC_BASE}/`, "ubid-main")),
-      csrfCookieFound: !!(await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z")),
-    };
-    if (!cookieFlags.sessionId || !cookieFlags.sessionToken) {
-      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] Seller Central tab preflight passed; continuing despite missing cookie API session flags", cookieFlags);
-    }
-
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 08 FormData contract expected", {
-      fields: "feedFile|feedName|feedVersion|csrfToken",
-      csrfExpected: true,
-      csrfHeaderIncluded: false,
-      finalTsvHeader,
-      finalTsvFirstDataLine,
-      finalTsvLineCount,
-      finalTsvChecksum,
-      finalTsvLength,
-      filename: stableFileObj.name,
-      fileSize: stableFileObj.size,
-    });
-
-    const requestStartTime = Date.now();
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 09 strategy selected", {
-      strategy: "sellerCentralTabPageContext",
-      csrfHeaderIncluded: false,
-      filename: stableFileObj.name,
-      fileSize: stableFileObj.size,
-      tsvChecksum: finalTsvChecksum,
-    });
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 10 request sending", {
-      strategy: "sellerCentralTabPageContext",
-      uploadPath: AMAZON_UPLOADFEED_URL_PATH,
-      filename: stableFileObj.name,
-    });
-
-    pageUploadResult = await uploadToAmazonFromSellerCentralTab(stableFileObj, uploadParams);
-    const requestDuration = Date.now() - requestStartTime;
-    const response = sellerCentralTabUploadResultToResponse(pageUploadResult);
-    const contentType = response.headers.get("content-type") || "";
-    const responseText = pageUploadResult?.textPreview || "";
-
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed FormData runtime result", {
-      fields: "feedFile|feedName|feedVersion|csrfToken",
-      csrfIncluded: !!pageUploadResult?.csrfIncluded,
-      csrfSource: pageUploadResult?.csrfSource || "none",
-      csrfTokenLength: pageUploadResult?.csrfTokenLength || 0,
-      liveExtractionFound: !!pageUploadResult?.liveExtractionFound,
-      cachedTokenFound: !!pageUploadResult?.cachedTokenFound,
-      snifferInstalled: !!pageUploadResult?.snifferInstalled,
-      world: pageUploadResult?.world,
-      status: response.status,
-    }, pageUploadResult?.csrfIncluded ? "success" : "error");
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 11 response received", {
-      status: response.status,
-      statusText: response.statusText,
-      contentType,
-      url: response.url,
-      requestDuration,
-      world: pageUploadResult?.world,
-      csrfHeaderIncluded: false,
-    }, response.ok ? "success" : "error");
-
-    if (pageUploadResult?.code === "AMAZON_UPLOAD_CSRF_FORM_FIELD_MISSING") {
-      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed csrfToken FormData field missing", {
-        world: pageUploadResult?.world,
-        finalUrl: pageUploadResult?.finalUrl || pageUploadResult?.url || "",
-        pageTitle: pageUploadResult?.pageTitle || "",
-        readyState: pageUploadResult?.readyState || "",
-        isSellerCentralPage: !!pageUploadResult?.isSellerCentralPage,
-        isFeedsPage: !!pageUploadResult?.isFeedsPage,
-        csrfSource: pageUploadResult?.csrfSource || "none",
-        csrfTokenLength: pageUploadResult?.csrfTokenLength || 0,
-        liveExtractionFound: !!pageUploadResult?.liveExtractionFound,
-        cachedTokenFound: !!pageUploadResult?.cachedTokenFound,
-        snifferInstalled: !!pageUploadResult?.snifferInstalled,
-        instruction: pageUploadResult?.instruction || "Open Seller Central feeds page and perform one manual upload to let the extension capture uploadFeed csrfToken.",
-      }, "error");
-      throw createAmazonUploadError(
-        "AMAZON_UPLOAD_CSRF_FORM_FIELD_MISSING",
-        "Valid uploadFeed csrfToken FormData field is missing in Seller Central page context.",
-        {
-          status: 0,
-          preflight,
-          retryable: !preflight?.allowUpload,
-          userActionRequired: !preflight?.allowUpload,
-          uploadResult: pageUploadResult,
-        }
-      );
-    }
-
-    let result;
-    if (isJson(response)) {
-      result = pageUploadResult?.jsonParseOk ? pageUploadResult.json : await response.json();
-      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 12 response parsed", {
-        jsonParseOk: true,
-        keys: result && typeof result === "object" ? Object.keys(result).join(",") : "",
-        success: result?.success,
-        message: result?.message || "",
-      }, result?.success === false ? "error" : "success");
-    } else {
-      result = responseText;
-      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 12 response parsed", {
-        jsonParseOk: false,
-        textPreview: responseText.slice(0, 500),
-      }, response.ok ? "info" : "error");
-    }
-
-    if (!response.ok) {
-      const errorCode = classifyAmazonUploadFailure(response, responseText);
-
-      throw createAmazonUploadError(
-        errorCode,
-        `Amazon upload failed [${errorCode}] with status ${response.status}: ${responseText.slice(0, 200)}`,
-        {
-          status: response.status,
-          statusText: response.statusText,
-          responseText,
-          uploadUrl: response.url,
-          retryable: errorCode === "AMAZON_AUTH_REQUIRED",
-          userActionRequired: errorCode === "AMAZON_AUTH_REQUIRED",
-        }
-      );
-    }
-
-    if (response.status === 200 && isJson(response) && result?.success === false) {
-      throw createAmazonUploadError(
-        "AMAZON_UPLOAD_REJECTED",
-        result?.message || "Amazon uploadFeed rejected the confirmShipment feed.",
-        { status: response.status, statusText: response.statusText, response: result, retryable: false }
-      );
-    }
-
-    const duration = Date.now() - startTime;
-    if (extensionLogger) {
-      await extensionLogger.logUploadCompleted(
-        {
-          filename: stableFileObj.name,
-          fileSize: stableFileObj.size,
-          progress: 100,
-          ordersUploaded: uploadParams?.ordersCount || 0,
-          response: result,
-        },
-        { taskId: uploadTaskId, taskType: "UPLOAD_TRACKING", batchId: uploadBatchId },
-        {
-          duration,
-          requestDuration,
-          endpoint: response.url || `${SC_BASE}${AMAZON_UPLOADFEED_URL_PATH}`,
-          strategy: "sellerCentralTabPageContext",
-          world: pageUploadResult?.world,
-        },
-        "Amazon upload completed successfully"
-      );
-    }
-
-    await postLogSingle({
-      base,
-      token: (await getCfg()).ingestToken,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: "auto",
-      level: "success",
-      message: `Amazon upload completed: ${stableFileObj.name}`,
-    });
-
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 13 success", {
-      status: response.status,
-      contentType,
-      strategy: "sellerCentralTabPageContext",
-      world: pageUploadResult?.world,
-      csrfFormFieldIncluded: !!pageUploadResult?.csrfIncluded,
-      csrfHeaderIncluded: false,
-      taskId: uploadTaskId,
-      batchId: uploadBatchId,
-    }, "success");
-
-    return {
-      ok: true,
-      result,
-      status: response.status,
-      endpoint: response.url || `${SC_BASE}${AMAZON_UPLOADFEED_URL_PATH}`,
-      duration,
-      requestDuration,
-      strategy: "sellerCentralTabPageContext",
-      world: pageUploadResult?.world,
-    };
-  } catch (error) {
-    if (isUploadFeedAuthOrCsrfError(error)) {
-      await clearUploadFeedCsrfCache("auth_or_csrf_failure", {
-        code: error?.code || "UNKNOWN_ERROR",
-        status: error?.status || 0,
-      }).catch(() => { });
-    }
-
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 99 exception", {
-      code: error?.code || "UNKNOWN_ERROR",
-      message: error?.message || String(error),
-      status: error?.status || 0,
-      taskId: uploadTaskId,
-      batchId: uploadBatchId,
-      retryable: !!error?.retryable,
-      userActionRequired: !!error?.userActionRequired,
-    }, "error");
-
-    if (extensionLogger) {
-      await extensionLogger.logUploadFailed(
-        {
-          filename: stableFileObj?.name,
-          fileSize: stableFileObj?.size,
-          progress: 0,
-          ordersUploaded: 0,
-        },
-        { taskId: uploadTaskId, taskType: "UPLOAD_TRACKING", batchId: uploadBatchId },
-        error,
-        "Amazon upload failed"
-      );
-    }
-
-    await postLogSingle({
-      base,
-      token: (await getCfg()).ingestToken,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: "auto",
-      level: "error",
-      message: `Amazon upload failed: ${error.code || "UNKNOWN_ERROR"} - ${error.message}`,
-    }).catch(() => { });
-
-    throw error;
-  }
-}
-
-async function DO_NOT_USE_uploadToAmazonLegacyBackgroundUpload() {
-  throw new Error("Deprecated: uploadFeed must use Seller Central page-context upload. Do not use background upload.");
-}
-
-async function reportUploadResult(batchId, status, errorMessage = null) {
-  const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
-  log(`[UPLOAD_TRACKING] Reporting upload result for batch ${batchId}: ${status}${errorMessage ? " - " + errorMessage : ""}`);
-  try {
-    const reportData = {
-      batchId,
-      status, // 'success' | 'failed'
-      timestamp: new Date().toISOString(),
-      machineId: clientId,
-      label: clientLabel,
-      shopId
-    };
-
-    if (errorMessage) {
-      reportData.error = errorMessage;
-    }
-
-    // Report back to server via Socket.IO
-    if (socket && socket.connected) {
-      socket.emit('upload:result', reportData);
-      console.log(`[UPLOAD_TRACKING] Reported ${status} for batch ${batchId}`);
-    }
-
-    // Also log via standard logging
-    await postLogSingle({
-      base,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: "auto",
-      level: status === 'success' ? "success" : "error",
-      message: status === 'success'
-        ? `✅ Upload tracking batch ${batchId} success!`
-        : `❌ Upload tracking batch ${batchId} failed: ${errorMessage}`
-    });
-
-  } catch (error) {
-    console.error(`[UPLOAD_TRACKING] Failed to report result:`, error);
-  }
-}
-
-async function postLogSingle({
-  base,
-  token,
-  shopId,
-  machineId,
-  label,
-  action = "click",
-  level = "info",
-  message,
-}) {
-  try {
-    await postExtensionLog({
-      base,
-      token,
-      payload: {
-        shopId,
-        machineId,
-        label,
-        action,
-        level,
-        message,
-      },
-    });
-  } catch (_) { }
-}
-
-async function getBaseShopAndIdentity() {
-  const st = await chrome.storage.local.get([
-    "ingestUrl",
-    "shopId",
-    "autoConnect",
-  ]);
-  const { clientId, clientLabel } = await ensureIdentity();
-  const { base } = deriveApiUrls(st.ingestUrl);
-  return {
-    base,
-    shopId: st.shopId || "",
-    autoConnect: st.autoConnect !== false, // default true
-    clientId,
-    clientLabel,
+async function uploadGmailAdsDownload(url) {
+  const report = classifyAmazonAdsReportLink(url);
+  if (!report) return { ok: false, ignored: true };
+  const config = await getCfg();
+  const key = await gmailAdsDownloadKey(createGmailAdsDownloadFingerprint(config.ingestUrl, url));
+  const task = {
+    taskId: `gmail-ads-${key.slice(0, 12)}`,
+    taskType: 'IMPORT_ADS_SPEND',
+    filename: report.filename,
   };
-}
-
-// Chạy đủ 3 bước và EMIT LOG TỔNG qua socket (không POST DB)
-async function runFullFlowAndEmitLogs(trigger = "auto") {
-  const { base, shopId, clientId, clientLabel } =
-    await getBaseShopAndIdentity();
-  const phases = [];
-  const startTime = Date.now();
-  const taskId = `import_orders_${startTime}`;
-
-  // Initialize logger if not exists
-  if (!extensionLogger) {
-    await initializeLogger();
-  }
-
-  // Log task processing start
-  if (extensionLogger) {
-    await extensionLogger.logTaskProcessing({
-      taskId,
-      taskType: 'IMPORT_ORDERS',
-      batchId: taskId,
-      ordersCount: 0
-    }, `Starting full import flow (trigger: ${trigger})`);
-  }
-
-  try {
-    const importResult = await runImportNewOrders(undefined);
-    phases.push({
-      type: "import",
-      status: "success",
-      rows: importResult?.rows || 0,
-      referenceId: importResult?.referenceId || null,
-      documentId: importResult?.documentId || null,
-    });
-
-    // Log task completed
-    if (extensionLogger) {
-      const endTime = Date.now();
-      await extensionLogger.logTaskCompleted({
-        taskId,
-        taskType: 'IMPORT_ORDERS',
-        batchId: taskId,
-        ordersCount: importResult?.rows || 0
-      }, {
-        duration: endTime - startTime,
-        memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
-        cpuUsage: 0
-      }, 'Import orders completed successfully');
-    }
-
-    await postLogSingle({
-      base,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: trigger,
-      level: "success",
-      message: `\u2705 Import order success! rows=${importResult?.rows || 0}`,
-    });
-
-    return { ok: true, phases, result: importResult };
-  } catch (error) {
-    const errorMessage = error?.message || String(error);
-    phases.push({
-      type: "import",
-      status: "fail",
-      error: errorMessage,
-    });
-
-    // Log general error
-    if (extensionLogger) {
-      await extensionLogger.logTaskFailed({
-        taskId,
-        taskType: 'IMPORT_ORDERS',
-        batchId: taskId,
-        ordersCount: 0
-      }, error, 'Import orders failed');
-
-      await extensionLogger.logError(error, {
-        trigger: trigger,
-        function: 'runFullFlowAndEmitLogs'
-      }, 'Full import flow error');
-    }
-
-    await postLogSingle({
-      base,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: trigger,
-      level: "error",
-      message: `\u274C Import order error: ${errorMessage}`,
-    });
-
-    throw error;
-  }
-}
-
-//  Handle Confirm Shipping
-async function handleImportFBMOrders(trigger = "auto") {
-  const { base, shopId, clientId, clientLabel } =
-    await getBaseShopAndIdentity();
-  try {
-    await runImportFBMOrders(undefined, shopId, clientLabel);
-    await postLogSingle({
-      base,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: trigger,
-      level: "success",
-      message: "✅ Import FBM order success!",
-    });
-  } catch (e) {
-    await postLogSingle({
-      base,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: trigger,
-      level: "error",
-      message: "❌ Import FBM order error!",
-    });
-  }
-  return { ok: true, message: "Import FBM order success!" };
-}
-
-/* ===============================
-   Auto-capture Amazon Ads headers (CSRF) via webRequest
-   =============================== */
-const ADS_HEADER_KEYS = {
-  "amazon-ads-account-id": "adsAccountId",
-  "amazon-advertising-api-advertiserid": "adsAdvertiserId",
-  "amazon-advertising-api-clientid": "adsClientId",
-  "amazon-advertising-api-marketplaceid": "adsMarketplaceId",
-  "amazon-advertising-api-csrf-data": "adsCsrfData",
-  "amazon-advertising-api-csrf-token": "adsCsrfToken",
-};
-
-function collectAdsHeaders(requestHeaders = []) {
-  const out = {};
-  for (const h of requestHeaders) {
-    const k = String(h.name || "").toLowerCase();
-    const key = ADS_HEADER_KEYS[k];
-    if (key) out[key] = h.value || "";
-  }
-  return out;
-}
-
-let lastAdsHeaderWriteAt = 0;
-
-async function saveAdsHeadersIfAny(found) {
-  const clean = Object.fromEntries(
-    Object.entries(found || {}).filter(([, value]) => value !== undefined && value !== null && String(value) !== "")
-  );
-  const keys = Object.keys(clean);
-  if (!keys.length) return;
   const now = Date.now();
-
-  if (isAdsApiLocked()) {
-    await chrome.storage.local.set({
-      adsCandidateHeaders: {
-        ...clean,
-        adsHeaderLastSeen: now,
-        source: "webRequest",
-        capturedAt: now,
-      },
-    });
-    debugLog("[ADS-AUTH] Captured headers ignored while Ads API task is running", "info");
-    extensionLogger?.logInfo("[ADS-AUTH] Captured headers ignored while Ads API task is running", {
-      keys,
-      runId: adsApiLock.runId,
-      taskName: adsApiLock.taskName,
-    });
-    return;
-  }
-
-  const current = await chrome.storage.local.get(ADS_HEADER_STORAGE_KEYS);
-  const merged = { ...current, ...clean };
-  const changed = keys.some((k) => clean[k] && clean[k] !== current[k]);
-  const hasCoreHeaders = isAdsHeaderComplete(merged);
-
-  // Nếu Amazon vẫn gửi cùng token cũ, vẫn update lastSeen để chứng minh session còn sống.
-  if (!changed && hasCoreHeaders && now - lastAdsHeaderWriteAt < 5000) return;
-
-  const payload = { ...clean };
-  if (hasCoreHeaders) payload.adsHeaderLastSeen = now;
-
-  await chrome.storage.local.set(payload);
-  lastAdsHeaderWriteAt = now;
-
-  log("[ADS] headers captured:", keys.join(", "));
-  extensionLogger?.logInfo("[ADS-AUTH] Ads headers captured", {
-    keys,
-    changed,
-    hasCoreHeaders,
-    lastSeen: payload.adsHeaderLastSeen,
-  });
-}
-
-/* ===============================
-   Đảm bảo CSRF headers còn hạn trước khi gọi Ads API
-   - Nếu headers chưa có hoặc > 30 phút → mở tab ads, đợi capture xong
-   =============================== */
-const ADS_HEADER_TTL_MS = 20 * 60 * 1000; // giảm TTL để hạn chế token cũ gây 401
-
-async function forceRefreshAdsHeaders(options = {}) {
-  const reason = typeof options === "string" ? options : options.reason || "manual";
-  options = typeof options === "string" ? {} : options;
-  if (isAdsApiLocked() && !isAdsLockOwner(options.runId)) {
-    debugLog("[ADS-AUTH] force refresh blocked: not lock owner", "error");
-    extensionLogger?.logInfo("[ADS-AUTH] force refresh blocked: not lock owner", {
-      reason,
-      callerRunId: options.runId,
-      callerTaskName: options.taskName,
-      lock: { ...adsApiLock },
-    });
-    const err = createAdsError("ADS_LOCK_NOT_OWNER: cannot force refresh Ads headers while another Ads task owns the lock", 0, "");
-    err.code = "ADS_LOCK_NOT_OWNER";
-    throw err;
-  }
-
-  if (isAdsApiLocked()) {
-    debugLog("[ADS-AUTH] force refresh allowed under lock", "info");
-    extensionLogger?.logInfo("[ADS-AUTH] force refresh allowed under lock", {
-      reason,
-      runId: options.runId,
-      taskName: options.taskName,
-    });
-  }
-
-  const startedAt = Date.now();
-  debugLog(`🔄 [ADS-AUTH] Force refresh Ads headers — reason: ${reason}`, "info");
-  extensionLogger?.logInfo("[ADS-AUTH] Force refresh Ads headers", { reason });
-
-  await clearAdsHeaders(reason, options);
-
-  const tabId = await ensureAdsTab();
-
-  // Navigate về trang Campaigns, inject sniffer, rồi reload để bắt request gốc sau khi sniffer đã sẵn sàng.
-  await chrome.tabs.update(tabId, { url: `${ADS_BASE}/cm/campaigns`, active: true });
-  await waitForAdsTabComplete(tabId);
-  await ensureAdsBridgeInjected(tabId);
-
-  await chrome.tabs.reload(tabId);
-  await waitForAdsTabComplete(tabId);
-  await ensureAdsBridgeInjected(tabId);
-  await delayMs(ADS_PAGE_SETTLE_MS);
-
-  let captured = await waitForAdsHeaderCapture({ since: startedAt });
-
-  if (!captured) {
-    // Lần dự phòng: nhiều khi Amazon Ads lazy-load sau vài giây hoặc cần thêm reload.
-    debugLog("🔁 [ADS-AUTH] First refresh did not capture headers, retrying once...", "info");
-    await chrome.tabs.reload(tabId);
-    await waitForAdsTabComplete(tabId);
-    await ensureAdsBridgeInjected(tabId);
-    await delayMs(ADS_PAGE_SETTLE_MS + 1500);
-    captured = await waitForAdsHeaderCapture({ since: startedAt, timeoutMs: ADS_HEADER_REFRESH_TIMEOUT_MS });
-  }
-
-  let latest = await readAdsHeaderState();
-  if (captured && !isAdsHeaderComplete(latest)) {
-    const { adsCandidateHeaders } = await chrome.storage.local.get(["adsCandidateHeaders"]);
-    const candidateFresh = Number(adsCandidateHeaders?.adsHeaderLastSeen || 0) >= startedAt - 1000;
-    if (candidateFresh && isAdsHeaderComplete(adsCandidateHeaders || {}) && canMutateAdsHeaders(options)) {
-      const promoted = {};
-      for (const key of ADS_HEADER_STORAGE_KEYS) {
-        if (adsCandidateHeaders[key]) promoted[key] = adsCandidateHeaders[key];
-      }
-      await chrome.storage.local.set(promoted);
-      await chrome.storage.local.remove(["adsCandidateHeaders"]);
-      latest = await readAdsHeaderState();
-      debugLog("[ADS-AUTH] Promoted candidate Ads headers after owner refresh", "success");
-      extensionLogger?.logInfo("[ADS-AUTH] Promoted candidate Ads headers after owner refresh", {
-        reason,
-        runId: options.runId,
-        taskName: options.taskName,
-      });
-    }
-  }
-  if (captured && isAdsHeaderComplete(latest)) {
-    debugLog("✅ [ADS-AUTH] Fresh Ads headers ready", "success");
-    extensionLogger?.logInfo("[ADS-AUTH] Fresh Ads headers ready", {
-      lastSeen: latest.adsHeaderLastSeen,
-      ageSeconds: Math.round((Date.now() - Number(latest.adsHeaderLastSeen || 0)) / 1000),
-    });
-    return true;
-  }
-
-  const hint = await getAdsPageHint(tabId);
-  const reasonText = isAdsSignInText(`${hint.href || ""}
-${hint.title || ""}
-${hint.bodyText || ""}`)
-    ? "Amazon Ads đang yêu cầu login/reauth. Mở tab advertising.amazon.com, đăng nhập lại rồi chạy lại."
-    : "Không capture được Ads headers từ Amazon Ads page.";
-
-  throw createAdsError(`Không thể refresh Ads headers: ${reasonText}`, 401, JSON.stringify(hint).slice(0, 1000));
-}
-
-async function ensureFreshAdsHeaders(options = {}) {
-  const { force = false, reason = "preflight" } = options;
-  const st = await readAdsHeaderState();
-  const age = st.adsHeaderLastSeen ? Date.now() - Number(st.adsHeaderLastSeen) : Infinity;
-  const isValid = isAdsHeaderComplete(st) && age < ADS_HEADER_TTL_MS;
-
-  debugLog(`🔑 [ADS-AUTH] Header status: ${isValid ? "valid" : "expired/missing"} — age ${Math.round(age / 1000)}s`, isValid ? "info" : "error");
-  extensionLogger?.logInfo("[ADS-AUTH] Header preflight", {
-    force,
-    reason,
-    isValid,
-    ageSeconds: Math.round(age / 1000),
-    hasAccountId: !!st.adsAccountId,
-    hasAdvertiserId: !!st.adsAdvertiserId,
-    hasClientId: !!st.adsClientId,
-    hasMarketplaceId: !!st.adsMarketplaceId,
-    hasCsrfData: !!st.adsCsrfData,
-    hasCsrfToken: !!st.adsCsrfToken,
-  });
-
-  if (!force && isValid) return true;
-  return forceRefreshAdsHeaders({ ...options, reason });
-}
-
-
-chrome.webRequest.onBeforeSendHeaders.addListener(
-  (details) => {
-    try {
-      if (!details?.url?.startsWith(ADS_BASE)) return;
-      const found = collectAdsHeaders(details.requestHeaders || []);
-      saveAdsHeadersIfAny(found);
-    } catch { }
-  },
-  { urls: [`${ADS_BASE}/*`] },
-  ["requestHeaders", "extraHeaders"]
-);
-
-/* =========================
-   ADS — Check Campaign Names (using your existing bridge)
-   ========================= */
-
-function todayYMD() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-async function fetchEmployeeCodes() {
-  const { ingestUrl } = await getCfg();
+  const stored = await chrome.storage.local.get(GMAIL_ADS_RECENT_DOWNLOADS_KEY);
+  const recent = (stored[GMAIL_ADS_RECENT_DOWNLOADS_KEY] || {}).entries || {};
+  for (const [item, timestamp] of Object.entries(recent)) if (now - timestamp > GMAIL_ADS_RECENT_DOWNLOADS_TTL_MS) delete recent[item];
+  await extensionLogger.logTaskProcessing(task, 'Downloading Amazon Ads report from Gmail');
   try {
-    const data = await fetchEmployeeCodesFromBackend({ ingestUrl });
-
-    if (!Array.isArray(data)) {
-      throw new Error("Invalid response format, expected an array");
+    if (recent[key]) {
+      await extensionLogger.logTaskCompleted(task, null, 'Amazon Ads report upload completed (already imported)');
+      return { ok: true, skipped: true, reason: 'ALREADY_IMPORTED' };
     }
 
-    console.log("✅ Danh sách mã nhân viên:", data);
-    return data; // Ví dụ: ["J2501","J2502","J2503",...]
+    const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
+    if (!response.ok) throw new Error(`Amazon Ads email download failed (${response.status}).`);
+    const file = await response.blob();
+    if (!file.size || file.size > GMAIL_ADS_MAX_FILE_SIZE) throw new Error('Amazon Ads email report has an invalid file size.');
+    const { adsSpendUrl } = deriveApiUrls(config.ingestUrl);
+    const result = await postFileTo(adsSpendUrl, {
+      salesChannelCode: 'AMAZON', marketplaceCode: config.marketplaceCode || 'US', dryRun: 'false',
+      sourceRef: report.filename, filename: report.filename, file,
+    }, config.ingestToken);
+    recent[key] = now;
+    await chrome.storage.local.set({ [GMAIL_ADS_RECENT_DOWNLOADS_KEY]: { entries: recent } });
+    await extensionLogger.logTaskCompleted(task, result, 'Amazon Ads report upload completed');
+    return { ok: true, rows: result?.data?.rowCount || 0, ingest: result };
   } catch (error) {
-    console.error("❌ Lỗi khi lấy mã nhân viên:", error.message);
-    return [];
+    await extensionLogger.logTaskFailed(task, error, `Amazon Ads report upload failed: ${error?.message || String(error)}`);
+    throw error;
   }
 }
-
-// background.js (hoặc module dùng để kiểm tra)
-function checkInvalidCampaignNames(campaigns, employeeCodes) {
-  // chuẩn hoá allowed: Set uppercase
-  const allowed = new Set(
-    (employeeCodes || []).map((c) => String(c).trim().toUpperCase())
-  );
-
-  // helper: lấy prefix hợp lệ dạng 1 chữ + 4 số ở đầu chuỗi
-  function extractPrefix5(name) {
-    if (!name) return "";
-    const s = String(name).trim();
-    const m = s.match(/^([A-Za-z]\d{4})/); // ^: ngay đầu chuỗi
-    return m ? m[1].toUpperCase() : ""; // VD: "J2501"
-  }
-
-  let totalChecked = 0;
-  const invalidList = [];
-
-  for (const c of campaigns || []) {
-    const name = (c.campaignName ?? c.name ?? "").trim();
-    if (!name) continue;
-    totalChecked++;
-
-    const prefix = extractPrefix5(name);
-    const isValid = prefix && allowed.has(prefix);
-
-    if (!isValid) {
-      invalidList.push({
-        name,
-        state: c.state || c.status || "Unknown",
-        prefixFound: prefix || null,
-      });
-    }
-  }
-
-  return {
-    ok: true,
-    total: totalChecked,
-    invalidCount: invalidList.length,
-    invalidList,
-  };
-}
-
-async function checkCampaign(date) {
-  return withAdsApiLock("CHECK_CAMPAIGN", (lock) => checkCampaignLocked(date, lock));
-}
-
-async function checkCampaignLocked(date, lock = {}) {
-  if (!date) throw new Error("date (YYYY-MM-DD) required");
-  const employeeCodes = await fetchEmployeeCodes();
-  await ensureFreshAdsHeaders({ ...lock, reason: "checkCampaign" });
-  const rows = await fetchAllCampaignSpend(date, date, 300, true, lock);
-
-  const result = checkInvalidCampaignNames(rows, employeeCodes);
-
-  return {
-    ok: true,
-    totalChecked: result?.total,
-    invalidCount: result?.invalidCount,
-    invalidList: result?.invalidList,
-  };
-}
-
-/* ================================================================
-   SOCKET.IO AUTO CONNECT + KEEPALIVE (Realtime only)
-   ================================================================ */
-
-let socket = null;
-let hbTimer = null;
-let connectBusy = false;
-
-// Auto reconnect polling
-let autoReconnectInterval = null;
-
-function safeLogConnectionStatus(status, details = {}, message = "") {
-  try {
-    if (!extensionLogger) return;
-    Promise.resolve(
-      extensionLogger.logConnectionStatus(status, details, message)
-    ).catch((error) => {
-      console.warn("[SOCKET-LOG] safeLogConnectionStatus failed:", error?.message || error);
-    });
-  } catch (error) {
-    console.warn("[SOCKET-LOG] safeLogConnectionStatus exception:", error?.message || error);
-  }
-}
-
-function safeLogInfo(message, rawData = {}) {
-  try {
-    if (!extensionLogger) return;
-    Promise.resolve(extensionLogger.logInfo(message, rawData)).catch((error) => {
-      console.warn("[SOCKET-LOG] safeLogInfo failed:", error?.message || error);
-    });
-  } catch (error) {
-    console.warn("[SOCKET-LOG] safeLogInfo exception:", error?.message || error);
-  }
-}
-
-function safePostLogSingle(payload) {
-  try {
-    Promise.resolve(postLogSingle(payload)).catch((error) => {
-      console.warn("[SOCKET-LOG] safePostLogSingle failed:", error?.message || error);
-    });
-  } catch (error) {
-    console.warn("[SOCKET-LOG] safePostLogSingle exception:", error?.message || error);
-  }
-}
-
-function startHeartbeat() {
-  if (hbTimer) clearInterval(hbTimer);
-  hbTimer = setInterval(async () => {
-    if (!socket || !socket.connected) return;
-    const { clientLabel } = await ensureIdentity();
-    socket.emit("ext:heartbeat", {
-      label: clientLabel,
-      version: "ext-" + chrome.runtime.getManifest().version,
-      ua: navigator.userAgent,
-      ip: null,
-    });
-  }, 15000);
-}
-function stopHeartbeat() {
-  if (hbTimer) clearInterval(hbTimer);
-  hbTimer = null;
-}
-
-/**
- * Kết nối Socket.IO.
- * - force = true: luôn ngắt và tạo lại kết nối (dùng cho nút Connect hoặc đổi shop/ingestUrl)
- * - nếu đã có socket.connected thì bỏ qua (trừ khi force)
- */
-// export async function connectSocketIO(force = false) {
-//   if (connectBusy) return { ok: false, reason: "busy" };
-//   connectBusy = true;
-//   try {
-//     const { base, shopId, clientId, clientLabel } =
-//       await getBaseShopAndIdentity();
-//     if (!base) {
-//       console.log("[SOCKET] Missing base");
-//       return { ok: false, reason: "base missing" };
-//     }
-//     if (!shopId) {
-//       console.log("[SOCKET] Missing shopId");
-//       return { ok: false, reason: "shopId missing" };
-//     }
-
-//     // Khi không force và đang connected thì thôi
-//     if (!force && socket && socket.connected) {
-//       return { ok: true, message: "already connected" };
-//     }
-
-//     // Nếu có socket cũ, disconnect trước
-//     if (socket) {
-//       try {
-//         socket.disconnect();
-//       } catch {}
-//       socket = null;
-//     }
-
-//     socket = io(base, {
-//       path: "/ws",
-//       transports: ["websocket"],
-//       auth: {
-//         shopId,
-//         machineId: clientId,
-//         label: clientLabel,
-//         version: "ext-" + chrome.runtime.getManifest().version,
-//         ua: navigator.userAgent,
-//       },
-//       reconnection: true,
-//       reconnectionAttempts: Infinity,
-//       reconnectionDelay: 2000,
-//       reconnectionDelayMax: 10000,
-//       timeout: 180000,
-//     });
-
-//     socket.on("connect", async () => {
-//       console.log("[SOCKET] connected", socket.id);
-//       await postLogSingle({
-//         base,
-//         shopId,
-//         machineId: clientId,
-//         label: clientLabel,
-//         action: "auto",
-//         level: "success",
-//         message: `✅ Extension connected to Socket.IO`,
-//       });
-//       startHeartbeat();
-//     });
-
-//     socket.on("disconnect", async (reason) => {
-//       console.log("[SOCKET] disconnected:", reason);
-//       await postLogSingle({
-//         base,
-//         shopId,
-//         machineId: clientId,
-//         label: clientLabel,
-//         action: "auto",
-//         level: "error",
-//         message: `❌ Extension disconnected to Socket.IO`,
-//       });
-//       stopHeartbeat();
-//       // để reconnection tự xử lý (đã bật trong options ở trên)
-//     });
-
-//     // (tuỳ chọn) nhận task từ server nếu bạn vẫn muốn bắn lệnh IMPORT_ORDERS
-//     socket.on("server:task", async (task) => {
-//       const { type, payload } = task || {};
-//       try {
-//         switch (type) {
-//           case "IMPORT_FBM_ORDERS":
-//             handleImportFBMOrders("click");
-//             break;
-//           case "IMPORT_ORDERS":
-//             runFullFlowAndEmitLogs("click");
-//             break;
-//           case "IMPORT_ADS_SPEND":
-//             const day = payload?.date;
-//             if (!day) throw new Error("Missing payload.date");
-//             try {
-//               await runExportAdsSpend(day);
-//               await postLogSingle({
-//                 base,
-//                 shopId,
-//                 machineId: clientId,
-//                 label: clientLabel,
-//                 action: "click",
-//                 level: "success",
-//                 message: "✅ Import ads success!",
-//               });
-//             } catch (error) {
-//               await postLogSingle({
-//                 base,
-//                 shopId,
-//                 machineId: clientId,
-//                 label: clientLabel,
-//                 action: "click",
-//                 level: "error",
-//                 message: "❌ Import ads error!",
-//               });
-//             }
-//             break;
-//           default:
-//             break;
-//         }
-//       } catch (e) {
-//         console.error("[SOCKET] task error:", e?.message || e);
-//       }
-//     });
-
-//     return { ok: true };
-//   } finally {
-//     connectBusy = false;
-//   }
-// }
-
-export async function connectSocketIO(force = false) {
-  return { ok: true, skipped: true, message: "Socket disabled; extension runs imports directly." };
-  console.log("[SOCKET-LOG] connectSocketIO entered", {
-    force,
-    connectBusy,
-    socketExists: !!socket,
-    socketConnected: !!socket?.connected
-  });
-
-  if (connectBusy) {
-    console.log('[SOCKET-LOG] Connection already in progress, skipping...');
-    safeLogConnectionStatus('busy', { force }, 'Socket connection already in progress');
-    return { ok: false, reason: "busy" };
-  }
-  connectBusy = true;
-
-  try {
-    const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
-
-    console.log('[SOCKET-LOG] Starting socket connection...', { base, shopId, clientId, clientLabel, force });
-    safeLogConnectionStatus('connecting', {
-      base, shopId, clientId, clientLabel, force
-    }, 'Initiating Socket.IO connection');
-
-    if (!base) {
-      console.error('[SOCKET-LOG] Missing base URL');
-      safeLogConnectionStatus('failed', { reason: 'base_missing' }, 'Socket connection failed: Missing base URL');
-      return { ok: false, reason: "base missing" };
-    }
-
-    if (!shopId) {
-      console.error('[SOCKET-LOG] Missing shopId');
-      safeLogConnectionStatus('failed', { reason: 'shopid_missing' }, 'Socket connection failed: Missing shopId');
-      return { ok: false, reason: "shopId missing" };
-    }
-
-    // Nếu đã connected và không force → bỏ qua
-    if (!force && socket?.connected) {
-      console.log('[SOCKET-LOG] Already connected, skipping reconnection');
-      safeLogConnectionStatus('already_connected', { socketId: socket?.id || null }, 'Socket already connected');
-      return { ok: true, message: "already connected" };
-    }
-
-    // Ngắt socket cũ nếu có
-    if (socket) {
-      console.log('[SOCKET-LOG] Disconnecting existing socket...');
-      safeLogConnectionStatus('disconnecting_old', {
-        oldSocketId: socket?.id || null,
-        oldConnected: !!socket?.connected
-      }, 'Disconnecting existing socket connection');
-      try { socket.disconnect(); } catch { }
-      socket = null;
-      stopHeartbeat();
-
-      // Dừng test connection polling khi cleanup socket
-      stopTestConnectionPolling();
-
-      // Dừng auto reconnect polling khi cleanup socket
-      if (force) stopAutoReconnectPolling();
-    }
-
-    console.log("[SOCKET-LOG] Creating new socket connection", {
-      url: base,
-      path: "/ws",
-      shopId,
-      machineId: clientId,
-      label: clientLabel
-    });
-
-    socket = io(base, {
-      path: "/ws",
-      transports: ["websocket"],
-      auth: {
-        shopId,
-        machineId: clientId,
-        label: clientLabel,
-        version: "ext-" + chrome.runtime.getManifest().version,
-        ua: navigator.userAgent,
-      },
-      reconnection: true,
-      reconnectionAttempts: Infinity,
-      reconnectionDelay: 2000,
-      reconnectionDelayMax: 10000,
-      timeout: 180000,
-    });
-
-    // Khi kết nối thành công
-    socket.on("connect", () => {
-      console.log("[SOCKET-LOG] Connected successfully", { socketId: socket?.id || null, timestamp: new Date().toISOString() });
-      startHeartbeat();
-      startTestConnectionPolling();
-      startAutoReconnectPolling();
-      Promise.resolve(startAutoConfigScheduler()).catch((error) => {
-        debugLog(`[AUTO-CFG] Socket start error: ${error.message}`, "error");
-        extensionLogger?.logError(error, { source: "socket_connect" }, "[AUTO-CFG] Socket start error");
-      });
-      Promise.resolve(startAutoConfigSync()).catch((error) => {
-        debugLog(`[AUTO-CFG-SYNC] Socket start error: ${error.message}`, "error");
-        extensionLogger?.logError(error, { source: "socket_connect" }, "[AUTO-CFG-SYNC] Socket start error");
-      });
-
-      safeLogConnectionStatus('connected', {
-        socketId: socket?.id || null,
-        timestamp: new Date().toISOString(),
-        reconnectionAttempts: socket?.io?.reconnectionAttempts || 0
-      }, 'Socket.IO connection established successfully');
-
-      safePostLogSingle({
-        base, shopId, machineId: clientId, label: clientLabel,
-        action: "auto", level: "success",
-        message: "✅ Extension connected to Socket.IO",
-      });
-    });
-
-    // Khi mất kết nối
-    socket.on("disconnect", (reason) => {
-      console.log("[SOCKET-LOG] ❌ Disconnected:", { reason, timestamp: new Date().toISOString() });
-
-      safeLogConnectionStatus('disconnected', {
-        reason,
-        timestamp: new Date().toISOString(),
-        wasConnected: true
-      }, `Socket disconnected: ${reason}`);
-
-      safePostLogSingle({
-        base, shopId, machineId: clientId, label: clientLabel,
-        action: "auto", level: "error",
-        message: `❌ Socket disconnected: ${reason}`,
-      });
-      stopHeartbeat();
-
-      // Dừng test connection polling khi socket ngắt kết nối
-      stopTestConnectionPolling();
-
-      // Dừng auto reconnect polling khi socket ngắt kết nối
-      // Keep auto reconnect polling alive during normal disconnects.
-
-      // Nếu server ép disconnect → force reconnect ngay
-      if (reason === "io server disconnect") {
-        console.log("[SOCKET-LOG] Server forced disconnect, attempting reconnection...");
-        safeLogConnectionStatus('reconnecting', {
-          reason: 'server_disconnect'
-        }, 'Server forced disconnect, initiating reconnection');
-        connectSocketIO(true);
-      }
-    });
-
-    // Connection error handling
-    socket.on("connect_error", (error) => {
-      console.error("[SOCKET-LOG] connect_error", {
-        message: error?.message,
-        description: error?.description,
-        context: error?.context,
-        type: error?.type
-      });
-      console.error("[SOCKET-LOG] ❌ Connection error:", error);
-
-      if (extensionLogger) {
-        Promise.resolve(extensionLogger.logError(error, {
-          socketUrl: base,
-          shopId,
-          clientId,
-          timestamp: new Date().toISOString()
-        }, 'Socket.IO connection error')).catch((logError) => {
-          console.warn("[SOCKET-LOG] connect_error log failed:", logError?.message || logError);
-        });
-      }
-    });
-
-    // Reconnection events
-    socket.on("reconnect", (attemptNumber) => {
-      console.log("[SOCKET-LOG] ✅ Reconnected after", attemptNumber, "attempts");
-
-      if (extensionLogger) {
-        safeLogConnectionStatus('reconnected', {
-          attemptNumber,
-          timestamp: new Date().toISOString()
-        }, `Successfully reconnected after ${attemptNumber} attempts`);
-      }
-    });
-
-    socket.on("reconnect_attempt", (attemptNumber) => {
-      console.log("[SOCKET-LOG] 🔄 Reconnection attempt", attemptNumber);
-
-      if (extensionLogger) {
-        safeLogConnectionStatus('reconnect_attempt', {
-          attemptNumber,
-          timestamp: new Date().toISOString()
-        }, `Reconnection attempt #${attemptNumber}`);
-      }
-    });
-
-    socket.on("reconnect_failed", () => {
-      console.error("[SOCKET-LOG] ❌ Reconnection failed after all attempts");
-
-      if (extensionLogger) {
-        safeLogConnectionStatus('reconnect_failed', {
-          timestamp: new Date().toISOString()
-        }, 'Socket reconnection failed after all attempts');
-      }
-    });
-
-    // Heartbeat tự động
-    // Task từ server
-    // socket.on("server:task", async (task) => {
-    //   const { type, payload } = task || {};
-    //   const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
-    //   log(`[SOCKET] Received task from server: ${type}`, payload);
-    //   try {
-    //     switch (type) {
-    //       case "IMPORT_FBM_ORDERS": 
-    //         handleImportFBMOrders("click"); 
-    //         break;
-    //       case "IMPORT_ORDERS": 
-    //         runFullFlowAndEmitLogs("click"); 
-    //         break;
-    //       case "IMPORT_ADS_SPEND":
-    //         if (!payload?.date) throw new Error("Missing payload.date");
-    //         await runExportAdsSpend(payload.date);
-    //         await postLogSingle({ 
-    //           base, 
-    //           token: (await getCfg()).ingestToken,
-    //           shopId, 
-    //           machineId: clientId, 
-    //           label: clientLabel, 
-    //           action: "click", 
-    //           level: "success", 
-    //           message: "✅ Import ads success!" 
-    //         });
-    //         break;
-    //       case "UPLOAD_TRACKING":
-    //         if (payload?.autoGenerated) {
-    //           console.log(`🎯 Received auto UPLOAD_TRACKING task: ${payload.reason}`);
-
-    //           // Log task start
-    //           await postLogSingle({
-    //             base,
-    //             token: (await getCfg()).ingestToken,
-    //             shopId,
-    //             machineId: clientId,
-    //             label: clientLabel,
-    //             action: "auto",
-    //             level: "info",
-    //             message: `🎯 Starting UPLOAD_TRACKING task: ${payload.reason}`
-    //           });
-
-    //           const { file, uploadParams, trackingData } = payload;
-
-    //           // 1. File TXT đã sẵn sàng, không cần tạo
-    //           const blob = new Blob([file.content], { type: file.contentType });
-    //           const fileObj = new File([blob], file.filename);
-
-    //           // Log file preparation
-    //           await postLogSingle({
-    //             base,
-    //             token: (await getCfg()).ingestToken,
-    //             shopId,
-    //             machineId: clientId,
-    //             label: clientLabel,
-    //             action: "auto",
-    //             level: "info",
-    //             message: `📄 Prepared file: ${file.filename} (${file.content.length} bytes)`
-    //           });
-
-    //           // Deprecated fire-and-forget upload removed; see handleServerTask.
-    //         }
-    //         break;
-    //       default: 
-    //         break;
-    //     }
-    //   } catch (e) {
-    //     console.error("[SOCKET] task error:", e?.message || e);
-    //   }
-    // });
-    socket.on("server:task", (task) => handleServerTask(task));
-
-    return { ok: true };
-  } finally {
-    connectBusy = false;
-  }
-}
-
-/* ===============================
-   handleServerTask — dùng chung cho socket & test
-   =============================== */
-async function handleServerTask(task) {
-  console.log('📨 [EXT-DEBUG] ===== RECEIVED SERVER TASK =====');
-  console.log('⏰ [EXT-DEBUG] Timestamp:', new Date().toISOString());
-  console.log('🔍 [EXT-DEBUG] Raw task object:', JSON.stringify(task, null, 2));
-
-  const { type, payload } = task || {};
-  console.log('🏷️ [EXT-DEBUG] Task type:', type);
-  console.log('📦 [EXT-DEBUG] Payload keys:', Object.keys(payload || {}));
-  log(`✅ [EXT-DEBUG] Connected to server`, payload);
-  log(`🆔 [EXT-DEBUG] Socket ID:`, socket?.id || "NO_SOCKET");
-  log('🔗 [EXT-DEBUG] Socket connected:', !!socket?.connected);
-
-  const authData = {
-    shopId: "your_shop_id",
-    machineId: "your_machine_id",
-    label: "Extension Name",
-    version: "1.0.0"
-  };
-  log('🔑 [EXT-DEBUG] Auth data being sent:', authData);
-  log(`[SOCKET] Received task from server: ${type}`, payload);
-  let identity;
-  try {
-    identity = await getBaseShopAndIdentity();
-    console.log('🔑 [EXT-DEBUG] Extension identity:', {
-      base: identity.base,
-      shopId: identity.shopId,
-      clientId: identity.clientId,
-      clientLabel: identity.clientLabel
-    });
-  } catch (identityError) {
-    console.error('❌ [EXT-DEBUG] Failed to get identity:', identityError);
-    return;
-  }
-
-  const { base, shopId, clientId, clientLabel } = identity;
-
-  try {
-    switch (type) {
-      case "IMPORT_FBM_ORDERS":
-        console.log('📋 [EXT-DEBUG] Handling IMPORT_FBM_ORDERS');
-
-        // Initialize logger if not exists
-        if (!extensionLogger) {
-          await initializeLogger();
-        }
-
-        const fbmTaskId = `fbm_${Date.now()}`;
-        const fbmStartTime = Date.now();
-
-        // Log task received
-        if (extensionLogger) {
-          await extensionLogger.logTaskReceived({
-            taskId: fbmTaskId,
-            taskType: type,
-            batchId: payload?.batchId || fbmTaskId,
-            ordersCount: 0,
-            filename: 'FBM Orders Import'
-          }, '[IMPORT_FBM_ORDERS] Task received from server');
-        }
-
-        // Log task processing
-        if (extensionLogger) {
-          await extensionLogger.logTaskProcessing({
-            taskId: fbmTaskId,
-            taskType: type,
-            batchId: payload?.batchId || fbmTaskId,
-            ordersCount: 0
-          }, '[IMPORT_FBM_ORDERS] Starting FBM orders import processing');
-        }
-
-        try {
-          await handleImportFBMOrders("click");
-
-          // Log task completed
-          if (extensionLogger) {
-            const fbmEndTime = Date.now();
-            await extensionLogger.logTaskCompleted({
-              taskId: fbmTaskId,
-              taskType: type,
-              batchId: payload?.batchId || fbmTaskId,
-              ordersCount: 0
-            }, {
-              duration: fbmEndTime - fbmStartTime,
-              memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
-              cpuUsage: 0
-            }, '[IMPORT_FBM_ORDERS] FBM orders import completed successfully');
-          }
-        } catch (error) {
-          // Log task failed
-          if (extensionLogger) {
-            await extensionLogger.logTaskFailed({
-              taskId: fbmTaskId,
-              taskType: type,
-              batchId: payload?.batchId || fbmTaskId,
-              ordersCount: 0
-            }, error, '[IMPORT_FBM_ORDERS] FBM orders import failed');
-          }
-          throw error;
-        }
-        break;
-
-      case "IMPORT_ORDERS":
-        console.log('📋 [EXT-DEBUG] Handling IMPORT_ORDERS');
-
-        // Initialize logger if not exists
-        if (!extensionLogger) {
-          await initializeLogger();
-        }
-
-        const ordersTaskId = `orders_${Date.now()}`;
-        const ordersStartTime = Date.now();
-
-        // Log task received
-        if (extensionLogger) {
-          await extensionLogger.logTaskReceived({
-            taskId: ordersTaskId,
-            taskType: type,
-            batchId: payload?.batchId || ordersTaskId,
-            ordersCount: 0,
-            filename: 'New Orders Import'
-          }, '[IMPORT_ORDERS] Task received from server');
-        }
-
-        // Log task processing
-        if (extensionLogger) {
-          await extensionLogger.logTaskProcessing({
-            taskId: ordersTaskId,
-            taskType: type,
-            batchId: payload?.batchId || ordersTaskId,
-            ordersCount: 0
-          }, '[IMPORT_ORDERS] Starting new orders import processing');
-        }
-
-        try {
-          await runFullFlowAndEmitLogs("click");
-
-          // Log task completed
-          if (extensionLogger) {
-            const ordersEndTime = Date.now();
-            await extensionLogger.logTaskCompleted({
-              taskId: ordersTaskId,
-              taskType: type,
-              batchId: payload?.batchId || ordersTaskId,
-              ordersCount: 0
-            }, {
-              duration: ordersEndTime - ordersStartTime,
-              memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
-              cpuUsage: 0
-            }, '[IMPORT_ORDERS] New orders import completed successfully');
-          }
-        } catch (error) {
-          // Log task failed
-          if (extensionLogger) {
-            await extensionLogger.logTaskFailed({
-              taskId: ordersTaskId,
-              taskType: type,
-              batchId: payload?.batchId || ordersTaskId,
-              ordersCount: 0
-            }, error, '[IMPORT_ORDERS] New orders import failed');
-          }
-          throw error;
-        }
-        break;
-
-      case "IMPORT_ADS_SPEND":
-        console.log('📋 [EXT-DEBUG] Handling IMPORT_ADS_SPEND');
-        if (!payload?.date) throw new Error("Missing payload.date");
-        console.log('📅 [EXT-DEBUG] Ads spend date:', payload.date);
-
-        // Initialize logger if not exists
-        if (!extensionLogger) {
-          await initializeLogger();
-        }
-
-        const adsTaskId = `ads_${Date.now()}`;
-        const adsStartTime = Date.now();
-
-        // Log task received
-        if (extensionLogger) {
-          await extensionLogger.logTaskReceived({
-            taskId: adsTaskId,
-            taskType: type,
-            batchId: payload?.batchId || `ads_${payload.date}`,
-            ordersCount: 0,
-            filename: `Ads Spend ${payload.date}`
-          }, `[IMPORT_ADS_SPEND] Task received for date: ${payload.date}`);
-        }
-
-        // Log task processing
-        if (extensionLogger) {
-          await extensionLogger.logTaskProcessing({
-            taskId: adsTaskId,
-            taskType: type,
-            batchId: payload?.batchId || `ads_${payload.date}`,
-            ordersCount: 0
-          }, `[IMPORT_ADS_SPEND] Starting ads spend import for date: ${payload.date}`);
-        }
-
-        let adsResult;
-        try {
-          adsResult = await runExportAdsSpend(payload.date);
-          if (adsResult?.skipped && adsResult?.reason === "ADS_TASK_ALREADY_RUNNING") {
-            extensionLogger?.logInfo("[ADS-LOCK] Skip IMPORT_ADS_SPEND, another Ads task is running", adsResult);
-            return adsResult;
-          }
-
-          // Log task completed
-          if (extensionLogger) {
-            const adsEndTime = Date.now();
-            await extensionLogger.logTaskCompleted({
-              taskId: adsTaskId,
-              taskType: type,
-              batchId: payload?.batchId || `ads_${payload.date}`,
-              ordersCount: 0,
-              filename: `Ads Spend ${payload.date}`
-            }, {
-              duration: adsEndTime - adsStartTime,
-              memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
-              cpuUsage: 0
-            }, `[IMPORT_ADS_SPEND] Ads spend import completed for date: ${payload.date}`);
-          }
-
-        } catch (error) {
-          // Log task failed
-          if (extensionLogger) {
-            await extensionLogger.logTaskFailed({
-              taskId: adsTaskId,
-              taskType: type,
-              batchId: payload?.batchId || `ads_${payload.date}`,
-              ordersCount: 0,
-              filename: `Ads Spend ${payload.date}`
-            }, error, `[IMPORT_ADS_SPEND] Ads spend import failed for date: ${payload.date}`);
-          }
-          throw error;
-        }
-
-        await postLogSingle({
-          base,
-          token: (await getCfg()).ingestToken,
-          shopId,
-          machineId: clientId,
-          label: clientLabel,
-          action: "click",
-          level: "success",
-          message: "✅ Import ads success!"
-        });
-        return adsResult;
-
-      case "UPLOAD_TRACKING":
-        console.log('📋 [EXT-DEBUG] ===== HANDLING UPLOAD_TRACKING =====');
-
-        // Initialize logger if not exists
-        if (!extensionLogger) {
-          await initializeLogger();
-        }
-
-        const uploadTaskId = payload?.batchId || payload?.taskId || `upload_${Date.now()}`;
-        const uploadStartTime = Date.now();
-
-        // Log task received with full details
-        if (extensionLogger) {
-          await extensionLogger.logTaskReceived({
-            taskId: uploadTaskId,
-            taskType: type,
-            batchId: payload?.batchId,
-            ordersCount: payload?.trackingData?.length || 0,
-            filename: payload?.file?.filename
-          }, `[UPLOAD_TRACKING] Task received: ${payload?.reason}`);
-        }
-
-        // Log task processing
-        if (extensionLogger) {
-          await extensionLogger.logTaskProcessing({
-            taskId: uploadTaskId,
-            taskType: type,
-            batchId: payload?.batchId,
-            ordersCount: payload?.trackingData?.length || 0,
-            filename: payload?.file?.filename
-          }, `[UPLOAD_TRACKING] Starting upload tracking processing: ${payload?.reason}`);
-        }
-
-        // Log to popup UI
-        debugLog('� [UPLOAD_TRACKING] ===== TASK RECEIVED =====', 'info');
-        debugLog(`🎯 [UPLOAD_TRACKING] Task Type: ${payload?.autoGenerated ? 'AUTO GENERATED' : 'MANUAL TRIGGER'}`, payload?.autoGenerated ? 'success' : 'info');
-        debugLog(`📝 [UPLOAD_TRACKING] Reason: ${payload?.reason}`, 'info');
-        debugLog(`🏷️ [UPLOAD_TRACKING] Batch ID: ${payload?.batchId}`, 'info');
-        debugLog(`👤 [UPLOAD_TRACKING] Requested By: ${payload?.requestedBy}`, 'info');
-        debugLog(`⏰ [UPLOAD_TRACKING] Timestamp: ${payload?.timestamp}`, 'info');
-
-        // Debug payload details
-        console.log('📦 [EXT-DEBUG] UPLOAD_TRACKING payload details:');
-        console.log('  - Batch ID:', payload?.batchId);
-        console.log('  - Machine ID:', payload?.machineId);
-        console.log('  - Shop ID:', payload?.shopId);
-        console.log('  - Label:', payload?.label);
-        console.log('  - Auto Generated:', payload?.autoGenerated);
-        console.log('  - Reason:', payload?.reason);
-        console.log('  - Requested By:', payload?.requestedBy);
-        console.log('  - Timestamp:', payload?.timestamp);
-
-        // Check machine ID match
-        if (payload?.machineId && payload.machineId !== clientId) {
-          console.warn('⚠️ [EXT-DEBUG] Machine ID mismatch!');
-          console.warn('  - Task Machine ID:', payload.machineId);
-          console.warn('  - Extension Machine ID:', clientId);
-          console.warn('  - Skipping task...');
-          debugLog('❌ [UPLOAD_TRACKING] Machine ID mismatch - skipping task', 'error');
-          debugLog(`   Task Machine ID: ${payload.machineId}`, 'error');
-          debugLog(`   Extension Machine ID: ${clientId}`, 'error');
-          break;
-        } else {
-          console.log('✅ [EXT-DEBUG] Machine ID match confirmed');
-          debugLog('✅ [UPLOAD_TRACKING] Machine ID match confirmed', 'success');
-        }
-
-        if (payload) {
-          console.log(`🎯 [EXT-DEBUG] Task received: ${payload.reason} (autoGenerated: ${payload.autoGenerated})`);
-
-          // Debug file info
-          if (payload.file) {
-            console.log('📄 [EXT-DEBUG] File details:');
-            console.log('  - Filename:', payload.file.filename);
-            console.log('  - Size:', payload.file.size, 'bytes');
-            console.log('  - Content Type:', payload.file.contentType);
-            console.log('  - Content length:', payload.file.content?.length);
-            console.log('  - Content preview:', payload.file.content?.substring(0, 200) + '...');
-          } else {
-            console.error('❌ [EXT-DEBUG] No file in payload!');
-            break;
-          }
-
-          // Debug upload params
-          if (payload.uploadParams) {
-            console.log('⚙️ [EXT-DEBUG] Upload params:');
-            console.log('  - Carrier Code:', payload.uploadParams.carrierCode);
-            console.log('  - Ship Method:', payload.uploadParams.shipMethod);
-            console.log('  - Ship Date:', payload.uploadParams.shipDate);
-          } else {
-            console.error('❌ [EXT-DEBUG] No upload params in payload!');
-          }
-
-          // Debug tracking data
-          if (payload.trackingData) {
-            console.log('📊 [EXT-DEBUG] Tracking data:');
-            console.log('  - Count:', payload.trackingData.length);
-            console.log('  - Sample orders:', payload.trackingData.slice(0, 3).map(t => ({
-              orderId: t.orderId,
-              tracking: t.tracking,
-              isFake: t.isFake,
-              source: t.source
-            })));
-          }
-
-          // Log task start
-          console.log('📝 [EXT-DEBUG] Logging task start...');
-          try {
-            await postLogSingle({
-              base,
-              token: (await getCfg()).ingestToken,
-              shopId,
-              machineId: clientId,
-              label: clientLabel,
-              action: "auto",
-              level: "info",
-              message: `🎯 Starting UPLOAD_TRACKING task: ${payload.reason}`
-            });
-            console.log('✅ [EXT-DEBUG] Task start logged successfully');
-          } catch (logError) {
-            console.error('❌ [EXT-DEBUG] Failed to log task start:', logError);
-          }
-
-          const { file, uploadParams, trackingData } = payload;
-          if (!file || typeof file.content !== "string" || !file.filename) {
-            const error = new Error("UPLOAD_TRACKING payload.file is required");
-            debugLog(`[UPLOAD_TRACKING] ${error.message}`, "error");
-            if (payload?.batchId) {
-              await reportUploadResult(payload.batchId, "failed", error.message);
-              error._uploadTrackingReported = true;
-            }
-            if (extensionLogger) {
-              await extensionLogger.logTaskFailed({
-                taskId: uploadTaskId,
-                taskType: type,
-                batchId: payload?.batchId,
-                ordersCount: payload?.trackingData?.length || 0,
-                filename: payload?.file?.filename
-              }, error, "[UPLOAD_TRACKING] Upload tracking payload validation failed");
-            }
-            throw error;
-          }
-
-          // 1. File TXT đã sẵn sàng, không cần tạo
-          console.log('📄 [EXT-DEBUG] Preparing file blob...');
-          const blob = new Blob([file.content], { type: file.contentType });
-          const fileObj = new File([blob], file.filename);
-          console.log('✅ [EXT-DEBUG] File blob created:', {
-            name: fileObj.name,
-            size: fileObj.size,
-            type: fileObj.type
-          });
-
-          // Log file preparation
-          console.log('📝 [EXT-DEBUG] Logging file preparation...');
-          try {
-            await postLogSingle({
-              base,
-              token: (await getCfg()).ingestToken,
-              shopId,
-              machineId: clientId,
-              label: clientLabel,
-              action: "auto",
-              level: "info",
-              message: `📄 Prepared file: ${file.filename} (${file.content.length} bytes)`
-            });
-            console.log('✅ [EXT-DEBUG] File preparation logged successfully');
-          } catch (logError) {
-            console.error('❌ [EXT-DEBUG] Failed to log file preparation:', logError);
-          }
-
-          // 2. Upload lên platform ngay lập tức
-          console.log('🚀 [EXT-DEBUG] Starting upload to Amazon...');
-          console.log('📤 [EXT-DEBUG] Upload params:', uploadParams);
-
-          const trackingUploadParams = {
-            ...(uploadParams || {}),
-            taskId: payload?.batchId || payload?.taskId || `upload_${Date.now()}`,
-            batchId: payload?.batchId,
-            ordersCount: trackingData?.length || uploadParams?.ordersCount || 0
-          };
-
-          try {
-            const result = await withUploadTrackingLock("UPLOAD_TRACKING_SOCKET", async () => {
-              const uploadResult = await uploadToAmazon(fileObj, trackingUploadParams);
-              console.log(`[EXT-DEBUG] Successfully uploaded ${file.filename}`);
-              console.log("[EXT-DEBUG] Reporting success to server...");
-
-              if (payload?.batchId) {
-                await reportUploadResult(payload.batchId, "success");
-              }
-
-              if (extensionLogger) {
-                const uploadEndTime = Date.now();
-                await extensionLogger.logTaskCompleted({
-                  taskId: uploadTaskId,
-                  taskType: type,
-                  batchId: payload?.batchId,
-                  ordersCount: payload?.trackingData?.length || 0,
-                  filename: payload?.file?.filename
-                }, {
-                  duration: uploadEndTime - uploadStartTime,
-                  memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
-                  cpuUsage: 0
-                }, `[UPLOAD_TRACKING] Upload tracking completed successfully: ${file.filename}`);
-              }
-
-              return uploadResult;
-            });
-
-            if (result?.skipped) {
-              debugLog("[UPLOAD_TRACKING] skipped because another upload is running", "info");
-              return result;
-            }
-
-            console.log("[EXT-DEBUG] Upload completed");
-            return result;
-          } catch (error) {
-            console.error(`[EXT-DEBUG] Failed to upload ${file.filename}:`, error);
-            console.log("[EXT-DEBUG] Reporting failure to server...");
-
-            if (payload?.batchId) {
-              await reportUploadResult(payload.batchId, "failed", error.message);
-              error._uploadTrackingReported = true;
-            }
-
-            if (extensionLogger) {
-              await extensionLogger.logTaskFailed({
-                taskId: uploadTaskId,
-                taskType: type,
-                batchId: payload?.batchId,
-                ordersCount: payload?.trackingData?.length || 0,
-                filename: payload?.file?.filename
-              }, error, `[UPLOAD_TRACKING] Upload tracking failed: ${file.filename}`);
-            }
-
-            throw error;
-          }
-        } else {
-          console.log('⚠️ [EXT-DEBUG] Non-auto-generated UPLOAD_TRACKING task, skipping...');
-        }
-        break;
-
-      default:
-        console.log('❓ [EXT-DEBUG] Unknown task type:', type);
-        break;
-    }
-
-    console.log('✅ [EXT-DEBUG] Task processing completed successfully');
-
-  } catch (e) {
-    console.error("❌ [EXT-DEBUG] Task processing error:", e?.message || e);
-    console.error("📋 [EXT-DEBUG] Error stack:", e?.stack);
-    console.error("📦 [EXT-DEBUG] Task that caused error:", { type, payload });
-
-    // Report error for UPLOAD_TRACKING tasks
-    if (type === "UPLOAD_TRACKING" && payload?.batchId && !e?._uploadTrackingReported) {
-      console.log('📝 [EXT-DEBUG] Reporting task error to server...');
-      try {
-        await reportUploadResult(payload.batchId, 'failed', e?.message || 'Unknown error');
-      } catch (reportError) {
-        console.error('❌ [EXT-DEBUG] Failed to report error:', reportError);
-      }
-    }
-    return { ok: false, error: e?.message || String(e) };
-  }
-
-  console.log('📨 [EXT-DEBUG] ===== END TASK PROCESSING =====\n');
-}
-
-// ====== Tự động connect khi extension khởi động (nếu autoConnect=true) ======
-chrome.runtime.onInstalled.addListener(async () => {
-  console.log('[EXT-INSTALL] Extension installed/updated');
-  await initializeLogger();
-  if (extensionLogger) {
-    await extensionLogger.logInfo('Extension installed or updated', {
-      timestamp: new Date().toISOString(),
-      event: 'onInstalled'
-    });
-  }
-
-  const st = await chrome.storage.local.get(["autoConnect"]);
-  if (st.autoConnect === undefined) {
-    await chrome.storage.local.set({ autoConnect: true }); // bật mặc định
-  }
-  const s = await chrome.storage.local.get(["autoConnect"]);
-  if (s.autoConnect !== false) {
-    connectSocketIO(true); // force để chắc chắn kết nối lần đầu
-  }
-});
-
-chrome.runtime.onStartup.addListener(async () => {
-  console.log('[EXT-STARTUP] Extension starting up...');
-  await initializeLogger();
-  if (extensionLogger) {
-    await extensionLogger.logInfo('Extension startup initiated', {
-      timestamp: new Date().toISOString(),
-      event: 'onStartup'
-    });
-  }
-
-  const st = await chrome.storage.local.get(["autoConnect"]);
-  if (st.autoConnect !== false) {
-    connectSocketIO(true); // force trên mỗi lần khởi động
-  }
-});
-
-// ====== Tự reconnect khi đổi ingestUrl/shopId trong Options ======
-chrome.storage.onChanged.addListener(async (changes) => {
-  if (changes.ingestUrl || changes.shopId) {
-    console.log('[EXT-CONFIG] Configuration changed, reconnecting socket...');
-    if (extensionLogger) {
-      await extensionLogger.logInfo('Configuration changed, reconnecting socket', {
-        changes: Object.keys(changes),
-        timestamp: new Date().toISOString()
-      });
-    }
-    setTimeout(() => connectSocketIO(true), 300);
-  }
-});
-
-/* ===============================
-   DEBUG FUNCTIONS - Connection Diagnostics
-   =============================== */
-
-// Helper function để gửi log ra UI
-function debugLog(message, level = 'info') {
-  console.log(message); // Vẫn log console để backup
-
-  // Gửi message tới popup để hiển thị
-  chrome.runtime.sendMessage({
-    type: 'DEBUG_LOG',
-    payload: {
-      message: message,
-      level: level,
-      timestamp: new Date().toLocaleTimeString()
-    }
-  }).catch(() => { }); // Ignore error nếu popup không mở
-}
-
-// Function to refresh Amazon session and CSRF token
-async function refreshAmazonSession() {
-  debugLog('🔄 [SESSION] Refreshing Amazon session...', 'info');
-
-  try {
-    // Visit main seller central page to refresh session
-    const mainPageUrl = "https://sellercentral.amazon.com/";
-    const mainResponse = await requestOnce(mainPageUrl, { method: 'GET' });
-
-    if (mainResponse.ok) {
-      debugLog('✅ [SESSION] Main page visited successfully', 'success');
-
-      // Then visit feeds page to get fresh CSRF
-      const feedsPageUrl = "https://sellercentral.amazon.com/order-reports-and-feeds/feeds";
-      const feedsResponse = await requestOnce(feedsPageUrl, { method: 'GET' });
-
-      if (feedsResponse.ok) {
-        debugLog('✅ [SESSION] Feeds page visited successfully', 'success');
-        return true;
-      }
-    }
-
-    debugLog('❌ [SESSION] Failed to refresh session', 'error');
-    return false;
-  } catch (error) {
-    debugLog(`❌ [SESSION] Session refresh error: ${error.message}`, 'error');
-    return false;
-  }
-}
-
-// Test CSRF token extraction from Amazon feeds page
-async function testCSRFTokenExtraction() {
-  debugLog('🔍 [CSRF-TEST] Testing CSRF token extraction...', 'info');
-
-  try {
-    // Visit the feeds page to get CSRF token
-    const feedsPageUrl = "https://sellercentral.amazon.com/order-reports-and-feeds/feeds";
-    debugLog(`📄 [CSRF-TEST] Fetching feeds page: ${feedsPageUrl}`, 'info');
-
-    const feedsResponse = await requestOnce(feedsPageUrl, {
-      method: 'GET'
-    });
-
-    if (!feedsResponse.ok) {
-      debugLog(`❌ [CSRF-TEST] Failed to fetch feeds page: ${feedsResponse.status}`, 'error');
-      return null;
-    }
-
-    const feedsHtml = await feedsResponse.text();
-    debugLog(`📄 [CSRF-TEST] Page loaded, size: ${feedsHtml.length} chars`, 'info');
-
-    // Extract CSRF token from the page HTML
-    const csrfMatches = [
-      /csrfToken['"]\s*:\s*['"]([^'"]+)['"]/i,
-      /name=['"]csrfToken['"][^>]*value=['"]([^'"]+)['"]/i,
-      /anti-csrftoken-a2z['"]\s*:\s*['"]([^'"]+)['"]/i,
-      /"csrfToken"\s*:\s*"([^"]+)"/i,
-      /window\.csrfToken\s*=\s*['"]([^'"]+)['"]/i,
-      /data-csrf-token=['"]([^'"]+)['"]/i
-    ];
-
-    let csrfToken = null;
-    for (let i = 0; i < csrfMatches.length; i++) {
-      const regex = csrfMatches[i];
-      const match = feedsHtml.match(regex);
-      if (match && match[1]) {
-        csrfToken = match[1];
-        debugLog(`[CSRF-TEST] CSRF token found with pattern ${i + 1}: csrfIncluded=true csrfTokenLength=${csrfToken.length}`, 'success');
-        break;
-      } else {
-        debugLog(`❌ [CSRF-TEST] Pattern ${i + 1} failed`, 'info');
-      }
-    }
-
-    if (!csrfToken) {
-      debugLog(`❌ [CSRF-TEST] No CSRF token found in page HTML`, 'error');
-
-      // Try cookie fallback
-      const cookieToken = await getCookie("https://sellercentral.amazon.com/", "anti-csrftoken-a2z");
-      if (cookieToken) {
-        debugLog(`[CSRF-TEST] Found CSRF token in cookie: cookieFound=true csrfTokenLength=${cookieToken.length}`, 'info');
-        csrfToken = cookieToken;
-      } else {
-        debugLog(`❌ [CSRF-TEST] No CSRF token in cookie either`, 'error');
-      }
-    }
-
-    // Test with a sample upload (dry run)
-    if (csrfToken) {
-      debugLog(`[CSRF-TEST] CSRF token ready for upload: csrfIncluded=true csrfTokenLength=${csrfToken.length}`, 'success');
-
-      // Show what the FormData would look like
-      debugLog(`📋 [CSRF-TEST] FormData would include:`, 'info');
-      debugLog(`  - feedFile: [Binary File]`, 'info');
-      debugLog(`  - feedName: confirmShipment`, 'info');
-      debugLog(`  - feedVersion: new`, 'info');
-      debugLog(`  - csrfToken: csrfIncluded=true csrfTokenLength=${csrfToken.length}`, 'info');
-    }
-
-    return csrfToken;
-
-  } catch (error) {
-    debugLog(`❌ [CSRF-TEST] Error during CSRF test: ${error.message}`, 'error');
+async function runFullFlowAndEmitLogs(numDays) { try { const importResult = await runImportNewOrders(undefined, numDays); return { ok: true, phases: [{ type: "import", status: "success", rows: importResult?.rows || 0 }], result: importResult }; } catch (error) { await setOrderImportProgress('FAILED', 'Order import failed', { error: error?.message || String(error) }); throw error; } }
+async function pollExtensionCommands(config = null) { config ||= await getCfg(); const identity = await getBaseShopAndIdentity(); return pollExtensionCommand({ base: identity.base, token: config.ingestToken, client: { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }, runImport: (numDays) => runFullFlowAndEmitLogs(numDays), runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }), runTransactions: ({ dateFrom, dateTo }) => runImportTransactions({ dateFrom, dateTo }), runSettlements: () => runScheduledSettlementImport() }); }
+async function queueManualOrderImport() { const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }; const command = await queueOrderImportCommand({ base: identity.base, token: config.ingestToken, client }); await setOrderImportProgress('QUEUED', 'Import queued'); await pollExtensionCommandsWithBackoff({ force: true }); return { ok: true, commandId: command.id }; }
+async function queueManualAdsSpend(date) { const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }; const command = await queueAdsSpendCommand({ base: identity.base, token: config.ingestToken, client, date }); await pollExtensionCommandsWithBackoff({ force: true }); return { ok: true, commandId: command.id }; }
+async function pollExtensionCommandsWithBackoff({ force = false } = {}) {
+  const now = Date.now();
+  const state = await chrome.storage.local.get(EXTENSION_COMMAND_POLL_BACKOFF_KEY);
+  const backoff = state[EXTENSION_COMMAND_POLL_BACKOFF_KEY] || {};
+  if (!force && backoff.nextAttemptAt > now) return null;
+  const config = await getCfg();
+  if (!config.ingestUrl || !config.ingestToken) {
+    await chrome.storage.local.remove(EXTENSION_COMMAND_POLL_BACKOFF_KEY);
+    await chrome.storage.local.set({ [EXTENSION_CONNECTION_STATUS_KEY]: { state: "NOT_CONFIGURED", lastHeartbeatAt: null, nextPollAt: null, lastTask: null } });
     return null;
   }
-}
-
-// Code để debug connection - chỉ chạy khi cần
-async function runExtensionDiagnostics() {
-  debugLog('🔍 [EXT-DEBUG] Starting connection diagnostics...', 'info');
-
-  // 1. Kiểm tra identity
-  async function checkExtensionIdentity() {
-    try {
-      const identity = await getBaseShopAndIdentity();
-      debugLog('🔑 [EXT-DEBUG] Extension Identity:', 'info');
-      debugLog(`  - Base URL: ${identity.base}`, 'info');
-      debugLog(`  - Shop ID: ${identity.shopId}`, 'info');
-      debugLog(`  - Client ID (machineId): ${identity.clientId}`, 'info');
-      debugLog(`  - Client Label: ${identity.clientLabel}`, 'info');
-
-      // Kiểm tra match với test data
-      const expectedMachineId = '6977178d9e8e7a4069e38170';
-      const expectedShopId = '6977178d9e8e7a4069e38170';
-      debugLog('🎯 [EXT-DEBUG] Identity Check:', 'info');
-      debugLog(`  - Expected Machine ID: ${expectedMachineId}`, 'info');
-      debugLog(`  - Actual Machine ID: ${identity.clientId}`, 'info');
-      debugLog(`  - Machine ID Match: ${identity.clientId === expectedMachineId ? '✅' : '❌'}`,
-        identity.clientId === expectedMachineId ? 'success' : 'error');
-      debugLog(`  - Expected Shop ID: ${expectedShopId}`, 'info');
-      debugLog(`  - Actual Shop ID: ${identity.shopId}`, 'info');
-      debugLog(`  - Shop ID Match: ${identity.shopId === expectedShopId ? '✅' : '❌'}`,
-        identity.shopId === expectedShopId ? 'success' : 'error');
-
-      return identity;
-    } catch (error) {
-      debugLog(`❌ [EXT-DEBUG] Failed to get identity: ${error.message}`, 'error');
-      return null;
-    }
-  }
-
-  // 2. Kiểm tra Socket connection
-  function checkSocketConnection() {
-    debugLog('🔌 [EXT-DEBUG] Socket Connection Status:', 'info');
-    debugLog(`  - Socket exists: ${!!socket}`, 'info');
-    if (socket) {
-      debugLog(`  - Socket connected: ${!!socket?.connected}`, socket?.connected ? 'success' : 'error');
-      debugLog(`  - Socket ID: ${socket?.id || "NO_SOCKET"}`, 'info');
-      debugLog(`  - Socket URL: ${socket.io?.uri}`, 'info');
-      debugLog(`  - Socket transport: ${socket.io?.engine?.transport?.name}`, 'info');
-
-      // Kiểm tra auth data
-      if (socket.auth) {
-        const expectedMachineId = '6977178d9e8e7a4069e38170';
-        debugLog('🔑 [EXT-DEBUG] Socket Auth Check:', 'info');
-        debugLog(`  - Auth Machine ID: ${socket.auth.machineId}`, 'info');
-        debugLog(`  - Expected Machine ID: ${expectedMachineId}`, 'info');
-        debugLog(`  - Auth Match: ${socket.auth.machineId === expectedMachineId ? '✅' : '❌'}`,
-          socket.auth.machineId === expectedMachineId ? 'success' : 'error');
-      }
-    } else {
-      debugLog('❌ [EXT-DEBUG] Socket not found! Extension not connected.', 'error');
-    }
-  }
-
-  // 3. Test server room check
-  async function checkServerRooms(identity) {
-    try {
-      debugLog('🏠 [EXT-DEBUG] Checking server rooms...', 'info');
-      const response = await fetch(`${identity.base}/api/shipping-batch/debug/socket-rooms?machineId=${identity.clientId}`);
-      const data = await response.json();
-
-      debugLog(`  - Total sockets on server: ${data.totalSockets}`, 'info');
-      debugLog(`  - My room socket count: ${data.roomInfo?.socketCount || 0}`, 'info');
-
-      if (data.roomInfo?.socketCount === 0) {
-        debugLog('❌ [EXT-DEBUG] Extension not found in server room!', 'error');
-        debugLog('💡 [EXT-DEBUG] Possible issues:', 'error');
-        debugLog('  - Extension not connected to server', 'error');
-        debugLog('  - Wrong machineId in auth data', 'error');
-        debugLog('  - Socket middleware error', 'error');
-      } else {
-        debugLog('✅ [EXT-DEBUG] Extension found in server room', 'success');
-        data.roomInfo.sockets.forEach((sock, index) => {
-          debugLog(`  Socket ${index + 1}: ${sock.socketId} (${sock.machineId})`, 'info');
-        });
-      }
-
-      return data;
-    } catch (error) {
-      debugLog(`❌ [EXT-DEBUG] Failed to check server rooms: ${error.message}`, 'error');
-      return null;
-    }
-  }
-
-  // 4. Test task listener
-  function checkTaskListener() {
-    debugLog('👂 [EXT-DEBUG] Checking task listeners...', 'info');
-    if (socket) {
-      const listeners = socket.listeners('server:task');
-      debugLog(`  - server:task listeners: ${listeners.length}`, 'info');
-      if (listeners.length === 0) {
-        debugLog('❌ [EXT-DEBUG] No server:task listeners found!', 'error');
-        debugLog('💡 [EXT-DEBUG] Extension is not listening for tasks', 'error');
-      } else {
-        debugLog('✅ [EXT-DEBUG] Task listeners found', 'success');
-      }
-    }
-  }
-
-  // 5. Test create batch
-  async function testCreateBatch(identity) {
-    try {
-      debugLog('🧪 [EXT-DEBUG] Testing batch creation...', 'info');
-      const response = await fetch(`${identity.base}/api/shipping-batch/create-from-orders`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          machineId: identity.clientId,
-          orders: [{
-            orderId: '111-6132493-9725004',
-            shopId: identity.shopId
-          }],
-          label: 'Extension Debug Test',
-          autoUpload: true
-        })
-      });
-
-      const data = await response.json();
-      debugLog('📦 [EXT-DEBUG] Batch creation result:', 'info');
-      debugLog(`  - Success: ${data.ok}`, data.ok ? 'success' : 'error');
-      debugLog(`  - Batches created: ${data.successfulBatches}`, 'info');
-
-      if (data.batches) {
-        data.batches.forEach(batch => {
-          debugLog(`  - Batch ID: ${batch.batchId}`, 'info');
-          debugLog(`  - Auto task sent: ${batch.autoTaskSent}`, batch.autoTaskSent ? 'success' : 'error');
-          debugLog(`  - Orders: ${batch.totalOrders} (${batch.totalReal} real, ${batch.totalFake} fake)`, 'info');
-        });
-      }
-
-      return data;
-    } catch (error) {
-      debugLog(`❌ [EXT-DEBUG] Batch creation failed: ${error.message}`, 'error');
-      return null;
-    }
-  }
-
-  // Chạy tất cả tests
-  debugLog('🚀 [EXT-DEBUG] ===== FULL DIAGNOSTICS =====', 'info');
-
-  // Step 1: Check identity
-  const identity = await checkExtensionIdentity();
-  if (!identity) return;
-
-  // Step 2: Check socket
-  checkSocketConnection();
-
-  // Step 3: Check task listener
-  checkTaskListener();
-
-  // Step 4: Check server rooms
-  await checkServerRooms(identity);
-
-  // Step 5: Test batch creation
-  debugLog('🧪 [EXT-DEBUG] Testing batch creation (should trigger task)...', 'info');
-  await testCreateBatch(identity);
-
-  debugLog('⏰ [EXT-DEBUG] Waiting 5 seconds for task...', 'info');
-  setTimeout(() => {
-    debugLog('⏰ [EXT-DEBUG] If no task received above, there is a connection issue', 'error');
-  }, 5000);
-
-  debugLog('🚀 [EXT-DEBUG] ===== DIAGNOSTICS COMPLETE =====', 'success');
-}
-
-/* ========== Test Connection API ========== */
-
-// Report connection status via extensionLogger only
-async function testConnection() {
   try {
-    const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
-
-    if (!base || !clientId) {
-      if (extensionLogger) {
-        await extensionLogger.logConnectionStatus('config_check_failed', {
-          reason: 'missing_config',
-          base: !!base,
-          clientId: !!clientId
-        }, 'Connection status check failed: Missing configuration');
-      }
-      return { ok: false, reason: 'missing_config' };
-    }
-
-    // Chỉ báo cáo trạng thái socket hiện tại, không gọi API
-    const socketStatus = socket?.connected ? 'connected' : 'disconnected';
-    const socketId = socket?.id || null;
-
-    if (extensionLogger) {
-      await extensionLogger.logConnectionStatus(socketStatus, {
-        socketId,
-        machineId: clientId,
-        timestamp: new Date().toISOString(),
-        socketExists: !!socket
-      }, `Connection status report: Socket ${socketStatus}`);
-    }
-
-    return {
-      ok: socket?.connected || false,
-      socketStatus,
-      socketId,
-      machineId: clientId
-    };
-
+    const result = await pollExtensionCommands(config);
+    await chrome.storage.local.remove(EXTENSION_COMMAND_POLL_BACKOFF_KEY);
+    await chrome.storage.local.set({ [EXTENSION_CONNECTION_STATUS_KEY]: { state: "CONNECTED", lastHeartbeatAt: now, nextPollAt: now + 60_000, lastTask: result || null } });
+    return result;
   } catch (error) {
-    if (extensionLogger) {
-      await extensionLogger.logConnectionStatus('status_check_error', {
-        errorMessage: error.message,
-        errorStack: error.stack
-      }, `Connection status check error: ${error.message}`);
-    }
-
-    return { ok: false, error: error.message };
+    const failures = Math.min(Number(backoff.failures || 0) + 1, EXTENSION_COMMAND_POLL_BACKOFF_MINUTES.length);
+    const delayMinutes = EXTENSION_COMMAND_POLL_BACKOFF_MINUTES[failures - 1];
+    await chrome.storage.local.set({ [EXTENSION_COMMAND_POLL_BACKOFF_KEY]: { failures, nextAttemptAt: now + delayMinutes * 60_000 } });
+    await chrome.storage.local.set({ [EXTENSION_CONNECTION_STATUS_KEY]: { state: "DISCONNECTED", lastHeartbeatAt: backoff.lastHeartbeatAt || null, nextPollAt: now + delayMinutes * 60_000, lastTask: null } });
+    throw error;
   }
 }
-
-/* ===============================
-   AUTO CONFIG SCHEDULER
-   Reads backend config and reconciles chrome.alarms for production auto tasks.
-   =============================== */
-
-const autoConfigTimers = {}; // Legacy interval cleanup only; production scheduling uses chrome.alarms.
-const AUTO_CONFIG_TYPES = ["IMPORT_ORDER", "IMPORT_FBM", "IMPORT_ADS", "UPLOAD_TRACKING"];
-const AUTO_CONFIG_SYNC_ALARM = "AUTO_CFG_SYNC";
-const AUTO_CONFIG_DEBOUNCE_MS = 3000;
-let _autoConfigSyncTimer = null;
-let _lastAutoConfigSnapshot = null;
-let autoConfigSchedulerStarting = false;
-let autoConfigAlarmListenerRegistered = false;
-
-function yesterdayYMD() {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().slice(0, 10);
-}
-
-function getAutoConfigAlarmName(type) {
-  const names = {
-    IMPORT_ORDER: "AUTO_CFG_IMPORT_ORDER",
-    IMPORT_FBM: "AUTO_CFG_IMPORT_FBM",
-    IMPORT_ADS: "AUTO_CFG_IMPORT_ADS",
-    UPLOAD_TRACKING: "AUTO_CFG_UPLOAD_TRACKING",
-  };
-  return names[type] || null;
-}
-
-function isAutoConfigAlarmName(name) {
-  return name === AUTO_CONFIG_SYNC_ALARM || AUTO_CONFIG_TYPES.some((type) => getAutoConfigAlarmName(type) === name);
-}
-
-function autoConfigSnapshotForRecords(records = []) {
-  return JSON.stringify(
-    records
-      .map((r) => ({ type: r.type, status: r.status === true, time: Number.parseInt(r.time, 10) || 60 }))
-      .sort((a, b) => String(a.type).localeCompare(String(b.type)))
-  );
-}
-
-function getAutoConfigPeriodMinutes(record) {
-  return Math.max(1, Number.parseInt(record?.time, 10) || 60);
-}
-
-async function ensureAutoConfigSyncAlarm() {
-  await chrome.alarms.create(AUTO_CONFIG_SYNC_ALARM, { periodInMinutes: 10 });
-  debugLog("[AUTO-CFG] Alarm created AUTO_CFG_SYNC every 10 min", "info");
-}
-
-async function clearAutoConfigAlarms() {
-  const alarms = await chrome.alarms.getAll();
-  for (const alarm of alarms.filter((item) => isAutoConfigAlarmName(item.name))) {
-    await chrome.alarms.clear(alarm.name);
-    debugLog(`[AUTO-CFG] Alarm cleared ${alarm.name}`, "info");
-    extensionLogger?.logInfo("[AUTO-CFG] Alarm cleared", { name: alarm.name });
-  }
-}
-
-async function reconcileAutoConfigAlarms(records = []) {
-  const activeRecords = records.filter((record) => record.status === true && getAutoConfigAlarmName(record.type));
-  const desired = new Map();
-
-  for (const record of activeRecords) {
-    const name = getAutoConfigAlarmName(record.type);
-    const periodInMinutes = getAutoConfigPeriodMinutes(record);
-    desired.set(name, { record, periodInMinutes });
-  }
-  desired.set(AUTO_CONFIG_SYNC_ALARM, { periodInMinutes: 10 });
-
-  const existing = await chrome.alarms.getAll();
-  for (const alarm of existing.filter((item) => isAutoConfigAlarmName(item.name))) {
-    if (!desired.has(alarm.name)) {
-      await chrome.alarms.clear(alarm.name);
-      debugLog(`[AUTO-CFG] Alarm cleared ${alarm.name}`, "info");
-      extensionLogger?.logInfo("[AUTO-CFG] Alarm cleared", { name: alarm.name });
-    }
-  }
-
-  for (const [name, cfg] of desired.entries()) {
-    await chrome.alarms.create(name, { periodInMinutes: cfg.periodInMinutes });
-    debugLog(`[AUTO-CFG] Alarm created ${name} every ${cfg.periodInMinutes} min`, "success");
-    extensionLogger?.logInfo("[AUTO-CFG] Alarm created", { name, periodInMinutes: cfg.periodInMinutes, type: cfg.record?.type });
-  }
-
-  return { enabledCount: activeRecords.length, disabledCount: records.length - activeRecords.length, scheduler: "alarms" };
-}
-
-async function fetchAutoConfigRecords() {
-  return [];
-}
-
-async function startAutoConfigScheduler(options = {}) {
-  const force = !!options.force;
-  const reason = options.reason || "manual";
-
-  if (autoConfigSchedulerStarting) {
-    debugLog(`[AUTO-CFG] Scheduler already starting; skipping duplicate call reason=${reason} force=${force}`, "info");
-    extensionLogger?.logInfo("[AUTO-CFG] Scheduler already starting; skipping duplicate call", { force, reason });
-    return { ok: true, skipped: true, reason: "AUTO_CONFIG_SCHEDULER_ALREADY_STARTING", force };
-  }
-
-  const now = Date.now();
-  if (!force && startAutoConfigScheduler._lastRun && now - startAutoConfigScheduler._lastRun < AUTO_CONFIG_DEBOUNCE_MS) {
-    debugLog(`[AUTO-CFG] Debounced duplicate call, keeping existing alarms reason=${reason} force=${force}`, "info");
-    extensionLogger?.logInfo("[AUTO-CFG] Debounced duplicate call, keeping existing alarms", { force, reason });
-    return { ok: true, skipped: true, reason: "AUTO_CONFIG_SCHEDULER_DEBOUNCED", force };
-  }
-  startAutoConfigScheduler._lastRun = now;
-  autoConfigSchedulerStarting = true;
-
-  try {
-    if (!extensionLogger) await initializeLogger();
-    const listenerReady = ensureAutoConfigAlarmListener();
-    if (!listenerReady) {
-      return {
-        ok: false,
-        error: "CHROME_ALARMS_UNAVAILABLE",
-        message: "chrome.alarms is unavailable. Check manifest permissions.",
-        force,
-        reason,
-      };
-    }
-
-    const records = await fetchAutoConfigRecords();
-    const snapshot = autoConfigSnapshotForRecords(records);
-    _lastAutoConfigSnapshot = snapshot;
-
-    await chrome.storage.local.set({
-      autoConfigRecordsSnapshot: records,
-      autoConfigLastLoadedAt: Date.now(),
-      autoConfigSnapshot: snapshot,
-    });
-
-    debugLog(`[AUTO-CFG] Loaded ${records.length} configs from API`, "info");
-    debugLog(`[AUTO-CFG] Scheduler starting reason=${reason} force=${force}`, "info");
-    extensionLogger?.logInfo("[AUTO-CFG] Scheduler starting", { total: records.length, scheduler: "alarms", force, reason });
-
-    for (const type of AUTO_CONFIG_TYPES) {
-      const record = records.find((item) => item.type === type);
-      const mins = record ? getAutoConfigPeriodMinutes(record) : "N/A";
-      if (record?.status === true) {
-        debugLog(`[AUTO-CFG] ${type} ON interval=${mins} min`, "success");
-      } else {
-        debugLog(`[AUTO-CFG] ${type} OFF interval=${mins} min`, "info");
-      }
-    }
-
-    const result = await reconcileAutoConfigAlarms(records);
-    debugLog("[AUTO-CFG] Config changed; alarms reconciled", "success");
-    return { ok: true, ...result, force, reason };
-  } catch (error) {
-    debugLog(`[AUTO-CFG] Scheduler error: ${error.message}`, "error");
-    extensionLogger?.logError(error, { scheduler: "alarms", force, reason }, "[AUTO-CFG] Scheduler error");
-    return { ok: false, error: error.message, force, reason };
-  } finally {
-    autoConfigSchedulerStarting = false;
-  }
-}
-
-async function stopAutoConfigScheduler() {
-  for (const [key, timer] of Object.entries(autoConfigTimers)) {
-    clearInterval(timer);
-    delete autoConfigTimers[key];
-    debugLog(`[AUTO-CFG] Stopped legacy timer: ${key}`, "info");
-    extensionLogger?.logInfo(`[AUTO-CFG] Legacy timer stopped: ${key}`);
-  }
-  await clearAutoConfigAlarms();
-}
-
-async function handleAutoConfigAlarm(alarm) {
-  if (!alarm?.name || !isAutoConfigAlarmName(alarm.name)) return;
-  debugLog(`[AUTO-CFG] Alarm tick ${alarm.name}`, "info");
-  extensionLogger?.logInfo("[AUTO-CFG] Alarm tick", { name: alarm.name, scheduledTime: alarm.scheduledTime });
-
-  try {
-    if (alarm.name === "AUTO_CFG_IMPORT_ORDER") {
-      await handleServerTask({ type: "IMPORT_ORDERS", payload: { source: "auto_alarm" } });
-    } else if (alarm.name === "AUTO_CFG_IMPORT_FBM") {
-      await handleServerTask({ type: "IMPORT_FBM_ORDERS", payload: { source: "auto_alarm" } });
-    } else if (alarm.name === "AUTO_CFG_IMPORT_ADS") {
-      const date = yesterdayYMD();
-      await handleServerTask({ type: "IMPORT_ADS_SPEND", payload: { date, source: "auto_alarm" } });
-    } else if (alarm.name === "AUTO_CFG_UPLOAD_TRACKING") {
-      await runUploadTrackingWithLock({ source: "auto_alarm" });
-    } else if (alarm.name === AUTO_CONFIG_SYNC_ALARM) {
-      const records = await fetchAutoConfigRecords();
-      const snapshot = autoConfigSnapshotForRecords(records);
-      if (snapshot === _lastAutoConfigSnapshot) {
-        debugLog("[AUTO-CFG-SYNC] No changes detected", "info");
-        return;
-      }
-      debugLog("[AUTO-CFG] Config changed; alarms reconciled", "info");
-      await startAutoConfigScheduler({
-        force: true,
-        reason: "AUTO_CFG_SYNC_CHANGED"
-      });
-    }
-  } catch (error) {
-    debugLog(`[AUTO-CFG] Alarm ${alarm.name} error: ${error.message}`, "error");
-    extensionLogger?.logError(error, { alarmName: alarm.name }, "[AUTO-CFG] Alarm error");
-  }
-}
-
-function ensureAutoConfigAlarmListener() {
-  if (!chrome?.alarms?.onAlarm) {
-    const message = "[AUTO-CFG] chrome.alarms unavailable. Check manifest permissions: add 'alarms'.";
-    debugLog(message, "error");
-    extensionLogger?.logInfo(message, {
-      missingPermission: "alarms",
-      manifestHint: "Add 'alarms' to permissions in manifest.json"
-    });
-    return false;
-  }
-
-  if (
-    autoConfigAlarmListenerRegistered ||
-    chrome.alarms.onAlarm.hasListener(handleAutoConfigAlarm)
-  ) {
-    autoConfigAlarmListenerRegistered = true;
-    return true;
-  }
-
-  chrome.alarms.onAlarm.addListener(handleAutoConfigAlarm);
-  autoConfigAlarmListenerRegistered = true;
-  debugLog("[AUTO-CFG] Alarm listener registered", "success");
-  extensionLogger?.logInfo("[AUTO-CFG] Alarm listener registered");
-  return true;
-}
-
-async function startAutoConfigSync() {
-  if (_autoConfigSyncTimer) {
-    clearInterval(_autoConfigSyncTimer);
-    _autoConfigSyncTimer = null;
-  }
-  const listenerReady = ensureAutoConfigAlarmListener();
-  if (!listenerReady) {
-    return { ok: false, error: "CHROME_ALARMS_UNAVAILABLE" };
-  }
-  await ensureAutoConfigSyncAlarm();
-  debugLog("[AUTO-CFG-SYNC] Started with chrome.alarms every 10 min", "info");
-  return { ok: true, scheduler: "alarms" };
-}
-
-async function stopAutoConfigSync() {
-  if (_autoConfigSyncTimer) {
-    clearInterval(_autoConfigSyncTimer);
-    _autoConfigSyncTimer = null;
-  }
-  await chrome.alarms.clear(AUTO_CONFIG_SYNC_ALARM);
-  debugLog("[AUTO-CFG-SYNC] Stopped", "info");
-}
-
-if (!ensureAutoConfigAlarmListener()) {
-  debugLog("[AUTO-CFG] Initial alarm listener registration skipped", "error");
-}
-
-// Bắt đầu polling connection status report mỗi 3 phút
-function startTestConnectionPolling() {
-  // Dừng polling cũ nếu có
-  stopTestConnectionPolling();
-
-  if (extensionLogger) {
-    extensionLogger.logInfo('Connection status polling started', { interval: '3min' });
-  }
-
-  // Report status ngay lập tức
-  testConnection();
-
-  // Sau đó report mỗi 3 phút
-  testConnectionInterval = setInterval(() => {
-    testConnection();
-  }, 180000); // 3 phút = 180000ms
-}
-
-// Dừng polling connection status report
-function stopTestConnectionPolling() {
-  if (testConnectionInterval) {
-    safeLogInfo('Connection status polling stopped');
-    clearInterval(testConnectionInterval);
-    testConnectionInterval = null;
-  }
-}
-
-// Bắt đầu auto reconnect polling mỗi 30 phút
-function startAutoReconnectPolling() {
-  // Dừng polling cũ nếu có
-  stopAutoReconnectPolling();
-
-  safeLogInfo('Auto reconnect polling started', { interval: '30min' });
-
-  // Polling mỗi 30 phút
-  autoReconnectInterval = setInterval(async () => {
-    try {
-      const { autoConnect } = await chrome.storage.local.get(['autoConnect']);
-
-      // Chỉ auto reconnect nếu autoConnect được bật
-      if (autoConnect !== false) {
-        if (extensionLogger) {
-          await extensionLogger.logInfo('Auto reconnect polling check', {
-            socketExists: !!socket,
-            socketConnected: socket?.connected || false,
-            timestamp: new Date().toISOString()
-          });
-        }
-
-        // Nếu socket không tồn tại hoặc không connected, thử kết nối lại
-        if (!socket || !socket.connected) {
-          if (extensionLogger) {
-            await extensionLogger.logInfo('Auto reconnect triggered - socket disconnected', {
-              socketExists: !!socket,
-              socketConnected: socket?.connected || false
-            });
-          }
-
-          await connectSocketIO(true); // Force reconnect
-        } else {
-          if (extensionLogger) {
-            await extensionLogger.logInfo('Auto reconnect check - socket already connected', {
-              socketId: socket?.id || null
-            });
-          }
-        }
-      } else {
-        if (extensionLogger) {
-          await extensionLogger.logInfo('Auto reconnect skipped - autoConnect disabled');
-        }
-      }
-    } catch (error) {
-      if (extensionLogger) {
-        await extensionLogger.logError(error, {
-          context: 'auto_reconnect_polling'
-        }, 'Auto reconnect polling error');
-      }
-    }
-  }, 600000); // 30 phút = 1800000ms
-}
-
-// Dừng auto reconnect polling
-function stopAutoReconnectPolling() {
-  if (autoReconnectInterval) {
-    safeLogInfo('Auto reconnect polling stopped');
-    clearInterval(autoReconnectInterval);
-    autoReconnectInterval = null;
-  }
-}
-
-// Expose debug function globally
-globalThis.runExtensionDiagnostics = runExtensionDiagnostics;
-globalThis.testConnection = testConnection;
-globalThis.startTestConnectionPolling = startTestConnectionPolling;
-globalThis.stopTestConnectionPolling = stopTestConnectionPolling;
-globalThis.startAutoReconnectPolling = startAutoReconnectPolling;
-globalThis.stopAutoReconnectPolling = stopAutoReconnectPolling;
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  (async () => {
-    try {
-      if (msg.type === "PING") return sendResponse({ ok: true });
-
-      if (msg?.type === "GET_LAST_UPLOAD_TRACKING_FINAL_TSV") {
-        const data = await chrome.storage.local.get(["lastUploadTrackingFinalTsv"]);
-        const item = data.lastUploadTrackingFinalTsv || {};
-        return sendResponse({
-          ok: !!item.content,
-          batchId: item.batchId || null,
-          filename: item.filename || "",
-          rows: item.rows || 0,
-          tsvLength: item.tsvLength || 0,
-          tsvChecksum: item.tsvChecksum || "",
-          contentJsonPreview: item.contentJsonPreview || "",
-          lineBreakAudit: item.lineBreakAudit || null,
-          content: item.content || ""
-        });
-      }
-
-      if (msg?.type === "DOWNLOAD_LAST_UPLOAD_TRACKING_FINAL_TSV") {
-        const data = await chrome.storage.local.get(["lastUploadTrackingFinalTsv"]);
-        const item = data.lastUploadTrackingFinalTsv || {};
-        if (!item.content) return sendResponse({ ok: false, error: "No final TSV snapshot found" });
-        if (!chrome.downloads?.download) {
-          return sendResponse({
-            ok: false,
-            error: "downloads permission is not enabled for this extension",
-            batchId: item.batchId || null,
-            filename: item.filename || "",
-            rows: item.rows || 0,
-            tsvLength: item.tsvLength || 0,
-            tsvChecksum: item.tsvChecksum || ""
-          });
-        }
-
-        const batchId = String(item.batchId || "unknown").replace(/[^A-Za-z0-9._-]/g, "_");
-        let method = "dataUrl";
-        let url = "data:text/plain;charset=utf-8," + encodeURIComponent(item.content);
-        if (typeof URL?.createObjectURL === "function" && typeof Blob !== "undefined") {
-          try {
-            url = URL.createObjectURL(new Blob([item.content], { type: "text/plain;charset=utf-8" }));
-            method = "blobUrl";
-          } catch {
-            url = "data:text/plain;charset=utf-8," + encodeURIComponent(item.content);
-            method = "dataUrl";
-          }
-        }
-        const downloadId = await chrome.downloads.download({
-          url,
-          filename: `debug-final-upload-tracking-${batchId}.txt`,
-          saveAs: true
-        });
-        if (method === "blobUrl") setTimeout(() => URL.revokeObjectURL(url), 30000);
-        return sendResponse({ ok: true, downloadId, method });
-      }
-
-      if (msg?.type === "UPLOADFEED_CSRF_CAPTURED") {
-        const result = await saveUploadFeedCsrfTokenCapture(msg.payload || {});
-        return sendResponse({ ok: true, saved: !!result?.ok, source: result?.source, tokenLength: result?.tokenLength });
-      }
-
-      if (msg?.type === "UPLOADFEED_SNIFFER_DEBUG") {
-        const payload = msg.payload || {};
-        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed sniffer debug", {
-          event: payload.event || "",
-          href: payload.href || "",
-          title: payload.title || "",
-          installedAt: payload.installedAt || 0,
-        }, "info");
-        return sendResponse({ ok: true });
-      }
-
-      if (msg?.type === "INSTALL_UPLOADFEED_CSRF_SNIFFER") {
-        const tab = await findOrOpenSellerCentralFeedsTab();
-        if (!tab?.id) return sendResponse({ ok: false, error: "Unable to open Seller Central feeds tab" });
-        await waitForSellerCentralTabComplete(tab.id);
-        await delayMs(1000);
-        await installUploadFeedCsrfSniffer(tab.id);
-        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer installed by debug command", {
-          tabId: tab.id,
-          message: "Sniffer installed. Perform one manual Seller Central upload to capture csrfToken.",
-        }, "success");
-        return sendResponse({
-          ok: true,
-          tabId: tab.id,
-          message: "Sniffer installed. Perform one manual Seller Central upload to capture csrfToken.",
-        });
-      }
-
-      if (msg?.type === "VERIFY_UPLOADFEED_SNIFFER") {
-        const tab = await findOrOpenSellerCentralFeedsTab();
-        if (!tab?.id) return sendResponse({ ok: false, error: "Unable to open Seller Central feeds tab" });
-        await waitForSellerCentralTabComplete(tab.id);
-        const [res] = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          world: "MAIN",
-          func: () => ({
-            mainWorldFlag: !!window.__APO_UPLOADFEED_SNIFFER_INSTALLED__,
-            installedAt: window.__APO_UPLOADFEED_SNIFFER_INSTALLED_AT__ || 0,
-            href: location.href,
-            title: document.title,
-            fetchPatched: !!window.fetch?.__apoUploadFeedPatched,
-            requestPatched: !!window.Request?.__apoUploadFeedPatched,
-            xhrPatched: !!XMLHttpRequest.prototype.send?.__apoUploadFeedPatched,
-            formDataAppendPatched: !!FormData.prototype.append?.__apoUploadFeedPatched,
-            formDataSetPatched: !!FormData.prototype.set?.__apoUploadFeedPatched,
-            consoleLogPatched: !!console.log?.__apoUploadFeedPatched,
-          }),
-        });
-        return sendResponse({ ok: true, tabId: tab.id, ...(res?.result || {}) });
-      }
-
-      if (msg?.type === "TEST_UPLOADFEED_SNIFFER_CAPTURE") {
-        const tab = await findOrOpenSellerCentralFeedsTab();
-        if (!tab?.id) return sendResponse({ ok: false, error: "Unable to open Seller Central feeds tab" });
-        await waitForSellerCentralTabComplete(tab.id);
-        await installUploadFeedCsrfSniffer(tab.id);
-        const [res] = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          world: "MAIN",
-          func: () => {
-            const fakeToken = "A".repeat(104);
-            console.log("dispatching", {
-              type: "UPLOAD_ACTION",
-              feedTypeName: "confirmShipment",
-              __apoTestToken: true,
-              payload: { csrfToken: fakeToken },
-            });
-            return {
-              ok: true,
-              tokenLength: fakeToken.length,
-              href: location.href,
-              title: document.title,
-            };
-          },
-        });
-        await delayMs(500);
-        const data = await chrome.storage.local.get([AMAZON_UPLOADFEED_CSRF_CACHE_KEY]);
-        const cache = data[AMAZON_UPLOADFEED_CSRF_CACHE_KEY] || null;
-        return sendResponse({
-          ok: true,
-          tabId: tab.id,
-          injected: res?.result || {},
-          cache: {
-            tokenFound: !!cache?.token,
-            tokenLength: cache?.tokenLength || 0,
-            source: cache?.source || null,
-            isTestToken: !!cache?.isTestToken,
-            valid: !!cache?.token && isValidUploadFeedCsrfToken(cache.token),
-          },
-        });
-      }
-
-      if (msg?.type === "GET_UPLOADFEED_READINESS_STATUS") {
-        return sendResponse(await getUploadFeedReadinessStatus(msg.options || {}));
-      }
-
-      if (msg?.type === "CHECK_UPLOADFEED_CSRF_CACHE") {
-        const cacheStatus = await getUploadFeedCsrfCacheStatus();
-        return sendResponse({
-          ok: true,
-          tokenFound: cacheStatus.tokenFound,
-          tokenLength: cacheStatus.tokenLength,
-          source: cacheStatus.source,
-          ageMs: cacheStatus.ageMs,
-          ageMin: cacheStatus.ageMin,
-          isTestToken: cacheStatus.isTestToken,
-          valid: cacheStatus.valid,
-        });
-      }
-
-      if (msg?.type === "CLEAR_UPLOADFEED_CSRF_CACHE") {
-        return sendResponse(await clearUploadFeedCsrfCache("manual_debug"));
-      }
-
-      if (msg?.type === "SOCKET_RESET_BUSY") {
-        connectBusy = false;
-        try {
-          if (socket) socket.disconnect();
-        } catch { }
-        socket = null;
-        stopHeartbeat();
-        return sendResponse({ ok: true });
-      }
-
-      if (msg.type === "RELOAD_AUTO_CONFIG") {
-        const result = await startAutoConfigScheduler();
-        await startAutoConfigSync();
-        return sendResponse(result);
-      }
-
-      if (msg.type === "ADS_BRIDGE_LOG") {
-        const { level, message, rawData } = msg.payload || {};
-        if (!extensionLogger) await initializeLogger();
-        if (extensionLogger) {
-          if (level === "error") {
-            await extensionLogger.logError({ message, code: "ADS_BRIDGE" }, rawData || {}, message);
-          } else {
-            await extensionLogger.logInfo(message, rawData || {});
-          }
-        }
-        return sendResponse({ ok: true });
-      }
-
-      if (msg.type === "RUN_ADS_SPEND")
-        return sendResponse(await runExportAdsSpend(msg.payload?.date));
-
-      if (msg?.type === "RUN_TRANSACTIONS_IMPORT")
-        return sendResponse(await runImportTransactions(msg.payload || {}));
-
-      if (msg?.type === "RUN_SETTLEMENTS_IMPORT")
-        return sendResponse(await runImportSettlements(msg.payload || {}));
-
-      // Manual full flow (CLICK) — emit log qua socket
-      if (msg.type === "AUTO_RUN_NOW")
-        return sendResponse(await runFullFlowAndEmitLogs("click"));
-
-      if (msg?.type === "SOCKET_CONNECT") {
-        const r = await connectSocketIO(true); // force reconnect
-        sendResponse(r);
-        return;
-      }
-      if (msg?.type === "SOCKET_SET_AUTOCONNECT") {
-        await chrome.storage.local.set({ autoConnect: !!msg.enabled });
-        sendResponse({ ok: true, enabled: !!msg.enabled });
-        return;
-      }
-
-      if (msg?.type === "ADS_CHECK_NAMES") {
-        const date = todayYMD();
-        return sendResponse(await checkCampaign(date));
-      }
-
-      if (msg?.type === "RUN_DIAGNOSTICS") {
-        runExtensionDiagnostics();
-        return sendResponse({ ok: true, message: "Diagnostics started, check console" });
-      }
-
-      if (msg?.type === "OPEN_AMAZON_SC") {
-        // Open Amazon Seller Central to get cookies
-        debugLog('🌐 [AMAZON] Opening Amazon Seller Central...', 'info');
-
-        chrome.tabs.create({
-          url: "https://sellercentral.amazon.com/order-reports-and-feeds/reports",
-          active: true
-        }, (tab) => {
-          if (chrome.runtime.lastError) {
-            debugLog(`❌ [AMAZON] Failed to open Amazon SC: ${chrome.runtime.lastError.message}`, 'error');
-            sendResponse({ ok: false, error: chrome.runtime.lastError.message });
-          } else {
-            debugLog('✅ [AMAZON] Amazon Seller Central opened successfully', 'success');
-            debugLog('💡 [AMAZON] Please login and then test upload again', 'info');
-            sendResponse({ ok: true, message: "Amazon Seller Central opened", tabId: tab.id });
-          }
-        });
-        return true; // Keep message channel open for async response
-      }
-
-      if (msg?.type === "CHECK_AMAZON_COOKIES") {
-        // Check Amazon cookies
-        const cookies = {};
-        try {
-          cookies.csrfA2z = await getCookie("https://sellercentral.amazon.com/", "anti-csrftoken-a2z");
-          cookies.sessionId = await getCookie("https://sellercentral.amazon.com/", "session-id");
-          cookies.sessionToken = await getCookie("https://sellercentral.amazon.com/", "session-token");
-          cookies.ubidMain = await getCookie("https://sellercentral.amazon.com/", "ubid-main");
-
-          debugLog('🍪 [COOKIES] Amazon Cookies Check:', 'info');
-          debugLog(`  - anti-csrftoken-a2z: ${cookies.csrfA2z ? 'Found' : 'Missing'}`, cookies.csrfA2z ? 'success' : 'error');
-          debugLog(`  - session-id: ${cookies.sessionId ? 'Found' : 'Missing'}`, cookies.sessionId ? 'success' : 'error');
-          debugLog(`  - session-token: ${cookies.sessionToken ? 'Found' : 'Missing'}`, cookies.sessionToken ? 'success' : 'error');
-          debugLog(`  - ubid-main: ${cookies.ubidMain ? 'Found' : 'Missing'}`, cookies.ubidMain ? 'success' : 'error');
-
-          if (!cookies.csrfA2z) {
-            debugLog('❌ [COOKIES] No CSRF token found - please login to Amazon Seller Central', 'error');
-          } else if (!cookies.sessionId) {
-            debugLog('❌ [COOKIES] No session found - please login to Amazon Seller Central', 'error');
-          } else {
-            debugLog('✅ [COOKIES] Amazon authentication looks good', 'success');
-          }
-
-          return sendResponse({
-            ok: true,
-            cookies: Object.fromEntries(Object.entries(cookies).map(([key, value]) => [key, !!value]))
-          });
-        } catch (error) {
-          debugLog(`❌ [COOKIES] Error checking cookies: ${error.message}`, 'error');
-          return sendResponse({ ok: false, error: error.message });
-        }
-      }
-
-      if (msg?.type === "TEST_CSRF_EXTRACTION") {
-        // Test CSRF token extraction
-        debugLog('🧪 [TEST] Starting CSRF token extraction test...', 'info');
-
-        try {
-          const csrfToken = await testCSRFTokenExtraction();
-          return sendResponse({
-            ok: true,
-            csrfIncluded: !!csrfToken,
-            csrfTokenLength: String(csrfToken || "").length,
-            message: csrfToken ? 'CSRF token extracted successfully' : 'No CSRF token found'
-          });
-        } catch (error) {
-          debugLog(`❌ [TEST] CSRF extraction test failed: ${error.message}`, 'error');
-          return sendResponse({ ok: false, error: error.message });
-        }
-      }
-
-      if (msg?.type === "TEST_UPLOAD_WITH_TOKEN") {
-        // Test upload với CSRF token thủ công
-        const { csrfToken } = msg.payload || {};
-
-        if (!csrfToken) {
-          debugLog('❌ [TEST] No CSRF token provided', 'error');
-          return sendResponse({ ok: false, error: "CSRF token required" });
-        }
-
-        debugLog(`[TEST] Testing upload with manual CSRF token: csrfIncluded=true csrfTokenLength=${String(csrfToken || "").length}`, 'info');
-
-        const testTask = {
-          type: 'UPLOAD_TRACKING',
-          payload: {
-            autoGenerated: true,
-            reason: 'Manual test with CSRF token',
-            batchId: 'test_manual_' + Date.now(),
-            file: {
-              content: 'order-id\tship-date\tcarrier-code\ttracking-number\tship-method\n113-6500150-8449038\t2026-04-06T00:22:22+00:00\tUSPS\t9400136105660294358530\tUSPS First Class\n',
-              filename: 'test_manual_csrf.txt',
-              contentType: 'text/tab-separated-values; charset=utf-8'
-            },
-            uploadParams: {
-              csrfToken: csrfToken,
-              carrierCode: 'USPS',
-              shipMethod: 'USPS First Class',
-              shipDate: '2026-04-06T00:22:22+00:00'
-            }
-          }
-        };
-
-        const { payload } = testTask;
-
-        if (payload) {
-          const { file, uploadParams } = payload;
-          const blob = new Blob([file.content], { type: file.contentType });
-          const fileObj = new File([blob], file.filename);
-
-          try {
-            const result = await withUploadTrackingLock("UPLOAD_TRACKING_TEST_TOKEN", async () => {
-              return uploadToAmazon(fileObj, uploadParams);
-            });
-            if (result?.skipped) {
-              debugLog("[UPLOAD_TRACKING] Manual CSRF test skipped because another upload is running", "info");
-              return sendResponse(result);
-            }
-            debugLog("Manual CSRF test successful!", "success");
-            return sendResponse({ ok: true, message: "Manual CSRF test successful", result });
-          } catch (error) {
-            debugLog(`Manual CSRF test failed: ${error.message}`, "error");
-            return sendResponse({ ok: false, error: error.message });
-          }
-        }
-
-        return sendResponse({ ok: false, error: "Missing upload payload" });
-      }
-
-      if (msg?.type === "TEST_CONNECTION") {
-        // Test connection thủ công
-        const result = await testConnection();
-        return sendResponse(result);
-      }
-
-      if (msg?.type === "START_TEST_POLLING") {
-        // Bắt đầu polling thủ công
-        startTestConnectionPolling();
-        return sendResponse({ ok: true, message: "Test connection polling started" });
-      }
-
-      if (msg?.type === "STOP_TEST_POLLING") {
-        // Dừng polling thủ công
-        stopTestConnectionPolling();
-        return sendResponse({ ok: true, message: "Test connection polling stopped" });
-      }
-
-      if (msg?.type === "START_AUTO_RECONNECT") {
-        // Bắt đầu auto reconnect polling thủ công
-        startAutoReconnectPolling();
-        return sendResponse({ ok: true, message: "Auto reconnect polling started" });
-      }
-
-      if (msg?.type === "STOP_AUTO_RECONNECT") {
-        // Dừng auto reconnect polling thủ công
-        stopAutoReconnectPolling();
-        return sendResponse({ ok: true, message: "Auto reconnect polling stopped" });
-      }
-
-      if (msg?.type === "TEST_UPLOAD_TRACKING") {
-        // Test manual upload tracking task
-        const testTask = {
-          type: 'UPLOAD_TRACKING',
-          payload: {
-            autoGenerated: true,
-            reason: 'Manual test from extension',
-            batchId: 'test_' + Date.now(),
-            file: {
-              content: 'order-id\tship-date\tcarrier-code\ttracking-number\tship-method\n113-6500150-8449038\t2026-04-06T00:22:22+00:00\tUSPS\t9400136105660294358530\tUSPS First Class\n',
-              filename: 'test_tracking_upload.txt',
-              contentType: 'text/tab-separated-values; charset=utf-8'
-            },
-            uploadParams: {
-              carrierCode: 'USPS',
-              shipMethod: 'USPS First Class',
-              shipDate: '2026-04-06T00:22:22+00:00'
-            },
-            trackingData: [{
-              orderId: '113-6500150-8449038',
-              tracking: '9400136105660294358530',
-              isFake: false,
-              source: 'test'
-            }]
-          }
-        };
-
-        // Simulate task reception
-        debugLog('🧪 [TEST] Simulating UPLOAD_TRACKING task...', 'info');
-
-        const result = await handleServerTask(testTask);
-        if (result?.skipped) {
-          return sendResponse(result);
-        }
-        return sendResponse({ ok: true, message: "Test upload task completed", result });
-      }
-
-      sendResponse({ ok: false, message: "Unknown command" });
-    } catch (e) {
-      sendResponse({ ok: false, message: String(e?.message || e) });
-    }
-  })();
-  return true;
-});
-
-// ── Khởi động tự động khi background script load ──
-// Không phụ thuộc socket, chỉ cần có shopId và ingestUrl
-(async () => {
-  try {
-    const { ingestUrl, shopId } = await getCfg();
-    if (!ingestUrl || !shopId) {
-      debugLog("⚙️ [INIT] Chưa có shopId/ingestUrl — bỏ qua auto start", "info");
-      return;
-    }
-    debugLog("🚀 [INIT] Extension loaded — starting auto scheduler...", "info");
-    await startAutoConfigScheduler();
-    await startAutoConfigSync();
-    debugLog("✅ [INIT] Auto scheduler & sync started", "success");
-  } catch (e) {
-    debugLog(`❌ [INIT] Auto start error: ${e.message}`, "error");
-  }
-})();
+async function startExtensionCommandPolling() { await chrome.alarms.create(EXTENSION_COMMAND_POLL_ALARM, { periodInMinutes: 1 }); await pollExtensionCommandsWithBackoff().catch(() => undefined); }
+chrome.runtime.onInstalled.addListener(() => startExtensionCommandPolling());
+chrome.runtime.onStartup.addListener(() => startExtensionCommandPolling());
+chrome.storage.onChanged.addListener((changes) => { if (changes.ingestUrl || changes.ingestToken) startExtensionCommandPolling(); });
+chrome.alarms.onAlarm.addListener((alarm) => { if (alarm?.name === EXTENSION_COMMAND_POLL_ALARM) pollExtensionCommandsWithBackoff().catch(() => undefined); });
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => { (async () => { if (msg?.type === "PING") return sendResponse({ ok: true }); if (msg?.type === "HEARTBEAT_NOW") { await pollExtensionCommandsWithBackoff({ force: true }); return sendResponse({ ok: true, message: "Heartbeat completed." }); } if (msg?.type === "AUTO_RUN_NOW") return sendResponse(await queueManualOrderImport()); if (msg?.type === "RUN_ADS_SPEND") return sendResponse(await queueManualAdsSpend(msg.payload?.date)); if (msg?.type === "RUN_TRANSACTIONS_IMPORT") return sendResponse(await runImportTransactions(msg.payload || {})); if (msg?.type === "RUN_SETTLEMENTS_IMPORT") return sendResponse(await runImportSettlements(msg.payload || {})); if (msg?.type === "GMAIL_AMAZON_ADS_DOWNLOAD") return sendResponse(await uploadGmailAdsDownload(msg.url)); return sendResponse({ ok: false, error: "Unsupported action" }); })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) })); return true; });

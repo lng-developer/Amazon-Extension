@@ -14,7 +14,13 @@
   const ADS_HOST = "advertising.amazon.com";
   const ADS_BASE = `https://${ADS_HOST}`;
   const RETRIEVE_URL = `${ADS_BASE}/a9g-api-gateway/cm/dds/retrieveReport`;
+  const REPORTING_URLS = {
+    QUERY_CONFIGURATIONS: `${ADS_BASE}/a9g-api-gateway/adsApi/v1/query/reportConfigurations`,
+    CREATE_CONFIGURATION: `${ADS_BASE}/a9g-api-gateway/adsApi/v1/create/reportConfigurations`,
+    RUN_CONFIGURATION: `${ADS_BASE}/a9g-api-gateway/adsApi/v1/create/scheduledReports`,
+  };
   const MSG_TYPE_SNIFF = "APO_ADS_HEADER_SNIFF";
+  const MSG_TYPE_DOWNLOAD = "APO_ADS_DOWNLOAD_URL";
 
   if (!location.host.endsWith(ADS_HOST)) {
     console.warn("[APO][ADS] Wrong host for ads_bridge.js:", location.href);
@@ -41,6 +47,7 @@
           "adsMarketplaceId",
           "adsCsrfData",
           "adsCsrfToken",
+          "adsReportingCsrfToken",
           "adsHeaderLastSeen",
           "adsApiLockState",
           "adsCandidateHeaders",
@@ -101,6 +108,7 @@
       adsMarketplaceId,
       adsCsrfData,
       adsCsrfToken,
+      adsReportingCsrfToken,
     } = await getCfg();
 
     const h = {
@@ -120,6 +128,7 @@
     // CSRF bắt buộc
     if (adsCsrfData) h["Amazon-Advertising-Api-Csrf-Data"] = adsCsrfData;
     if (adsCsrfToken) h["Amazon-Advertising-Api-Csrf-Token"] = adsCsrfToken;
+    if (adsReportingCsrfToken) h["x-csrf-token"] = adsReportingCsrfToken;
 
     // Cảnh báo nhẹ nếu thiếu cặp CSRF
     if (!adsCsrfData || !adsCsrfToken) {
@@ -136,7 +145,6 @@
     const pagination = reportConfig?.offsetPagination || {};
 
     const cfg = await getCfg();
-    console.log("[ADS][DEBUG][cfg]", JSON.stringify(cfg, null, 2));
     bridgeLog("info", "[ADS_BRIDGE] Storage config loaded", {
       hasAccountId: !!cfg.adsAccountId,
       hasAdvertiserId: !!cfg.adsAdvertiserId,
@@ -148,21 +156,12 @@
     });
 
     const headers = await buildAdsHeaders();
-    const safeHeadersForLog = Object.fromEntries(
-      Object.entries(headers).map(([k, v]) => [
-        k,
-        /csrf|token|account|advertiser|client/i.test(k) && v ? `${String(v).slice(0, 6)}...` : v,
-      ])
-    );
-    console.log("[APO][ADS] retrieveReport → headers(use)", safeHeadersForLog);
     bridgeLog("info", "[ADS_BRIDGE] retrieveReport headers built", {
       hasAccountId: !!headers["Amazon-Ads-Account-Id"],
       hasAdvertiserId: !!headers["Amazon-Advertising-Api-Advertiserid"],
       hasCsrfToken: !!headers["Amazon-Advertising-Api-Csrf-Token"],
       hasCsrfData: !!headers["Amazon-Advertising-Api-Csrf-Data"],
     });
-    console.log("[APO][ADS] retrieveReport → payload", payload);
-
     const res = await fetch(RETRIEVE_URL, {
       method: "POST",
       credentials: "include",
@@ -174,7 +173,6 @@
     });
 
     const text = await res.text();
-    console.log("[APO][ADS] retrieveReport ←", res.status, text.slice(0, 300));
     bridgeLog(
       res.ok ? "info" : "error",
       `[ADS_BRIDGE] retrieveReport response: ${res.status} offset=${pagination.offset}`,
@@ -188,10 +186,77 @@
         runId: options.runId,
         lockOwner: !!options.lockOwner,
         attempt: options.attempt,
-        preview: text.slice(0, 300),
       }
     );
     return { status: res.status, ok: res.ok, text };
+  }
+
+  async function callReportingApi(operation, payload) {
+    const url = REPORTING_URLS[operation];
+    if (!url) throw new Error(`Unsupported Amazon Ads reporting operation: ${operation}`);
+    const res = await fetch(url, {
+      method: 'POST',
+      credentials: 'include',
+      headers: await buildAdsHeaders(),
+      referrer: `${ADS_BASE}/reporting`,
+      referrerPolicy: 'strict-origin-when-cross-origin',
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_) { }
+    if (!res.ok) throw new Error(`Amazon Ads reporting ${operation} failed (${res.status}).`);
+    return { status: res.status, data };
+  }
+
+  function isVisible(element) {
+    const rect = element?.getBoundingClientRect?.();
+    return !!rect && rect.width > 0 && rect.height > 0;
+  }
+
+  function findDownloadControl() {
+    return [...document.querySelectorAll('a,button,[role="menuitem"]')]
+      .find((element) => isVisible(element) && /download latest/i.test(element.textContent || element.getAttribute('aria-label') || ''));
+  }
+
+  async function revealDownloadControl() {
+    const direct = findDownloadControl();
+    if (direct) return direct;
+    const menuButtons = [...document.querySelectorAll('button,[role="button"]')]
+      .filter((element) => isVisible(element) && /more|action|option/i.test([
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.textContent,
+      ].filter(Boolean).join(' ')));
+    for (const button of menuButtons) {
+      button.click();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const control = findDownloadControl();
+      if (control) return control;
+    }
+    return null;
+  }
+
+  async function requestLatestDownload() {
+    const direct = await revealDownloadControl();
+    if (!direct) throw new Error('Amazon Ads Download latest is unavailable. Keep the Amazon Reporting tab open and try again.');
+    const href = direct.href || '';
+    if (/amazonaws\.com/i.test(href)) return href;
+    return await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        window.removeEventListener('message', onMessage);
+        reject(new Error('Amazon Ads did not provide a CSV download link.'));
+      }, 15_000);
+      const onMessage = (event) => {
+        const message = event?.data;
+        if (event.origin !== location.origin || message?.type !== MSG_TYPE_DOWNLOAD || !message.url) return;
+        clearTimeout(timeout);
+        window.removeEventListener('message', onMessage);
+        resolve(message.url);
+      };
+      window.addEventListener('message', onMessage);
+      direct.click();
+    });
   }
 
   // ---------- Inject page script để bắt headers từ request gốc ----------
@@ -253,20 +318,13 @@
   }
 
   // ---------- Nhận headers từ page → lưu storage ----------
-  let lastWrite = 0;
   window.addEventListener("message", async (evt) => {
     const msg = evt && evt.data;
     if (!msg || !msg.__apo) return;
     if (msg.type !== MSG_TYPE_SNIFF) return;
     const data = msg.data || {};
     try {
-      // debounce nhỏ để tránh spam storage
-      const now = Date.now();
-      if (now - lastWrite < 300) return;
-      lastWrite = now;
-
       await saveCapturedAdsHeaders(data, "ads_bridge");
-      console.log("[APO][ADS] captured headers -> storage/candidate", data);
     } catch (e) {
       console.warn("[APO][ADS] save headers error:", e);
     }
@@ -278,6 +336,24 @@
   // ---------- Bridge từ background ----------
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     (async () => {
+      if (msg?.type === 'ADS_REPORTING_REQUEST') {
+        try {
+          const result = await callReportingApi(msg.operation, msg.payload);
+          sendResponse({ ok: true, ...result });
+        } catch (error) {
+          sendResponse({ ok: false, status: 0, message: error?.message || String(error) });
+        }
+        return;
+      }
+      if (msg?.type === 'ADS_DOWNLOAD_LATEST_REPORT') {
+        try {
+          const downloadUrl = await requestLatestDownload();
+          sendResponse({ ok: true, downloadUrl });
+        } catch (error) {
+          sendResponse({ ok: false, status: 0, message: error?.message || String(error) });
+        }
+        return;
+      }
       if (msg?.type !== "ADS_FETCH_REPORT") return;
       try {
         const r = await callRetrieveReport(msg.payload, msg.options || {});

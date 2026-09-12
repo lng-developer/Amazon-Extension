@@ -1,7 +1,11 @@
 export const DEFAULT_ENVIRONMENTS = {
-  production: { ingestUrl: "https://api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
   development: { ingestUrl: "https://dev-api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
 };
+
+export const DEVELOPMENT_API_URLS = [
+  "https://dev-api.lngmerch.co",
+  "http://localhost:3001",
+];
 
 export function normalizeBaseUrl(u) {
   if (!u) return "";
@@ -12,18 +16,18 @@ export function normalizeBaseUrl(u) {
     .replace(/\/+$/, "");
 }
 
+export function resolveDevelopmentApiUrl(value) {
+  const base = normalizeBaseUrl(value);
+  return DEVELOPMENT_API_URLS.includes(base) ? base : DEFAULT_ENVIRONMENTS.development.ingestUrl;
+}
+
 export function deriveApiUrls(ingestUrl) {
   const base = normalizeBaseUrl(ingestUrl);
   return {
     base,
     importNewUrl: base ? `${base}/api/integration/external-order-imports/manual-excel` : "",
     adsSpendUrl: base ? `${base}/api/finance/imports/ads` : "",
-    getSeller: base ? `${base}/api/user/employee-code` : "",
-    importFBMUrl: base ? `${base}/api/shipping-batches` : "",
-    checkOrdersStatusUrl: base ? `${base}/api/shipping-batch/check-orders-status` : "",
-    createShippingBatchUrl: base ? `${base}/api/shipping-batch/create-from-orders` : "",
     transactionsImportUrl: base ? `${base}/api/finance/imports/transactions` : "",
     settlementsImportUrl: base ? `${base}/api/finance/imports/settlements` : "",
-    logUrl: base ? `${base}/api/logs/add` : "",
   };
 }

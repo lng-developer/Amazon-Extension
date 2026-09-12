@@ -4,52 +4,57 @@
   "version": "0.3.0",
   "description": "Auto Pull Order - LNG Group",
   "icons": {
-    "16": "logo.jpg",
-    "32": "logo.jpg",
-    "48": "logo.jpg",
-    "128": "logo.jpg"
+    "16": "icons/logo-16.png",
+    "32": "icons/logo-32.png",
+    "48": "icons/logo-48.png",
+    "128": "icons/logo-128.png"
   },
   "permissions": [
-    "cookies",
     "storage",
     "tabs",
     "scripting",
     "alarms",
-    "webRequest",
-    "webRequestBlocking",
-    "downloads"
+    "cookies"
   ],
   "host_permissions": [
     "https://sellercentral.amazon.com/*",
     "https://advertising.amazon.com/*",
+    "https://na.r.ads.amazon.com/*",
+    "https://mail.google.com/*",
+    "https://decorated-reports-prod-iad.s3.amazonaws.com/*",
     "https://api.lngmerch.co/*",
     "https://dev-api.lngmerch.co/*",
-    "https://*.trycloudflare.com/*",
-    "http://localhost:5000/*"
-  ],
-  "content_scripts": [
-    {
-      "matches": ["https://advertising.amazon.com/*"],
-      "js": ["ads_bridge.js"],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": ["https://advertising.amazon.com/*"],
-      "js": ["ads_name_guard.js"],
-      "run_at": "document_idle"
-    }
+    "http://localhost:3001/*"
   ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
+  "content_scripts": [
+    {
+      "matches": ["https://advertising.amazon.com/*"],
+      "js": ["ads_bridge.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://advertising.amazon.com/*"],
+      "js": ["ads_main_sniffer.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://mail.google.com/*"],
+      "js": ["gmail_report_bridge.js"],
+      "run_at": "document_start"
+    }
+  ],
   "action": {
-    "default_title": "AMZ EXTENSION LNG",
     "default_popup": "options.html",
+    "default_title": "AMZ EXTENSION LNG",
     "default_icon": {
-      "16": "logo.jpg",
-      "32": "logo.jpg",
-      "128": "logo.jpg"
+      "16": "icons/logo-16.png",
+      "32": "icons/logo-32.png",
+      "128": "icons/logo-128.png"
     }
   }
 }
