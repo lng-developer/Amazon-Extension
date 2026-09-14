@@ -62,7 +62,7 @@ async function fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limi
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetchImpl(url, { credentials: 'include', signal: controller.signal });
-      if (response.ok) return response.json();
+      if (response.ok) return await response.json();
       if (![429, 500, 502, 503, 504].includes(response.status) || attempt === 2) throw new Error(`Amazon transaction request failed (${response.status})`);
     } catch (error) {
       if (controller.signal.aborted) throw new Error('Amazon transaction request timed out');

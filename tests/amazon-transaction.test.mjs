@@ -88,6 +88,31 @@ test('fails a transaction request that does not receive an Amazon response', asy
   );
 });
 
+test('fails when Amazon sends headers but its response body stays pending', async () => {
+  let signal;
+  await assert.rejects(
+    fetchTransactionsCsv({
+      dateFrom: '2026-09-13',
+      dateTo: '2026-09-13',
+      timeoutMs: 1,
+      fetchImpl: async (_url, options) => {
+        signal = options.signal;
+        return {
+          ok: true,
+          json: () => new Promise((_resolve, reject) => {
+            const pending = setTimeout(() => reject(new Error('response body stayed pending')), 10);
+            signal.addEventListener('abort', () => {
+              clearTimeout(pending);
+              reject(new Error('request aborted'));
+            }, { once: true });
+          }),
+        };
+      },
+    }),
+    /Amazon transaction request timed out/,
+  );
+});
+
 test('summarizes the fetched CSV without logging transaction contents', () => {
   const summary = summarizeTransactionCsv(buildTransactionCsv([
     row(Date.UTC(2026, 8, 14)),
