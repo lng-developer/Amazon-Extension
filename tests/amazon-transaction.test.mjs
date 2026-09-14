@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildTransactionCsv, fetchTransactionsCsv } from '../amazonTransaction.js';
+import { buildTransactionCsv, fetchTransactionsCsv, summarizeTransactionCsv } from '../amazonTransaction.js';
 
 const page = (pageNumber, rows, numberOfRows = rows.length) => ({
   tableMetadata: { numberOfRows, pageNumber },
@@ -41,4 +41,19 @@ test('fetches all pages sequentially and returns one CSV', async () => {
   assert.equal(calls.length, 2);
   assert.match(calls[1], /offset=2/);
   assert.equal(csv.split('\n').length, 3);
+  const request = new URL(calls[0]);
+  assert.equal(request.searchParams.get('fiqFiltersString'), '(startTimestamp==1788627600000)(endTimestamp==1788800399999)');
+});
+
+test('summarizes the fetched CSV without logging transaction contents', () => {
+  const summary = summarizeTransactionCsv(buildTransactionCsv([
+    row(Date.UTC(2026, 8, 14)),
+    row(Date.UTC(2026, 8, 13)),
+  ]));
+
+  assert.deepEqual(summary, {
+    rowCount: 2,
+    postedDateMin: '2026-09-13',
+    postedDateMax: '2026-09-14',
+  });
 });

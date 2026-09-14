@@ -14,7 +14,7 @@ import {
   shouldFailReportStatus,
 } from './adsReporting.js';
 import { classifyAmazonAdsReportLink, createGmailAdsDownloadFingerprint } from './gmailReportDownload.js';
-import { fetchTransactionsCsv as fetchAmazonTransactionsCsv } from './amazonTransaction.js';
+import { fetchTransactionsCsv as fetchAmazonTransactionsCsv, summarizeTransactionCsv } from './amazonTransaction.js';
 import {
   SETTLEMENT_IMPORT_COOLDOWN_MS,
   canStartSettlementImport,
@@ -1338,6 +1338,12 @@ async function runImportTransactions({ dateFrom, dateTo } = {}) {
   try {
     const { transactionsImportUrl } = deriveApiUrls(ingestUrl);
     const csv = await fetchTransactionsCsvFromAmazon({ dateFrom, dateTo });
+    const contentHash = await sha256Key(csv);
+    await extensionLogger.logInfo('Transaction CSV fetched', {
+      ...context,
+      ...summarizeTransactionCsv(csv),
+      contentHash,
+    });
     const idempotencyKey = await sha256Key(`TRANSACTIONS|${dateFrom}|${dateTo}|${csv}`);
     const result = await postFileTo(transactionsImportUrl, {
       salesChannelCode: "AMAZON",

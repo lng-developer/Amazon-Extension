@@ -27,6 +27,22 @@ export function buildTransactionCsv(rows = []) {
   })].map((line) => Array.isArray(line) ? line.map(csvCell).join(',') : line).join('\n');
 }
 
+export function summarizeTransactionCsv(csv = '') {
+  const postedDates = String(csv).split(/\r?\n/).slice(1)
+    .map((line) => line.match(/^"((?:""|[^"])*)"/)?.[1]?.replaceAll('""', ''))
+    .map((value) => {
+      const match = value?.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      return match ? `${match[3]}-${match[1].padStart(2, '0')}-${match[2].padStart(2, '0')}` : null;
+    })
+    .filter(Boolean)
+    .sort();
+  return {
+    rowCount: Math.max(String(csv).split(/\r?\n/).filter(Boolean).length - 1, 0),
+    postedDateMin: postedDates[0] || null,
+    postedDateMax: postedDates.at(-1) || null,
+  };
+}
+
 function timestamp(date, endOfDay = false) {
   const value = new Date(`${date}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}`).getTime();
   if (!Number.isFinite(value)) throw new Error(`Invalid transaction date: ${date}`);
