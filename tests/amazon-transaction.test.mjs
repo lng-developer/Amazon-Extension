@@ -70,6 +70,25 @@ test('uses Amazon Payments default page size', async () => {
   assert.equal(new URL(calls[0]).searchParams.get('limit'), '10');
 });
 
+test('reports safe page diagnostics without transaction details', async () => {
+  const diagnostics = [];
+  await fetchTransactionsCsv({
+    dateFrom: '2026-09-13',
+    dateTo: '2026-09-13',
+    onPage: async (diagnostic) => diagnostics.push(diagnostic),
+    fetchImpl: async () => ({ ok: true, json: async () => page(1, [row(Date.UTC(2026, 8, 13, 12))]) }),
+  });
+
+  assert.deepEqual(diagnostics, [{
+    offset: 1,
+    pageNumber: 1,
+    totalRows: 1,
+    returnedRows: 1,
+    postedAtMin: Date.UTC(2026, 8, 13, 12),
+    postedAtMax: Date.UTC(2026, 8, 13, 12),
+  }]);
+});
+
 test('fails a transaction request that does not receive an Amazon response', async () => {
   await assert.rejects(
     fetchTransactionsCsv({

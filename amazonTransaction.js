@@ -81,15 +81,33 @@ async function fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limi
   throw new Error('Amazon transaction request failed');
 }
 
-function assertRowsWithinRequestedRange(rows, startTimestamp, endTimestamp, dateFrom, dateTo) {
-  const outsideRange = rows.some((row) => {
+function pageDiagnostic({ page, offset, totalRows, rows }) {
+  const postedAts = rows
+    .map((row) => Number((row.tableCells || []).find((cell) => cell.columnIdentifier === 'POSTED_DATE')?.value?.dateEpochMillis))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  return {
+    offset,
+    pageNumber: Number(page.tableMetadata?.pageNumber || offset),
+    totalRows,
+    returnedRows: rows.length,
+    postedAtMin: postedAts[0] || null,
+    postedAtMax: postedAts.at(-1) || null,
+  };
+}
+
+function assertRowsWithinRequestedRange(rows, startTimestamp, endTimestamp, dateFrom, dateTo, diagnostic) {
+  const outsideRange = rows.find((row) => {
     const postedAt = Number((row.tableCells || []).find((cell) => cell.columnIdentifier === 'POSTED_DATE')?.value?.dateEpochMillis);
     return Number.isFinite(postedAt) && (postedAt < startTimestamp || postedAt > endTimestamp);
   });
-  if (outsideRange) throw new Error(`Amazon returned transactions outside requested date range: ${dateFrom} to ${dateTo}`);
+  if (outsideRange) {
+    const postedAt = Number((outsideRange.tableCells || []).find((cell) => cell.columnIdentifier === 'POSTED_DATE')?.value?.dateEpochMillis);
+    throw new Error(`Amazon returned transactions outside requested date range: ${dateFrom} to ${dateTo} (page ${diagnostic.pageNumber}, postedAtEpochMillis ${postedAt})`);
+  }
 }
 
-export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch, limit = 10, sleep = sleepDefault, timeoutMs = AMAZON_REQUEST_TIMEOUT_MS } = {}) {
+export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch, limit = 10, sleep = sleepDefault, timeoutMs = AMAZON_REQUEST_TIMEOUT_MS, onPage = async () => {} } = {}) {
   const startTimestamp = timestamp(dateFrom);
   const endTimestamp = timestamp(dateTo, true);
   const rows = [];
@@ -100,11 +118,13 @@ export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch
     const page = await fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limit, timeoutMs });
     const pageRows = page.tableRows || [];
     total = Number(page.tableMetadata?.numberOfRows ?? rows.length + pageRows.length);
+    const diagnostic = pageDiagnostic({ page, offset, totalRows: total, rows: pageRows });
+    await onPage(diagnostic);
+    assertRowsWithinRequestedRange(pageRows, startTimestamp, endTimestamp, dateFrom, dateTo, diagnostic);
     rows.push(...pageRows);
     if (!pageRows.length || rows.length >= total) break;
     await sleep(500);
   }
   const resultRows = rows.slice(0, total ?? rows.length);
-  assertRowsWithinRequestedRange(resultRows, startTimestamp, endTimestamp, dateFrom, dateTo);
   return buildTransactionCsv(resultRows);
 }

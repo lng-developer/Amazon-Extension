@@ -1337,7 +1337,11 @@ async function runImportTransactions({ dateFrom, dateTo } = {}) {
   await extensionLogger.logTaskProcessing(context, 'Transaction task started');
   try {
     const { transactionsImportUrl } = deriveApiUrls(ingestUrl);
-    const csv = await fetchTransactionsCsvFromAmazon({ dateFrom, dateTo });
+    const csv = await fetchTransactionsCsvFromAmazon({
+      dateFrom,
+      dateTo,
+      onPage: (diagnostic) => extensionLogger.logInfo('Transaction page fetched', { ...context, ...diagnostic }),
+    });
     const contentHash = await sha256Key(csv);
     await extensionLogger.logInfo('Transaction CSV fetched', {
       ...context,
