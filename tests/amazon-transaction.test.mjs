@@ -34,7 +34,7 @@ test('fetches all pages sequentially and returns one CSV', async () => {
   const fetchImpl = async (url) => {
     calls.push(String(url));
     const pageNumber = Number(new URL(url).searchParams.get('offset'));
-    return { ok: true, json: async () => page(pageNumber, [row(pageNumber)], 2) };
+    return { ok: true, json: async () => page(pageNumber, [row(Date.UTC(2026, 8, 6, 12))], 2) };
   };
 
   const csv = await fetchTransactionsCsv({ dateFrom: '2026-09-06', dateTo: '2026-09-07', fetchImpl, limit: 1, sleep: async () => {} });
@@ -42,7 +42,19 @@ test('fetches all pages sequentially and returns one CSV', async () => {
   assert.match(calls[1], /offset=2/);
   assert.equal(csv.split('\n').length, 3);
   const request = new URL(calls[0]);
-  assert.equal(request.searchParams.get('fiqFiltersString'), '(startTimestamp==1788627600000)(endTimestamp==1788800399999)');
+  assert.equal(request.searchParams.get('fiqFiltersString'), '(startTimestamp==1788627600000);(endTimestamp==1788800399999)');
+});
+
+test('rejects an Amazon response with posted dates outside the requested range', async () => {
+  await assert.rejects(
+    fetchTransactionsCsv({
+      dateFrom: '2026-09-13',
+      dateTo: '2026-09-13',
+      fetchImpl: async () => ({ ok: true, json: async () => page(1, [row(Date.UTC(2026, 4, 23))]) }),
+      sleep: async () => {},
+    }),
+    /Amazon returned transactions outside requested date range: 2026-09-13 to 2026-09-13/,
+  );
 });
 
 test('summarizes the fetched CSV without logging transaction contents', () => {

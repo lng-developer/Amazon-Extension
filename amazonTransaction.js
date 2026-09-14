@@ -54,7 +54,7 @@ async function fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limi
   url.searchParams.set('limit', String(limit));
   url.searchParams.set('offset', String(offset));
   url.searchParams.set('accountType', 'PAYABLE');
-  url.searchParams.set('fiqFiltersString', `(startTimestamp==${startTimestamp})(endTimestamp==${endTimestamp})`);
+  url.searchParams.set('fiqFiltersString', `(startTimestamp==${startTimestamp});(endTimestamp==${endTimestamp})`);
   url.searchParams.set('sortType', 'DESC');
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const response = await fetchImpl(url, { credentials: 'include' });
@@ -63,6 +63,14 @@ async function fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limi
     await sleepDefault(500 * (2 ** attempt));
   }
   throw new Error('Amazon transaction request failed');
+}
+
+function assertRowsWithinRequestedRange(rows, startTimestamp, endTimestamp, dateFrom, dateTo) {
+  const outsideRange = rows.some((row) => {
+    const postedAt = Number((row.tableCells || []).find((cell) => cell.columnIdentifier === 'POSTED_DATE')?.value?.dateEpochMillis);
+    return Number.isFinite(postedAt) && (postedAt < startTimestamp || postedAt > endTimestamp);
+  });
+  if (outsideRange) throw new Error(`Amazon returned transactions outside requested date range: ${dateFrom} to ${dateTo}`);
 }
 
 export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch, limit = 50, sleep = sleepDefault } = {}) {
@@ -80,5 +88,7 @@ export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch
     if (!pageRows.length || rows.length >= total) break;
     await sleep(500);
   }
-  return buildTransactionCsv(rows.slice(0, total ?? rows.length));
+  const resultRows = rows.slice(0, total ?? rows.length);
+  assertRowsWithinRequestedRange(resultRows, startTimestamp, endTimestamp, dateFrom, dateTo);
+  return buildTransactionCsv(resultRows);
 }
