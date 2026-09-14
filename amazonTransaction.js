@@ -59,10 +59,16 @@ async function fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limi
   url.searchParams.set('sortType', 'DESC');
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let timeout;
+    const timeoutPromise = new Promise((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        controller.abort();
+        reject(new Error('Amazon transaction request timed out'));
+      }, timeoutMs);
+    });
     try {
-      const response = await fetchImpl(url, { credentials: 'include', signal: controller.signal });
-      if (response.ok) return await response.json();
+      const response = await Promise.race([fetchImpl(url, { credentials: 'include', signal: controller.signal }), timeoutPromise]);
+      if (response.ok) return await Promise.race([response.json(), timeoutPromise]);
       if (![429, 500, 502, 503, 504].includes(response.status) || attempt === 2) throw new Error(`Amazon transaction request failed (${response.status})`);
     } catch (error) {
       if (controller.signal.aborted) throw new Error('Amazon transaction request timed out');
