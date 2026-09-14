@@ -73,7 +73,7 @@ function assertRowsWithinRequestedRange(rows, startTimestamp, endTimestamp, date
   if (outsideRange) throw new Error(`Amazon returned transactions outside requested date range: ${dateFrom} to ${dateTo}`);
 }
 
-export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch, limit = 50, sleep = sleepDefault } = {}) {
+export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch, limit = 10, sleep = sleepDefault } = {}) {
   const startTimestamp = timestamp(dateFrom);
   const endTimestamp = timestamp(dateTo, true);
   const rows = [];

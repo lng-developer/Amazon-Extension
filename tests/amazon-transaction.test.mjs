@@ -57,6 +57,19 @@ test('rejects an Amazon response with posted dates outside the requested range',
   );
 });
 
+test('uses Amazon Payments default page size', async () => {
+  const calls = [];
+  await fetchTransactionsCsv({
+    dateFrom: '2026-09-13',
+    dateTo: '2026-09-13',
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      return { ok: true, json: async () => page(1, [], 0) };
+    },
+  });
+  assert.equal(new URL(calls[0]).searchParams.get('limit'), '10');
+});
+
 test('summarizes the fetched CSV without logging transaction contents', () => {
   const summary = summarizeTransactionCsv(buildTransactionCsv([
     row(Date.UTC(2026, 8, 14)),
