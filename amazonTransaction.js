@@ -1,4 +1,5 @@
 const AMAZON_EVENTS_URL = 'https://sellercentral.amazon.com/payments/api/events-view';
+const AMAZON_REQUEST_TIMEOUT_MS = 30_000;
 const HEADERS = ['Date', 'Transaction Status', 'Transaction type', 'Order ID', 'Product Details', 'Total product charges', 'Total promotional rebates', 'Amazon fees', 'Other', 'Total (USD)'];
 
 const sleepDefault = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -49,7 +50,7 @@ function timestamp(date, endOfDay = false) {
   return value;
 }
 
-async function fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limit }) {
+async function fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limit, timeoutMs }) {
   const url = new URL(AMAZON_EVENTS_URL);
   url.searchParams.set('limit', String(limit));
   url.searchParams.set('offset', String(offset));
@@ -57,9 +58,18 @@ async function fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limi
   url.searchParams.set('fiqFiltersString', `(startTimestamp==${startTimestamp});(endTimestamp==${endTimestamp})`);
   url.searchParams.set('sortType', 'DESC');
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const response = await fetchImpl(url, { credentials: 'include' });
-    if (response.ok) return response.json();
-    if (![429, 500, 502, 503, 504].includes(response.status) || attempt === 2) throw new Error(`Amazon transaction request failed (${response.status})`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetchImpl(url, { credentials: 'include', signal: controller.signal });
+      if (response.ok) return response.json();
+      if (![429, 500, 502, 503, 504].includes(response.status) || attempt === 2) throw new Error(`Amazon transaction request failed (${response.status})`);
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error('Amazon transaction request timed out');
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
     await sleepDefault(500 * (2 ** attempt));
   }
   throw new Error('Amazon transaction request failed');
@@ -73,7 +83,7 @@ function assertRowsWithinRequestedRange(rows, startTimestamp, endTimestamp, date
   if (outsideRange) throw new Error(`Amazon returned transactions outside requested date range: ${dateFrom} to ${dateTo}`);
 }
 
-export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch, limit = 10, sleep = sleepDefault } = {}) {
+export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch, limit = 10, sleep = sleepDefault, timeoutMs = AMAZON_REQUEST_TIMEOUT_MS } = {}) {
   const startTimestamp = timestamp(dateFrom);
   const endTimestamp = timestamp(dateTo, true);
   const rows = [];
@@ -81,7 +91,7 @@ export async function fetchTransactionsCsv({ dateFrom, dateTo, fetchImpl = fetch
   let total = null;
   for (let offset = 1; rows.length < (total ?? 1); offset += 1) {
     if (rows.length >= totalLimit) throw new Error('Amazon transaction result exceeds 5000 rows');
-    const page = await fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limit });
+    const page = await fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limit, timeoutMs });
     const pageRows = page.tableRows || [];
     total = Number(page.tableMetadata?.numberOfRows ?? rows.length + pageRows.length);
     rows.push(...pageRows);

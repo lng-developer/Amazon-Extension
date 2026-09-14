@@ -70,6 +70,24 @@ test('uses Amazon Payments default page size', async () => {
   assert.equal(new URL(calls[0]).searchParams.get('limit'), '10');
 });
 
+test('fails a transaction request that does not receive an Amazon response', async () => {
+  await assert.rejects(
+    fetchTransactionsCsv({
+      dateFrom: '2026-09-13',
+      dateTo: '2026-09-13',
+      timeoutMs: 1,
+      fetchImpl: (_url, options) => new Promise((_resolve, reject) => {
+        const pending = setTimeout(() => reject(new Error('fetch stayed pending')), 10);
+        options.signal?.addEventListener('abort', () => {
+          clearTimeout(pending);
+          reject(new Error('request aborted'));
+        }, { once: true });
+      }),
+    }),
+    /Amazon transaction request timed out/,
+  );
+});
+
 test('summarizes the fetched CSV without logging transaction contents', () => {
   const summary = summarizeTransactionCsv(buildTransactionCsv([
     row(Date.UTC(2026, 8, 14)),
