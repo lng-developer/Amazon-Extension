@@ -20,6 +20,20 @@ test('falls back to the largest declared image, never invents an original URL', 
   const result = extract({ image: { 'data-a-dynamic-image': JSON.stringify({ 'https://m.media-amazon.com/images/I/small.jpg': [100,100], [url]: [1254,1254] }) } });
   assert.equal(result.sourceUrl, url);
 });
+test('invalid preferred MAIN URLs fall back to the verified MAIN src', () => {
+  const src = 'https://m.media-amazon.com/images/I/61o8k673O+L._AC_SX679_.jpg';
+  assert.equal(extract({ image: {
+    'data-old-hires': 'https://m.media-amazon.com/unsupported/main.jpg',
+    'data-a-dynamic-image': JSON.stringify({ 'https://m.media-amazon.com/unsupported/large.jpg': [1500,1500] }),
+    src,
+  } }).sourceUrl, src);
+});
+test('invalid high resolution URL falls back to largest trusted dynamic MAIN image', () => {
+  assert.equal(extract({ image: { 'data-old-hires': 'https://evil.test/main.jpg',
+    'data-a-dynamic-image': JSON.stringify({ 'https://evil.test/large.jpg': [2000,2000], [url]: [1254,1254] }),
+    src: 'https://m.media-amazon.com/images/I/small.jpg',
+  } }).sourceUrl, url);
+});
 test('refuses redirected variant and CAPTCHA instead of copying another image', () => {
   assert.equal(extract({pageAsin:'B000000001'}).errorCode, 'ASIN_MISMATCH');
   assert.equal(extract({challenge:true}).errorCode, 'AMAZON_CHALLENGE');
