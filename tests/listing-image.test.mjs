@@ -23,8 +23,8 @@ test('falls back to the largest declared image, never invents an original URL', 
 test('invalid preferred MAIN URLs fall back to the verified MAIN src', () => {
   const src = 'https://m.media-amazon.com/images/I/61o8k673O+L._AC_SX679_.jpg';
   assert.equal(extract({ image: {
-    'data-old-hires': 'https://m.media-amazon.com/unsupported/main.jpg',
-    'data-a-dynamic-image': JSON.stringify({ 'https://m.media-amazon.com/unsupported/large.jpg': [1500,1500] }),
+    'data-old-hires': 'https://untrusted.test/main.jpg',
+    'data-a-dynamic-image': JSON.stringify({ 'https://untrusted.test/large.jpg': [1500,1500] }),
     src,
   } }).sourceUrl, src);
 });
@@ -62,6 +62,25 @@ test('download returns image bytes without sending Amazon cookies', async () => 
     return new Response(new Uint8Array([255,216,255,224]),{headers:{'content-type':'image/jpeg'}});
   }});
   assert.equal(blob.type,'image/jpeg'); assert.equal(blob.size,4);
+});
+test('trusted CDN paths are opaque during MAIN extraction and download', async () => {
+  for (const sourceUrl of [
+    'https://m.media-amazon.com/images/W/BW_MEDIAX_AVIF_MEASUREMENT_1306696-T2/images/I/61GdTTezDrL._AC_SX679_.jpg',
+    'https://m.media-amazon.com/future-layout/main-image',
+  ]) {
+    assert.equal(extract({ image: { src: sourceUrl } }).sourceUrl, sourceUrl);
+    const blob = await images.downloadListingImage(sourceUrl, { fetchImpl: async (requested) => {
+      assert.equal(requested, sourceUrl);
+      return new Response(new Uint8Array([255,216,255,224]), { headers: { 'content-type': 'image/jpeg' } });
+    } });
+    assert.equal(blob.size, 4);
+  }
+});
+test('CDN URL validation rejects protocol, credentials, ports and hostname lookalikes', async () => {
+  for (const bad of ['http://m.media-amazon.com/a', 'https://user:pass@m.media-amazon.com/a', 'https://m.media-amazon.com:8443/a', 'https://m.media-amazon.com.evil.test/a', 'https://evil.test/m.media-amazon.com/a']) {
+    assert.equal(extract({ image: { src: bad } }).errorCode, 'INVALID_IMAGE_URL');
+    await assert.rejects(images.downloadListingImage(bad, { fetchImpl: () => { assert.fail('Must not fetch'); } }), /trusted/);
+  }
 });
 
 function fixture({fatal=false, paused=false}={}) {

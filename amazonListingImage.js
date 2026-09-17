@@ -32,7 +32,7 @@ export function inspectListingMainImage(expectedAsin) {
       const url = new URL(sourceUrl);
       // Never include URL credentials, query, fragment, or arbitrary path in logs.
       diagnostic = `${sourceKind}; protocol=${url.protocol}; host=${url.hostname.slice(0,80)}; path=${url.pathname.startsWith('/images/I/') ? '/images/I/' : url.pathname.startsWith('/images/S/') ? '/images/S/' : 'other'}; port=${url.port || 'default'}; credentials=${!!(url.username || url.password)}`;
-      if (url.protocol !== 'https:' || url.hostname !== 'm.media-amazon.com' || url.port || url.username || url.password || !url.pathname.startsWith('/images/I/')) throw new Error('Untrusted image');
+      if (url.protocol !== 'https:' || url.hostname !== 'm.media-amazon.com' || url.port || url.username || url.password) throw new Error('Untrusted image');
       return { asin, sourceUrl: url.href };
     } catch (error) { errorMessage = `Amazon MAIN image URL is not trusted (${diagnostic}; parse=${error.name}).`.slice(0,300); }
   }
@@ -41,7 +41,7 @@ export function inspectListingMainImage(expectedAsin) {
 
 export async function downloadListingImage(sourceUrl, { fetchImpl = fetch, maxBytes = IMAGE_LIMIT, signal } = {}) {
   const url = new URL(sourceUrl);
-  if (url.protocol !== 'https:' || url.hostname !== 'm.media-amazon.com' || url.port || url.username || url.password || !url.pathname.startsWith('/images/I/')) throw imageError('INVALID_IMAGE_URL', 'Image URL is not trusted');
+  if (url.protocol !== 'https:' || url.hostname !== 'm.media-amazon.com' || url.port || url.username || url.password) throw imageError('INVALID_IMAGE_URL', 'Image URL is not trusted');
   const timeout = AbortSignal.timeout(60000);
   const response = await fetchImpl(url.href, { credentials: 'omit', redirect: 'error', signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
   if (response.redirected) throw imageError('INVALID_IMAGE_URL', 'Image redirect is not allowed');
