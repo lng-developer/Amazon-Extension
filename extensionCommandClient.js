@@ -48,7 +48,7 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
         : command.type === 'IMPORT_TRANSACTIONS'
           ? await runTransactions({ dateFrom: command.dateFrom, dateTo: command.dateTo })
           : command.type === 'IMPORT_SETTLEMENTS'
-            ? await runSettlements()
+            ? await runSettlements({ dateFrom: command.dateFrom, dateTo: command.dateTo })
         : null;
     const result = outcome?.data || outcome?.result || outcome;
     const importJobId = result?.id || result?.importBatchId || result?.jobId || result?.data?.jobId || result?.ingest?.data?.jobId || null;

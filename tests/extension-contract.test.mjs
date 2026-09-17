@@ -360,7 +360,7 @@ test('extension command polling supports finance imports', () => {
   assert.match(client, /runTransactions/);
   assert.match(client, /runSettlements/);
   assert.match(background, /runTransactions: \(\{ dateFrom, dateTo \}\) => runImportTransactions\(\{ dateFrom, dateTo \}\)/);
-  assert.match(background, /runSettlements: \(\) => runScheduledSettlementImport\(\)/);
+  assert.match(background, /runSettlements: \(\{ dateFrom, dateTo \}\) => dateFrom && dateTo \? runImportSettlements\(\{ dateFrom, dateTo \}\) : runScheduledSettlementImport\(\)/);
 });
 
 test('settlement automation opens All Statements only when no tab exists', () => {

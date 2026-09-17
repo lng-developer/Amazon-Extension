@@ -12,7 +12,7 @@ function csvCell(value) {
 function cellText(value) {
   if (!value) return '';
   if (value.type === 'LocalizedDate') {
-    const date = new Date(value.dateEpochMillis);
+    const date = new Date(Number(value.dateEpochMillis) + 7 * 60 * 60 * 1000);
     return `${date.getUTCMonth() + 1}/${date.getUTCDate()}/${date.getUTCFullYear()}`;
   }
   if (value.type === 'LocalizedCurrency') return Number(value.currency?.amount || 0).toFixed(2);
@@ -45,7 +45,7 @@ export function summarizeTransactionCsv(csv = '') {
 }
 
 function timestamp(date, endOfDay = false) {
-  const value = new Date(`${date}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}`).getTime();
+  const value = new Date(`${date}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}+07:00`).getTime();
   if (!Number.isFinite(value)) throw new Error(`Invalid transaction date: ${date}`);
   return value;
 }
@@ -55,7 +55,7 @@ async function fetchPage({ fetchImpl, startTimestamp, endTimestamp, offset, limi
   url.searchParams.set('limit', String(limit));
   url.searchParams.set('offset', String(offset));
   url.searchParams.set('accountType', 'PAYABLE');
-  url.searchParams.set('fiqFiltersString', `(startTimestamp==${startTimestamp});(endTimestamp==${endTimestamp})`);
+  url.searchParams.set('fiqlFiltersString', `(startTimestamp==${startTimestamp});(endTimestamp==${endTimestamp})`);
   url.searchParams.set('sortType', 'DESC');
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const controller = new AbortController();

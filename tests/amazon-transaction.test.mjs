@@ -42,7 +42,7 @@ test('fetches all pages sequentially and returns one CSV', async () => {
   assert.match(calls[1], /offset=2/);
   assert.equal(csv.split('\n').length, 3);
   const request = new URL(calls[0]);
-  assert.equal(request.searchParams.get('fiqFiltersString'), '(startTimestamp==1788627600000);(endTimestamp==1788800399999)');
+  assert.equal(request.searchParams.get('fiqlFiltersString'), '(startTimestamp==1788627600000);(endTimestamp==1788800399999)');
 });
 
 test('rejects an Amazon response with posted dates outside the requested range', async () => {
@@ -68,6 +68,20 @@ test('uses Amazon Payments default page size', async () => {
     },
   });
   assert.equal(new URL(calls[0]).searchParams.get('limit'), '10');
+});
+
+test('uses fixed UTC+7 boundaries and CSV dates regardless of the RDC timezone', async () => {
+  let request;
+  const csv = await fetchTransactionsCsv({
+    dateFrom: '2026-09-16', dateTo: '2026-09-16',
+    fetchImpl: async (url) => {
+      request = url;
+      return { ok: true, json: async () => page(1, [row(1789491600000), row(1789577999999)]) };
+    },
+  });
+  assert.equal(request.searchParams.get('fiqlFiltersString'), '(startTimestamp==1789491600000);(endTimestamp==1789577999999)');
+  assert.equal(summarizeTransactionCsv(csv).postedDateMin, '2026-09-16');
+  assert.equal(summarizeTransactionCsv(csv).postedDateMax, '2026-09-16');
 });
 
 test('reports safe page diagnostics without transaction details', async () => {
