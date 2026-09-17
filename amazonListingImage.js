@@ -20,11 +20,16 @@ export function inspectListingMainImage(expectedAsin) {
   if (!img || !img.complete || !img.naturalWidth || !asin) return { pending: true };
   let candidates = [];
   try { candidates = Object.entries(JSON.parse(img.getAttribute('data-a-dynamic-image') || '{}')).sort((a,b) => b[1][0]*b[1][1] - a[1][0]*a[1][1]); } catch { /* src remains available */ }
-  const sourceUrl = img.getAttribute('data-old-hires') || candidates[0]?.[0] || img.getAttribute('src');
+  const hires = img.getAttribute('data-old-hires');
+  const sourceKind = hires ? 'data-old-hires' : candidates[0]?.[0] ? 'data-a-dynamic-image' : 'src';
+  const sourceUrl = hires || candidates[0]?.[0] || img.getAttribute('src');
+  let diagnostic = `${sourceKind}; valueType=${typeof sourceUrl}`;
   try {
     const url = new URL(sourceUrl);
+    // Never include URL credentials, query, fragment, or arbitrary path in logs.
+    diagnostic = `${sourceKind}; protocol=${url.protocol}; host=${url.hostname.slice(0,80)}; path=${url.pathname.startsWith('/images/I/') ? '/images/I/' : url.pathname.startsWith('/images/S/') ? '/images/S/' : 'other'}; port=${url.port || 'default'}; credentials=${!!(url.username || url.password)}`;
     if (url.protocol !== 'https:' || url.hostname !== 'm.media-amazon.com' || url.port || url.username || url.password || !url.pathname.startsWith('/images/I/')) throw new Error('Untrusted image');
-  } catch { return { errorCode: 'INVALID_IMAGE_URL', errorMessage: 'Amazon MAIN image URL is not trusted.' }; }
+  } catch (error) { return { errorCode: 'INVALID_IMAGE_URL', errorMessage: `Amazon MAIN image URL is not trusted (${diagnostic}; parse=${error.name}).`.slice(0,300) }; }
   return { asin, sourceUrl };
 }
 

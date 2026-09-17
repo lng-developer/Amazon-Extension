@@ -24,6 +24,18 @@ test('refuses redirected variant and CAPTCHA instead of copying another image', 
   assert.equal(extract({pageAsin:'B000000001'}).errorCode, 'ASIN_MISMATCH');
   assert.equal(extract({challenge:true}).errorCode, 'AMAZON_CHALLENGE');
 });
+test('rejected MAIN image reports safe URL diagnostics without credentials or query secrets', () => {
+  const result = extract({ image: { 'data-old-hires': 'https://user:password@images-na.ssl-images-amazon.com/images/I/main.jpg?token=secret#private' } });
+  assert.equal(result.errorCode, 'INVALID_IMAGE_URL');
+  assert.match(result.errorMessage, /data-old-hires/);
+  assert.match(result.errorMessage, /images-na\.ssl-images-amazon\.com/);
+  assert.match(result.errorMessage, /credentials=true/);
+  assert.doesNotMatch(result.errorMessage, /user|password|token|secret|private/);
+  assert.ok(result.errorMessage.length <= 300);
+  const invalid = extract({ image: { src: 'not-a-url?token=secret' } });
+  assert.match(invalid.errorMessage, /src.*parse=TypeError/);
+  assert.doesNotMatch(invalid.errorMessage, /secret/);
+});
 test('download rejects untrusted host, oversized bytes, non-image response and redirects', async () => {
   await assert.rejects(images.downloadListingImage('https://evil.test/image.jpg'), /trusted/i);
   await assert.rejects(images.downloadListingImage(url, { fetchImpl: async () => new Response('html',{headers:{'content-type':'text/html'}}) }), /image/i);
