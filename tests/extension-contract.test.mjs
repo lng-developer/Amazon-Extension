@@ -335,9 +335,8 @@ test('order upload reads marketplace code from the extension configuration', () 
 test("command polling keeps a stable extension identity", () => {
   const background = read("background.js");
 
-  assert.match(background, /async function ensureIdentity\(\)/);
-  assert.match(background, /chrome\.storage\.local\.get\(\["clientId", "clientLabel"\]\)/);
-  assert.match(background, /chrome\.storage\.local\.set\(\{ clientId, clientLabel \}\)/);
+  assert.match(background, /import \{ createExtensionIdentity \} from ['"]\.\/extensionIdentity\.js['"];/);
+  assert.match(background, /const ensureIdentity = createExtensionIdentity\(/);
 });
 
 test("extension command polling uses the LNG command API and current import flow", () => {
