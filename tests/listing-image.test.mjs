@@ -5,9 +5,9 @@ import * as images from '../amazonListingImage.js';
 
 const asin = 'B0H9WGN6MM';
 const url = 'https://m.media-amazon.com/images/I/71mTwyEqu7L._AC_SL1254_.jpg';
-function extract({ image = { 'data-old-hires': url }, pageAsin = asin, challenge = false } = {}) {
-  const document = { body: { innerText: challenge ? 'Enter the characters you see below' : 'Product' },
-    querySelector: selector => selector === '#landingImage' ? { getAttribute: key => image[key] || null, complete: true, naturalWidth: 1254 }
+function extract({ image = { 'data-old-hires': url }, pageAsin = asin, challenge = false, title = 'Product', text = 'Product' } = {}) {
+  const document = { title, body: { innerText: challenge ? 'Enter the characters you see below' : text },
+    querySelector: selector => selector === '#landingImage' ? (image && { getAttribute: key => image[key] || null, complete: true, naturalWidth: 1254 })
       : selector === '#ASIN' ? { value: pageAsin } : null };
   return vm.runInNewContext(`(${images.inspectListingMainImage.toString()})('${asin}')`, {
     document, location: { href: `https://www.amazon.com/dp/${asin}`, hostname: 'www.amazon.com', pathname: `/dp/${asin}` }, URL,
@@ -15,6 +15,15 @@ function extract({ image = { 'data-old-hires': url }, pageAsin = asin, challenge
 }
 test('reads verified ASIN MAIN high resolution URL rather than thumbnail', () => {
   assert.equal(extract().sourceUrl, url);
+});
+
+const notFoundPage = { image: null, pageAsin: '', title: 'Page Not Found', text: "SORRY\nwe couldn't find that page\nTry searching or go to Amazon's home page." };
+test('recognizes Amazon Page Not Found immediately without mistaking product text or loading pages', () => {
+  assert.equal(extract(notFoundPage).errorCode, 'AMAZON_PAGE_NOT_FOUND');
+  assert.equal(extract({ title: notFoundPage.title, text: notFoundPage.text }).sourceUrl, url);
+  assert.equal(extract({ image: null, pageAsin: '', text: notFoundPage.text }).pending, true);
+  assert.equal(extract({ image: null, pageAsin: '', title: notFoundPage.title }).pending, true);
+  assert.equal(extract({ ...notFoundPage, challenge: true }).errorCode, 'AMAZON_CHALLENGE');
 });
 test('falls back to the largest declared image, never invents an original URL', () => {
   const result = extract({ image: { 'data-a-dynamic-image': JSON.stringify({ 'https://m.media-amazon.com/images/I/small.jpg': [100,100], [url]: [1254,1254] }) } });
@@ -99,6 +108,30 @@ function fixture({fatal=false, paused=false}={}) {
 test('batch uploads and acknowledges each item and closes only its owned tab', async()=>{
   const f=fixture();const result=await images.runListingImageBatch({base:'https://be.test',token:'token',client:{clientId:'client'},command:{id:'cmd'},leaseToken:'lease',onProgress:async()=>{},...f});
   assert.equal(result.importedCount,2);assert.deepEqual(f.results,['UPLOADED','UPLOADED']);assert.deepEqual(f.removed,[91]);assert.equal(f.visited.length,2);
+});
+
+test('Page Not Found checkpoints failure without uploading and continues to the next listing without waiting', async () => {
+  const f = fixture();
+  const fetchImpl = f.fetchImpl;
+  let failed = false;
+  f.chromeApi.scripting.executeScript = async () => [{ result: failed ? extract() : extract(notFoundPage) }];
+  f.fetchImpl = async (target, options) => {
+    if (target.endsWith('/items/item1/result') && !(options.body instanceof FormData)) {
+      const body = JSON.parse(options.body);
+      assert.equal(body.errorCode, 'AMAZON_PAGE_NOT_FOUND');
+      assert.equal(body.asin, asin);
+      assert.equal(body.leaseToken, 'lease');
+      failed = true;
+      f.results.push('FAILED');
+      return Response.json({ data: { status: 'FAILED' } });
+    }
+    return fetchImpl(target, options);
+  };
+  const result = await images.runListingImageBatch({ base: 'https://be.test', token: 'token', client: { clientId: 'client' }, command: { id: 'cmd' }, leaseToken: 'lease', onProgress: async () => {}, delay: async () => assert.fail('Not-found page must not wait for an image'), ...f });
+  assert.deepEqual(result, { importedCount: 1, failedCount: 1 });
+  assert.deepEqual(f.results, ['FAILED', 'UPLOADED']);
+  assert.equal(f.visited.length, 2);
+  assert.deepEqual(f.removed, [91]);
 });
 test('paused parent performs no Amazon work',async()=>{
   const f=fixture({paused:true});await images.runListingImageBatch({base:'https://be.test',token:'token',client:{clientId:'client'},command:{id:'cmd'},leaseToken:'lease',onProgress:async()=>{},...f});
