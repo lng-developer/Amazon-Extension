@@ -97,3 +97,20 @@ test('reports the backend error detail when heartbeat fails', async () => {
     /MongoServerError: duplicate key \(request req-1\)/,
   );
 });
+
+test('forwards manual settlement dates and leaves scheduled discovery undated', async () => {
+  for (const dates of [{ dateFrom: '2026-09-01', dateTo: '2026-09-14' }, {}]) {
+    const responses = [
+      { data: { id: 'agent-1' } },
+      { data: { command: { id: 'settlement-1', type: 'IMPORT_SETTLEMENTS', ...dates }, leaseToken: 'lease-token' } },
+      { data: {} }, { data: {} },
+    ];
+    let received;
+    await pollExtensionCommand({
+      base: 'https://dev-api.lngmerch.co', token: 'test-token', client: { clientId: 'rdc-1', label: 'RDC 1' },
+      runSettlements: async (input) => { received = input; return { rows: 1 }; },
+      fetchImpl: async () => ({ ok: true, json: async () => responses.shift() }),
+    });
+    assert.deepEqual(received, { dateFrom: dates.dateFrom, dateTo: dates.dateTo });
+  }
+});
