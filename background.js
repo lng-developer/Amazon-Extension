@@ -4,6 +4,7 @@ import { pollExtensionCommand, queueAdsSpendCommand, queueOrderImportCommand } f
 import { getJson, postFileTo, postOrderImport } from "./backendApi.js";
 import { createExtensionLogger } from "./extensionLogger.js";
 import { ORDER_IMPORT_PROGRESS_KEY, createOrderImportProgress } from './orderImportProgress.js';
+import { createExtensionIdentity } from './extensionIdentity.js';
 import { parseTSV } from './orderReportParser.js';
 import {
   buildOneOffReportConfig,
@@ -31,6 +32,7 @@ const EXTENSION_CONNECTION_STATUS_KEY = "extensionConnectionStatus";
 const EXTENSION_COMMAND_POLL_BACKOFF_MINUTES = [1, 2, 5, 10];
 const adsApiLock = { running: false, taskName: "", runId: "", startedAt: 0 };
 const extensionLogger = createExtensionLogger({ storage: chrome.storage.local });
+const ensureIdentity = createExtensionIdentity({ storage: chrome.storage.local, randomUUID: crypto.randomUUID });
 async function setOrderImportProgress(state, message, details = {}) {
   await chrome.storage.local.set({ [ORDER_IMPORT_PROGRESS_KEY]: createOrderImportProgress(state, message, details) });
 }
@@ -320,13 +322,6 @@ async function getCfg(keys = []) {
   return all;
 }
 
-async function ensureIdentity() {
-  let { clientId, clientLabel } = await chrome.storage.local.get(["clientId", "clientLabel"]);
-  if (!clientId) clientId = `ext-${crypto.randomUUID()}`;
-  if (!clientLabel) clientLabel = `Chrome ${clientId.slice(-6)}`;
-  await chrome.storage.local.set({ clientId, clientLabel });
-  return { clientId, clientLabel };
-}
 /* ===============================
    ORDERS: xin ref + kiểm tra + tải
    ============================== */
