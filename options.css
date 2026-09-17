@@ -231,6 +231,8 @@ output {
   background: #fff;
 }
 .activity-run.is-failed { border-left-color: #d92d20; }
+.activity-run.is-unknown { border-left-color: #b7791f; }
+.is-unknown .activity-status { background: #fff8e6; color: #805b10; }
 .activity-run.is-succeeded { border-left-color: #17804b; }
 .activity-run-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .activity-status { border-radius: 999px; padding: 2px 8px; background: #edf2f7; color: #344054; font-size: 11px; font-weight: 700; }

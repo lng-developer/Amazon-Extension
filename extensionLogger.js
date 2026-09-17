@@ -48,27 +48,50 @@ export function formatVietnamTime(timestamp) {
   }).format(new Date(timestamp))} ICT`;
 }
 
-export function buildActivityRuns(events = []) {
-  return events.reduce((runs, event) => {
+export function buildActivityRuns(events = [], { now = Date.now(), commands = [] } = {}) {
+  const runs = events.reduce((runs, event) => {
     const type = activityType(event);
+    const context = event.context || {};
+    const strongKey = context.commandId || context.runId;
+    const key = strongKey || context.taskId;
     const latest = [...runs].reverse().find((item) => item.type === type);
-    const startsRun = /task started|requesting new orders report|acquired import_ads_spend/i.test(event.message || '');
+    const startsRun = context.activityStatus === 'RUNNING' || /task started|requesting new orders report|acquired import_ads_spend/i.test(event.message || '');
     const withinRunWindow = latest && new Date(event.timestamp).getTime() - new Date(latest.events.at(-1).timestamp).getTime() <= 60_000;
-    let run = latest && withinRunWindow && !(latest.status !== 'RUNNING' && startsRun) ? latest : null;
+    let run = key ? [...runs].reverse().find(item => item.type === type && item.key === key)
+      : latest && (!startsRun || latest.commandId) && (latest.status === 'RUNNING' || withinRunWindow) ? latest : null;
+    // Legacy task IDs were date ranges, not attempt IDs. A new start is a new attempt.
+    if (key && !strongKey && startsRun) run = null;
     if (!run) {
-      run = { id: event?.context?.taskId || event?.context?.runId || `${type}-${event.timestamp}`, type, label: ACTIVITY_TYPES[type], status: 'RUNNING', startedAt: event.timestamp, error: null, events: [] };
+      run = { id: `${key || type}-${event.timestamp}-${runs.length}`, key, commandId: context.commandId, type, label: ACTIVITY_TYPES[type], status: 'RUNNING', startedAt: event.timestamp, error: null, events: [] };
       runs.push(run);
     }
     run.events.push(event);
-    if (event.level === 'error') {
+    if (context.backendConfirmed && ['SUCCEEDED', 'FAILED'].includes(context.activityStatus)) run.confirmedStatus = context.activityStatus;
+    if (context.activityStatus === 'FAILED' || event.level === 'error') {
       run.status = 'FAILED';
       const error = event?.context?.errorMessage || event.message;
       if (!run.error || !/^\[ADS-LOCK\] Released error [^:]+$/.test(error)) run.error = error;
-    } else if (/task completed|upload completed|hoàn thành/i.test(event.message || '')) {
+    } else if (context.activityStatus === 'SUCCEEDED' || /task completed|upload completed|hoàn thành/i.test(event.message || '')) {
       run.status = 'SUCCEEDED';
+      run.error = null;
     }
     return runs;
   }, []);
+  const byId = new Map(commands.map(command => [command.id, command]));
+  return runs.map(run => {
+    const command = byId.get(run.commandId);
+    if (run.confirmedStatus && !['SUCCEEDED', 'FAILED'].includes(command?.status)) {
+      run.status = run.confirmedStatus;
+      if (run.status === 'SUCCEEDED') run.error = null;
+    } else if (command) {
+      run.status = ['SUCCEEDED', 'FAILED', 'QUEUED', 'CLAIMED', 'RUNNING'].includes(command.status) ? command.status : 'UNKNOWN';
+      if (['RUNNING', 'CLAIMED'].includes(run.status) && !(Date.parse(command.leaseExpiresAt) > now)) run.status = 'UNKNOWN';
+      run.error = command.errorMessage || null;
+    } else if (run.status === 'RUNNING' && now - Date.parse(run.events.at(-1).timestamp) > 7 * 60_000) {
+      run.status = 'UNKNOWN';
+    }
+    return run;
+  });
 }
 
 export function createExtensionLogger({ storage, maxEntries = 200 }) {
@@ -92,9 +115,9 @@ export function createExtensionLogger({ storage, maxEntries = 200 }) {
   return {
     logInfo: (message, context) => append('info', message, context),
     logError: (_error, context, message) => append('error', message ?? 'Operation failed', context),
-    logTaskProcessing: (context, message) => append('info', message || 'Task started', context),
-    logTaskCompleted: (context, _result, message) => append('info', message || 'Task completed', context),
-    logTaskFailed: (context, error, message) => append('error', message || error?.message || 'Task failed', { ...context, ...(error?.message ? { errorMessage: error.message } : {}) }),
+    logTaskProcessing: (context, message) => append('info', message || 'Task started', { ...context, activityStatus: 'RUNNING' }),
+    logTaskCompleted: (context, _result, message) => append('info', message || 'Task completed', { ...context, activityStatus: 'SUCCEEDED' }),
+    logTaskFailed: (context, error, message) => append('error', message || error?.message || 'Task failed', { ...context, activityStatus: 'FAILED', ...(error?.message ? { errorMessage: error.message } : {}) }),
     async getEvents() {
       await writeQueue;
       const current = await storage.get(EXTENSION_LOG_STORAGE_KEY);

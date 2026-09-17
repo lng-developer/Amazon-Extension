@@ -10,6 +10,20 @@ const tabs = [...document.querySelectorAll('[data-tab]')];
 const panels = [...document.querySelectorAll('[data-panel]')];
 const extensionLogger = createExtensionLogger({ storage: chrome.storage.local });
 const connectionStatusKey = 'extensionConnectionStatus';
+let activityCommands = [];
+let activityRefreshPending = false;
+async function refreshActivityCommands() {
+  if (activityRefreshPending) return;
+  activityRefreshPending = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'GET_ACTIVITY_COMMANDS' });
+    if (!response?.ok) throw new Error('Command history unavailable');
+    activityCommands = response.commands || [];
+  } catch {
+    activityCommands = activityCommands.filter(command => ['SUCCEEDED', 'FAILED'].includes(command.status));
+  }
+  finally { activityRefreshPending = false; await renderLogs(); }
+}
 async function renderOrderImportProgress() {
   const stored = await chrome.storage.local.get(ORDER_IMPORT_PROGRESS_KEY);
   const progress = stored[ORDER_IMPORT_PROGRESS_KEY];
@@ -35,7 +49,7 @@ async function renderConnectionStatus() {
 async function renderLogs() {
   const events = await extensionLogger.getEvents();
   const container = $('#logEntries');
-  const runs = buildActivityRuns(events);
+  const runs = buildActivityRuns(events, { commands: activityCommands });
   container.replaceChildren();
   if (!runs.length) {
     container.textContent = 'No activity yet.';
@@ -50,7 +64,7 @@ async function renderLogs() {
     title.textContent = run.label;
     const status = document.createElement('span');
     status.className = 'activity-status';
-    status.textContent = run.status;
+    status.textContent = run.status === 'UNKNOWN' ? 'Không xác định' : run.status;
     header.append(title, status);
     const meta = document.createElement('p');
     const batchId = run.events[0]?.context?.batchId;
@@ -85,7 +99,7 @@ function activateTab(name) {
     panel.classList.toggle('is-active', active);
     panel.hidden = !active;
   });
-  if (name === 'logs') void renderLogs();
+  if (name === 'logs') { void renderLogs(); void refreshActivityCommands(); }
 }
 
 function fill(config) {
@@ -155,5 +169,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   await renderConnectionStatus();
   await renderOrderImportProgress();
+  chrome.storage.onChanged.addListener((changes) => { if (changes.extensionLogs) void renderLogs(); });
+  window.setInterval(() => {
+    if (!document.querySelector('[data-panel="logs"]')?.hidden) void refreshActivityCommands();
+  }, 30000);
   window.setInterval(() => { void renderConnectionStatus(); void renderOrderImportProgress(); }, 1000);
 });

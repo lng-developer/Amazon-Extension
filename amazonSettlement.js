@@ -31,6 +31,28 @@ export function selectSettlementDownload(candidates = [], { dateFrom, dateTo } =
   return matches[0];
 }
 
+export function selectSettlementRange(candidates = [], { dateFrom, dateTo } = {}) {
+  const validDate = value => /^\d{4}-\d{2}-\d{2}$/.test(value || '')
+    && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value;
+  if (!validDate(dateFrom) || !validDate(dateTo) || dateFrom > dateTo
+    || Date.parse(dateTo) - Date.parse(dateFrom) > 119 * 86400000) {
+    throw new Error('Settlement date range must contain 1 to 120 days');
+  }
+  const selected = new Map();
+  for (const candidate of candidates) {
+    const period = parseStatementPeriod(candidate.periodText || '');
+    if (!candidate.isFlatFileV2 || !period || /\bPresent\b/i.test(candidate.periodText)
+      || period.dateFrom > dateTo || period.dateTo < dateFrom) continue;
+    const url = new URL(candidate.href, 'https://sellercentral.amazon.com');
+    if (url.origin !== 'https://sellercentral.amazon.com' || url.pathname !== '/payments/reports/download') {
+      throw new Error('Amazon settlement download link is not trusted');
+    }
+    const referenceId = getSettlementReferenceId(url.href);
+    selected.set(referenceId, { ...candidate, ...period, href: url.href, referenceId });
+  }
+  return [...selected.values()].sort((a, b) => a.dateFrom.localeCompare(b.dateFrom) || a.referenceId.localeCompare(b.referenceId));
+}
+
 export function validateSettlementText(text = '') {
   const lines = String(text).split(/\r?\n/).filter((line) => line.trim());
   const header = lines[0]?.split('\t') || [];

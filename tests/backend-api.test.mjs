@@ -1,7 +1,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { postFileTo } from '../backendApi.js';
+import { getJson, postFileTo } from '../backendApi.js';
+
+test('status and upload requests have an abort deadline', async () => {
+  const previousFetch = globalThis.fetch;
+  const signals = [];
+  globalThis.fetch = async (_, options) => {
+    signals.push(options.signal);
+    return { ok: true, text: async () => '{}' };
+  };
+  try {
+    await getJson('https://example.test/batch', 'test');
+    await postFileTo('https://example.test/upload', { file: 'csv' }, 'test');
+    assert.equal(signals.length, 2);
+    for (const signal of signals) assert.ok(signal instanceof AbortSignal);
+  } finally { globalThis.fetch = previousFetch; }
+});
 
 test('postFileTo preserves the backend error message', async () => {
   const previousFetch = globalThis.fetch;

@@ -1,6 +1,6 @@
 /* Amazon order, ads, transaction, settlement imports and LNG command polling. */
 import { DEFAULT_ENVIRONMENTS, deriveApiUrls, resolveDevelopmentApiUrl } from "./config.js";
-import { pollExtensionCommand, queueAdsSpendCommand, queueOrderImportCommand } from "./extensionCommandClient.js";
+import { listAgentCommands, pollExtensionCommand, queueAdsSpendCommand, queueOrderImportCommand } from "./extensionCommandClient.js";
 import { getJson, postFileTo, postOrderImport } from "./backendApi.js";
 import { createExtensionLogger } from "./extensionLogger.js";
 import { ORDER_IMPORT_PROGRESS_KEY, createOrderImportProgress } from './orderImportProgress.js';
@@ -22,6 +22,7 @@ import {
   getSettlementReferenceId,
   settlementImportDecision,
   selectSettlementDownload,
+  selectSettlementRange,
   validateSettlementText,
 } from './amazonSettlement.js';
 const REPORT_POLL_MAX_ATTEMPTS = 18;
@@ -31,6 +32,7 @@ const EXTENSION_COMMAND_POLL_BACKOFF_KEY = "extensionCommandPollBackoff";
 const EXTENSION_CONNECTION_STATUS_KEY = "extensionConnectionStatus";
 const EXTENSION_COMMAND_POLL_BACKOFF_MINUTES = [1, 2, 5, 10];
 const adsApiLock = { running: false, taskName: "", runId: "", startedAt: 0 };
+let transactionImportRunning = false;
 const extensionLogger = createExtensionLogger({ storage: chrome.storage.local });
 const ensureIdentity = createExtensionIdentity({ storage: chrome.storage.local, randomUUID: crypto.randomUUID });
 async function setOrderImportProgress(state, message, details = {}) {
@@ -63,6 +65,7 @@ const GMAIL_ADS_RECENT_DOWNLOADS_TTL_MS = 24 * 60 * 60 * 1000;
 const GMAIL_ADS_MAX_FILE_SIZE = 20 * 1024 * 1024;
 const SETTLEMENT_IMPORT_HISTORY_KEY = 'settlementImportHistory';
 const settlementImportLock = { running: false };
+let settlementRangeRunning = false;
 
 const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1080,8 +1083,8 @@ async function runExportAdsSpend({ dateFrom, dateTo }) {
   return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked({ dateFrom, dateTo }, lock));
 }
 
-async function fetchTransactionsCsvFromAmazon({ dateFrom, dateTo }) {
-  return fetchAmazonTransactionsCsv({ dateFrom, dateTo });
+async function fetchTransactionsCsvFromAmazon({ dateFrom, dateTo, onPage }) {
+  return fetchAmazonTransactionsCsv({ dateFrom, dateTo, onPage });
 }
 
 async function sha256Key(value) {
@@ -1092,34 +1095,50 @@ async function sha256Key(value) {
 
 const financeImportSleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-async function waitForFinanceImport({ base, batchId, token, context, kind = 'Finance' }) {
+async function waitForFinanceImport({ base, batchId, token, context, kind = 'Finance', onProgress = async () => {}, progressTimeoutMs = 0 }) {
   let delay = 2000;
   let lastStatus = null;
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    const response = await getJson(`${base}/api/finance/import-batches/${batchId}`, token);
-    const batch = response?.data || response;
-    const recalcStatus = batch.recalculationStatus || "NOT_REQUIRED";
-    const combinedStatus = `${batch.status}:${recalcStatus}`;
-    if (combinedStatus !== lastStatus) {
-      lastStatus = combinedStatus;
-      await extensionLogger.logInfo(`${kind} import status updated`, {
-        ...context, batchId, status: batch.status, recalculationStatus: recalcStatus,
-      });
-    }
-    if (["COMPLETED", "PARTIAL_FAILED", "FAILED"].includes(batch.status)) {
-      if (batch.status === "COMPLETED" && ["PROCESSING"].includes(recalcStatus)) {
-        await financeImportSleep(delay);
-        delay = Math.min(delay + 1000, 10000);
-        continue;
+  const startedAt = Date.now();
+  let lastAdvancedAt = startedAt;
+  let lastLoggedAt = 0;
+  // Keep the existing 60-poll budget for importers without live row counters.
+  for (let attempt = 0; progressTimeoutMs || attempt < 60; attempt += 1) {
+    try {
+      const response = await getJson(`${base}/api/finance/import-batches/${batchId}`, token);
+      const batch = response?.data || response;
+      const recalcStatus = batch.recalculationStatus || "NOT_REQUIRED";
+      const combinedStatus = `${batch.status}:${recalcStatus}:${batch.processedRows || 0}:${batch.recalculationCompleted || 0}:${batch.recalculationFailed || 0}`;
+      const changed = combinedStatus !== lastStatus;
+      if (changed) {
+        lastStatus = combinedStatus;
+        lastAdvancedAt = Date.now();
       }
-      if (batch.status !== "COMPLETED") throw new Error(`${kind} import ${batch.status.toLowerCase()}`);
-      if (recalcStatus === "PARTIAL_FAILED") throw new Error(`${kind} profit recalculation partially failed`);
-      return batch;
+      if (changed || Date.now() - lastLoggedAt >= 30000) {
+        lastLoggedAt = Date.now();
+        await extensionLogger.logInfo(`${kind} import status updated`, {
+          ...context, batchId, status: batch.status, recalculationStatus: recalcStatus,
+          processedRows: batch.processedRows || 0, validRows: batch.validRows || 0,
+          recalculationCompleted: batch.recalculationCompleted || 0,
+          elapsedSeconds: Math.floor((Date.now() - startedAt) / 1000),
+        });
+      }
+      if (["COMPLETED", "PARTIAL_FAILED", "FAILED"].includes(batch.status) && !(batch.status === 'COMPLETED' && recalcStatus === 'PROCESSING')) {
+        const message = batch.status !== 'COMPLETED' ? `${kind} import ${batch.status.toLowerCase()}`
+          : recalcStatus === 'PARTIAL_FAILED' ? `${kind} profit recalculation partially failed` : null;
+        if (message) throw Object.assign(new Error(message), { terminalBatch: true });
+        return batch;
+      }
+      if (progressTimeoutMs && Date.now() - lastAdvancedAt >= progressTimeoutMs) throw new Error(`${kind} batch ${batchId}: no progress for ${progressTimeoutMs / 60000} minutes; backend may still be processing. Resume this batch, do not upload again.`);
+      if (Date.now() - startedAt >= 7200000) throw new Error(`${kind} batch ${batchId}: monitoring limit reached; resume this batch, do not upload again.`);
+      if (changed) await onProgress({ stage: 'IMPORTING', batchId, processedRows: batch.processedRows || 0 });
+      await financeImportSleep(delay);
+      delay = Math.min(delay + 1000, 10000);
+    } catch (error) {
+      error.batchId = batchId;
+      throw error;
     }
-    await financeImportSleep(delay);
-    delay = Math.min(delay + 1000, 10000);
   }
-  throw new Error(`${kind} import polling timed out`);
+  throw Object.assign(new Error(`${kind} import polling timed out (batch ${batchId})`), { batchId });
 }
 
 async function extractSettlementDownloadCandidates({ dateFrom, dateTo, autoDiscover = false } = {}) {
@@ -1299,9 +1318,87 @@ async function findSettlementDownload({ dateFrom, dateTo, autoDiscover = false }
   return { ...selected, href: url.href, referenceId: getSettlementReferenceId(url.href), tabId: tab.id, ...(period || {}) };
 }
 
+// Runs inside Seller Central; keep this function self-contained for executeScript.
+async function inspectSettlementRangePage({ advance = false, dateFrom, dateTo } = {}) {
+  const elements = root => [...root.querySelectorAll('*')].flatMap(node => [node, ...(node.shadowRoot ? elements(node.shadowRoot) : [])]);
+  const rows = () => elements(document).filter(node => node.matches('tr,[role="row"]'));
+  const fingerprint = () => rows().map(row => row.innerText || row.textContent || '').join('|');
+  const nextButton = () => elements(document).find(node => node.matches('button,a,[role="button"]')
+    && /^(next(?: page)?|next ›|›|→)$/i.test((node.getAttribute('aria-label') || node.getAttribute('title') || node.textContent || '').trim()));
+  const enabled = node => node && !node.disabled && node.getAttribute('aria-disabled') !== 'true'
+    && !node.closest('.a-disabled,[disabled],[aria-disabled="true"]');
+  const before = fingerprint();
+  if (advance) {
+    const next = nextButton();
+    if (!enabled(next)) throw new Error('Settlement next page is unavailable');
+    next.click();
+  }
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const current = fingerprint();
+    if (current && (!advance || current !== before) && /\d{1,2}\/\d{1,2}\/\d{4}/.test(current)) break;
+    if (attempt === 79) throw new Error('Settlement page did not load or pagination did not advance');
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  const candidates = [];
+  for (const row of rows()) {
+    const periodText = row.innerText || row.textContent || '';
+    if (/\bPresent\b/i.test(periodText)) continue;
+    const dates = (periodText.match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || []).map(value => {
+      const [month, day, year] = value.split('/');
+      return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+    });
+    if (dates.length < 2 || dates[0] > dateTo || dates[1] < dateFrom) continue;
+    const controls = elements(row);
+    const referenceId = controls.find(node => node.matches('button[data-action]')
+      && /^\d+$/.test(node.getAttribute('data-action') || ''))?.getAttribute('data-action');
+    let href;
+    if (referenceId) {
+      const url = new URL('/payments/reports/download', location.origin);
+      url.search = new URLSearchParams({ referenceId, contentType: 'text/xls', fileName: `${referenceId}.txt` }).toString();
+      href = url.href;
+    } else {
+      href = controls.map(node => node.getAttribute('href') || node.getAttribute('data-href') || node.getAttribute('data-url'))
+        .filter(Boolean).find(value => {
+          const url = new URL(value, location.href);
+          return url.pathname === '/payments/reports/download' && url.searchParams.get('contentType') === 'text/xls'
+            && /\.txt$/i.test(url.searchParams.get('fileName') || '');
+        });
+    }
+    if (!href) throw new Error(`Closed settlement has no readable Flat File V2 link: ${dates[0]} to ${dates[1]}`);
+    candidates.push({ href, isFlatFileV2: true, periodText });
+  }
+  return { candidates, hasNext: !!enabled(nextButton()) };
+}
+
+async function findSettlementRange({ dateFrom, dateTo, onProgress = async () => {} }) {
+  selectSettlementRange([], { dateFrom, dateTo }); // Validate before opening Amazon.
+  const tab = await chrome.tabs.create({ url: ALL_STATEMENTS_URL, active: false });
+  try {
+    await waitForTabComplete(tab.id, 'Amazon All Statements did not finish loading');
+    const loaded = await chrome.tabs.get(tab.id);
+    if (!loaded.url?.startsWith(`${SC_BASE}/payments/past-settlements`)) throw new Error('SELLER_CENTRAL_AUTH_REQUIRED');
+    const candidates = [];
+    // ponytail: bounded DOM pagination; fail rather than silently truncate above 100 pages.
+    for (let page = 0; page < 100; page++) {
+      await onProgress({ stage: 'DISCOVERING', pageNumber: page + 1 });
+      const execution = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, func: inspectSettlementRangePage,
+        args: [{ dateFrom, dateTo, advance: page > 0 }],
+      });
+      const result = execution?.[0]?.result;
+      if (!result || !Array.isArray(result.candidates)) throw new Error('Cannot inspect Amazon settlement page');
+      candidates.push(...result.candidates);
+      if (!result.hasNext) return selectSettlementRange(candidates, { dateFrom, dateTo });
+    }
+    throw new Error('Settlement discovery exceeded 100 pages; narrow the range or inspect Amazon pagination');
+  } finally {
+    await chrome.tabs.remove(tab.id).catch(() => {});
+  }
+}
+
 async function fetchSettlementsTxtFromAmazon({ dateFrom, dateTo, descriptor: providedDescriptor } = {}) {
   const descriptor = providedDescriptor || await findSettlementDownload({ dateFrom, dateTo });
-  const response = await fetch(descriptor.href, { credentials: 'include' });
+  const response = await fetch(descriptor.href, { credentials: 'include', signal: AbortSignal.timeout(120000) });
   if (!response.ok) throw new Error(`Amazon settlement download failed (${response.status})`);
   const text = await response.text();
   const summary = validateSettlementText(text);
@@ -1323,52 +1420,78 @@ async function recordSettlementImport(referenceId, entry) {
   await writeSettlementImportHistory(history);
 }
 
-async function runImportTransactions({ dateFrom, dateTo } = {}) {
-  const { ingestUrl, ingestToken, marketplaceCode } = await getCfg();
-  if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
-  if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
-
-  const context = { dateFrom, dateTo, taskId: `transactions_${dateFrom}_${dateTo}` };
-  await extensionLogger.logTaskProcessing(context, 'Transaction task started');
+async function runImportTransactions({ dateFrom, dateTo, onProgress = async () => {}, activity = {} } = {}) {
+  if (transactionImportRunning) throw new Error('Transaction import already running; wait for the current task');
+  transactionImportRunning = true;
+  const context = { ...activity, runId: activity.commandId || crypto.randomUUID(), dateFrom, dateTo, taskId: `transactions_${dateFrom}_${dateTo}` };
+  let batchId;
+  let pendingKey;
   try {
-    const { transactionsImportUrl } = deriveApiUrls(ingestUrl);
-    const csv = await fetchTransactionsCsvFromAmazon({
-      dateFrom,
-      dateTo,
-      onPage: (diagnostic) => extensionLogger.logInfo('Transaction page fetched', { ...context, ...diagnostic }),
-    });
-    const contentHash = await sha256Key(csv);
-    await extensionLogger.logInfo('Transaction CSV fetched', {
-      ...context,
-      ...summarizeTransactionCsv(csv),
-      contentHash,
-    });
-    const idempotencyKey = await sha256Key(`TRANSACTIONS|${dateFrom}|${dateTo}|${csv}`);
-    const result = await postFileTo(transactionsImportUrl, {
-      salesChannelCode: "AMAZON",
-      marketplaceCode: marketplaceCode || "US",
-      dryRun: "false",
-      sourceRef: `transactions-${dateFrom}-${dateTo}.csv`,
-      file: { name: `transactions-${dateFrom}-${dateTo}.csv`, text: csv },
-    }, ingestToken, { idempotencyKey });
-    const batchId = result?.data?.importBatchId;
+    const { ingestUrl, ingestToken, marketplaceCode } = await getCfg();
+    if (!ingestUrl) throw new Error("Missing ingestUrl (Options)");
+    if (!dateFrom || !dateTo) throw new Error("dateFrom and dateTo are required");
+    await extensionLogger.logTaskProcessing(context, 'Transaction task started');
+    const { transactionsImportUrl, base } = deriveApiUrls(ingestUrl);
+    pendingKey = `transactionBatch:${await sha256Key(`${ingestUrl}|${ingestToken}|${marketplaceCode || 'US'}|${dateFrom}|${dateTo}`)}`;
+    batchId = (await chrome.storage.local.get(pendingKey))[pendingKey];
+    let result;
+    if (!batchId) {
+      await onProgress({ stage: 'FETCHING' });
+      const csv = await fetchTransactionsCsvFromAmazon({
+        dateFrom,
+        dateTo,
+        onPage: async (diagnostic) => {
+          await onProgress({ stage: 'FETCHING', ...diagnostic });
+          await extensionLogger.logInfo('Transaction page fetched', { ...context, ...diagnostic });
+        },
+      });
+      const contentHash = await sha256Key(csv);
+      await extensionLogger.logInfo('Transaction CSV fetched', {
+        ...context,
+        ...summarizeTransactionCsv(csv),
+        contentHash,
+      });
+      const idempotencyKey = await sha256Key(`TRANSACTIONS|${dateFrom}|${dateTo}|${csv}`);
+      await onProgress({ stage: 'UPLOADING' });
+      await extensionLogger.logInfo('Transaction CSV uploading', context);
+      result = await postFileTo(transactionsImportUrl, {
+        salesChannelCode: "AMAZON",
+        marketplaceCode: marketplaceCode || "US",
+        dryRun: "false",
+        sourceRef: `transactions-${dateFrom}-${dateTo}.csv`,
+        file: { name: `transactions-${dateFrom}-${dateTo}.csv`, text: csv },
+      }, ingestToken, { idempotencyKey });
+      batchId = result?.data?.importBatchId;
+      if (batchId) await chrome.storage.local.set({ [pendingKey]: batchId });
+    }
+    if (batchId) {
+      await extensionLogger.logInfo('Transaction batch monitoring', { ...context, batchId });
+      await onProgress({ stage: 'IMPORTING', batchId });
+    }
     const completed = batchId ? await waitForFinanceImport({
-      base: deriveApiUrls(ingestUrl).base,
+      base,
       batchId,
       token: ingestToken,
       context,
       kind: 'Transaction',
+      onProgress,
+      progressTimeoutMs: 300000,
     }) : result;
+    if (batchId) await chrome.storage.local.remove(pendingKey);
     await extensionLogger.logTaskCompleted(context, completed, 'Transaction task completed');
     return completed;
   } catch (error) {
-    await extensionLogger.logTaskFailed(context, error, 'Transaction task failed');
+    if (batchId) error.batchId = batchId;
+    if (pendingKey && error.terminalBatch) await chrome.storage.local.remove(pendingKey).catch(() => undefined);
+    await extensionLogger.logTaskFailed({ ...context, ...(batchId ? { batchId } : {}) }, error, 'Transaction task failed');
     throw error;
+  } finally {
+    transactionImportRunning = false;
   }
 }
 
-async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDescriptor } = {}) {
-  if (settlementImportLock.running) {
+async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDescriptor, onProgress = async () => {}, activity = {}, rangeTask = false } = {}) {
+  if (settlementImportLock.running || (settlementRangeRunning && !rangeTask)) {
     throw new Error('Settlement import already running; wait for the current import to finish');
   }
   const { ingestUrl, ingestToken, marketplaceCode } = await getCfg();
@@ -1376,16 +1499,22 @@ async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDesc
 
   settlementImportLock.running = true;
   let referenceId = null;
+  let historyId = null;
   let context = { dateFrom: dateFrom || null, dateTo: dateTo || null, taskId: 'settlements_scheduled' };
   try {
     const descriptor = providedDescriptor || await findSettlementDownload({ dateFrom, dateTo });
     const resolvedDateFrom = dateFrom || descriptor.dateFrom;
     const resolvedDateTo = dateTo || descriptor.dateTo;
     if (!resolvedDateFrom || !resolvedDateTo) throw new Error("dateFrom and dateTo are required");
-    context = { dateFrom: resolvedDateFrom, dateTo: resolvedDateTo, taskId: `settlements_${resolvedDateFrom}_${resolvedDateTo}` };
+    context = { ...activity, dateFrom: resolvedDateFrom, dateTo: resolvedDateTo, taskId: `settlements_${resolvedDateFrom}_${resolvedDateTo}` };
+    // Command lifecycle is emitted by the dispatcher, not by each statement.
+    const completedLog = async (result, message) => activity.commandId
+      ? extensionLogger.logInfo('Settlement statement result', { ...context, reason: result?.reason || 'IMPORTED' })
+      : extensionLogger.logTaskCompleted(context, result, message);
     await extensionLogger.logTaskProcessing(context, 'Settlement task started');
     referenceId = descriptor.referenceId;
     const { settlementsImportUrl, base } = deriveApiUrls(ingestUrl);
+    historyId = await sha256Key(`SETTLEMENT_HISTORY|${base}|${ingestToken}|${referenceId}`);
     const completion = await getJson(
       `${base}/api/finance/imports/settlements/${encodeURIComponent(referenceId)}/completed`,
       ingestToken,
@@ -1395,30 +1524,30 @@ async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDesc
       referenceId,
     });
     if (completedSkip) {
-      await extensionLogger.logTaskCompleted(context, completedSkip, 'Settlement task skipped (already imported)');
+      await completedLog(completedSkip, 'Settlement task skipped (already imported)');
       return completedSkip;
     }
     const history = await readSettlementImportHistory();
-    const previous = history[referenceId];
-    if (previous?.status === 'COMPLETED' && previous.batchId) {
-      const skipped = { ok: true, skipped: true, reason: 'SETTLEMENT_ALREADY_IMPORTED', referenceId, batchId: previous.batchId };
-      await extensionLogger.logTaskCompleted(context, skipped, 'Settlement task skipped (already imported)');
-      return skipped;
-    }
+    const previous = history[historyId];
     if (previous?.status === 'PROCESSING' && previous.batchId) {
-      const skipped = { ok: true, skipped: true, reason: 'SETTLEMENT_ALREADY_PROCESSING', referenceId, batchId: previous.batchId };
-      await extensionLogger.logTaskCompleted(context, skipped, 'Settlement task skipped (already processing)');
-      return skipped;
+      await onProgress({ stage: 'IMPORTING', batchId: previous.batchId });
+      const completed = await waitForFinanceImport({ base, batchId: previous.batchId, token: ingestToken, context,
+        kind: 'Settlement', onProgress, progressTimeoutMs: 300000 });
+      await recordSettlementImport(historyId, { ...previous, status: 'COMPLETED' });
+      await completedLog(completed, 'Settlement task completed');
+      return { ...completed, referenceId, rowCount: previous.rowCount };
     }
     if (!canStartSettlementImport(previous)) {
       const skipped = { ok: true, skipped: true, reason: 'SETTLEMENT_COOLDOWN', referenceId, retryAfterMs: SETTLEMENT_IMPORT_COOLDOWN_MS };
-      await extensionLogger.logTaskCompleted(context, skipped, 'Settlement task skipped (cooldown)');
+      await completedLog(skipped, 'Settlement task skipped (cooldown)');
       return skipped;
     }
 
-    await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'FETCHING', dateFrom: resolvedDateFrom, dateTo: resolvedDateTo });
+    await recordSettlementImport(historyId, { attemptedAt: Date.now(), status: 'FETCHING', dateFrom: resolvedDateFrom, dateTo: resolvedDateTo });
+    await onProgress({ stage: 'FETCHING' });
     const { text, summary } = await fetchSettlementsTxtFromAmazon({ dateFrom: resolvedDateFrom, dateTo: resolvedDateTo, descriptor });
     const idempotencyKey = await sha256Key(`SETTLEMENTS|${referenceId}|${text}`);
+    await onProgress({ stage: 'UPLOADING' });
     const result = await postFileTo(settlementsImportUrl, {
       salesChannelCode: "AMAZON",
       marketplaceCode: marketplaceCode || "US",
@@ -1427,19 +1556,28 @@ async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDesc
       file: { name: `settlements-${referenceId}.txt`, text },
     }, ingestToken, { idempotencyKey });
     const batchId = result?.data?.importBatchId;
-    await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'PROCESSING', batchId, rowCount: summary.rowCount });
+    if (!batchId) throw new Error('Settlement upload returned no import batch id');
+    await recordSettlementImport(historyId, { attemptedAt: Date.now(), status: 'PROCESSING', batchId, rowCount: summary.rowCount });
+    await onProgress({ stage: 'IMPORTING', batchId });
     const completed = batchId ? await waitForFinanceImport({
       base,
       batchId,
       token: ingestToken,
       context: { ...context, referenceId },
       kind: 'Settlement',
+      onProgress,
+      progressTimeoutMs: activity.commandId ? 300000 : 0,
     }) : result;
-    await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'COMPLETED', batchId, rowCount: summary.rowCount });
-    await extensionLogger.logTaskCompleted(context, completed, 'Settlement task completed');
+    await recordSettlementImport(historyId, { attemptedAt: Date.now(), status: 'COMPLETED', batchId, rowCount: summary.rowCount });
+    await completedLog(completed, 'Settlement task completed');
     return { ...completed, referenceId, rowCount: summary.rowCount };
   } catch (error) {
-    if (referenceId) await recordSettlementImport(referenceId, { attemptedAt: Date.now(), status: 'FAILED', error: error?.message || String(error) });
+    if (historyId) {
+      const previous = (await readSettlementImportHistory())[historyId];
+      if (error.terminalBatch || !previous?.batchId) {
+        await recordSettlementImport(historyId, { attemptedAt: Date.now(), status: 'FAILED', error: error?.message || String(error) });
+      }
+    }
     await extensionLogger.logTaskFailed(context, error, 'Settlement task failed');
     throw error;
   } finally {
@@ -1447,9 +1585,35 @@ async function runImportSettlements({ dateFrom, dateTo, descriptor: providedDesc
   }
 }
 
-async function runScheduledSettlementImport() {
+async function runSettlementRange({ dateFrom, dateTo, onProgress = async () => {}, activity = {} } = {}) {
+  if (settlementRangeRunning || settlementImportLock.running) throw new Error('Settlement import already running');
+  settlementRangeRunning = true;
+  let importedCount = 0;
+  let skippedCount = 0;
+  try {
+    const descriptors = await findSettlementRange({ dateFrom, dateTo, onProgress });
+    if (!descriptors.length) throw new Error('No closed settlement with Flat File V2 found in the requested range');
+    for (const descriptor of descriptors) {
+      await onProgress({ stage: `SETTLEMENT:${descriptor.referenceId}` });
+      await extensionLogger.logInfo('Settlement range progress', { ...activity, referenceId: descriptor.referenceId, statementCount: descriptors.length, importedCount, skippedCount });
+      const result = await runImportSettlements({ ...descriptor, descriptor, onProgress, activity, rangeTask: true });
+      if (result.skipped) {
+        if (result.reason !== 'SETTLEMENT_ALREADY_IMPORTED') throw new Error(`Settlement ${descriptor.referenceId}: ${result.reason}`);
+        skippedCount++;
+      } else importedCount += Number(result.processedRows ?? result.rowCount ?? 0);
+    }
+    return { importedCount, skippedCount, statementCount: descriptors.length };
+  } catch (error) {
+    error.importedCount = importedCount;
+    throw error;
+  } finally {
+    settlementRangeRunning = false;
+  }
+}
+
+async function runScheduledSettlementImport(options = {}) {
   const descriptor = await findSettlementDownload({ autoDiscover: true });
-  return runImportSettlements({ dateFrom: descriptor.dateFrom, dateTo: descriptor.dateTo, descriptor });
+  return runImportSettlements({ ...options, dateFrom: descriptor.dateFrom, dateTo: descriptor.dateTo, descriptor });
 }
 
 async function runExportAdsSpendLocked({ dateFrom, dateTo }, lock = {}) {
@@ -1602,7 +1766,13 @@ async function uploadGmailAdsDownload(url) {
   }
 }
 async function runFullFlowAndEmitLogs(numDays) { try { const importResult = await runImportNewOrders(undefined, numDays); return { ok: true, phases: [{ type: "import", status: "success", rows: importResult?.rows || 0 }], result: importResult }; } catch (error) { await setOrderImportProgress('FAILED', 'Order import failed', { error: error?.message || String(error) }); throw error; } }
-async function pollExtensionCommands(config = null) { config ||= await getCfg(); const identity = await getBaseShopAndIdentity(); return pollExtensionCommand({ base: identity.base, token: config.ingestToken, client: { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }, runImport: (numDays) => runFullFlowAndEmitLogs(numDays), runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }), runTransactions: ({ dateFrom, dateTo }) => runImportTransactions({ dateFrom, dateTo }), runSettlements: ({ dateFrom, dateTo }) => dateFrom && dateTo ? runImportSettlements({ dateFrom, dateTo }) : runScheduledSettlementImport() }); }
+async function pollExtensionCommands(config = null) { config ||= await getCfg(); const identity = await getBaseShopAndIdentity(); return pollExtensionCommand({ base: identity.base, token: config.ingestToken, client: { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }, logger: extensionLogger, runImport: (numDays) => runFullFlowAndEmitLogs(numDays), runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }), runTransactions: runImportTransactions, runSettlements: options => options.dateFrom && options.dateTo ? runSettlementRange(options) : runScheduledSettlementImport(options) }); }
+async function getActivityCommands() {
+  const config = await getCfg();
+  if (!config.ingestUrl || !config.ingestToken) return [];
+  const identity = await getBaseShopAndIdentity();
+  return listAgentCommands({ base: identity.base, token: config.ingestToken, client: { clientId: identity.clientId, label: identity.clientLabel } });
+}
 async function queueManualOrderImport() { const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }; const command = await queueOrderImportCommand({ base: identity.base, token: config.ingestToken, client }); await setOrderImportProgress('QUEUED', 'Import queued'); await pollExtensionCommandsWithBackoff({ force: true }); return { ok: true, commandId: command.id }; }
 async function queueManualAdsSpend(date) { const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }; const command = await queueAdsSpendCommand({ base: identity.base, token: config.ingestToken, client, date }); await pollExtensionCommandsWithBackoff({ force: true }); return { ok: true, commandId: command.id }; }
 async function pollExtensionCommandsWithBackoff({ force = false } = {}) {
@@ -1634,4 +1804,4 @@ chrome.runtime.onInstalled.addListener(() => startExtensionCommandPolling());
 chrome.runtime.onStartup.addListener(() => startExtensionCommandPolling());
 chrome.storage.onChanged.addListener((changes) => { if (changes.ingestUrl || changes.ingestToken) startExtensionCommandPolling(); });
 chrome.alarms.onAlarm.addListener((alarm) => { if (alarm?.name === EXTENSION_COMMAND_POLL_ALARM) pollExtensionCommandsWithBackoff().catch(() => undefined); });
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => { (async () => { if (msg?.type === "PING") return sendResponse({ ok: true }); if (msg?.type === "HEARTBEAT_NOW") { await pollExtensionCommandsWithBackoff({ force: true }); return sendResponse({ ok: true, message: "Heartbeat completed." }); } if (msg?.type === "AUTO_RUN_NOW") return sendResponse(await queueManualOrderImport()); if (msg?.type === "RUN_ADS_SPEND") return sendResponse(await queueManualAdsSpend(msg.payload?.date)); if (msg?.type === "RUN_TRANSACTIONS_IMPORT") return sendResponse(await runImportTransactions(msg.payload || {})); if (msg?.type === "RUN_SETTLEMENTS_IMPORT") return sendResponse(await runImportSettlements(msg.payload || {})); if (msg?.type === "GMAIL_AMAZON_ADS_DOWNLOAD") return sendResponse(await uploadGmailAdsDownload(msg.url)); return sendResponse({ ok: false, error: "Unsupported action" }); })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) })); return true; });
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => { (async () => { if (msg?.type === "PING") return sendResponse({ ok: true }); if (msg?.type === 'GET_ACTIVITY_COMMANDS') return sendResponse({ ok: true, commands: await getActivityCommands() }); if (msg?.type === "HEARTBEAT_NOW") { await pollExtensionCommandsWithBackoff({ force: true }); return sendResponse({ ok: true, message: "Heartbeat completed." }); } if (msg?.type === "AUTO_RUN_NOW") return sendResponse(await queueManualOrderImport()); if (msg?.type === "RUN_ADS_SPEND") return sendResponse(await queueManualAdsSpend(msg.payload?.date)); if (msg?.type === "RUN_TRANSACTIONS_IMPORT") return sendResponse(await runImportTransactions(msg.payload || {})); if (msg?.type === "RUN_SETTLEMENTS_IMPORT") return sendResponse(await runImportSettlements(msg.payload || {})); if (msg?.type === "GMAIL_AMAZON_ADS_DOWNLOAD") return sendResponse(await uploadGmailAdsDownload(msg.url)); return sendResponse({ ok: false, error: "Unsupported action" }); })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) })); return true; });

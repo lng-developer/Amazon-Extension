@@ -18,6 +18,7 @@ export async function postFileTo(url, fields, token = "", options = {}) {
 
   const res = await fetch(url, {
     method: "POST",
+    signal: AbortSignal.timeout(120000),
     headers: {
       Authorization: `Bearer ${token}`,
       ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
@@ -34,6 +35,7 @@ export async function postFileTo(url, fields, token = "", options = {}) {
 
 export async function getJson(url, token = "") {
   const res = await fetch(url, {
+    signal: AbortSignal.timeout(30000),
     headers: { Authorization: `Bearer ${token}` },
   });
   const body = await readBackendResponse(res);
