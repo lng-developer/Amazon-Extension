@@ -16,6 +16,7 @@ import {
 } from './adsReporting.js';
 import { classifyAmazonAdsReportLink, createGmailAdsDownloadFingerprint } from './gmailReportDownload.js';
 import { fetchTransactionsCsv as fetchAmazonTransactionsCsv, summarizeTransactionCsv } from './amazonTransaction.js';
+import { runListingImageBatch } from './amazonListingImage.js';
 import {
   SETTLEMENT_IMPORT_COOLDOWN_MS,
   canStartSettlementImport,
@@ -1766,7 +1767,18 @@ async function uploadGmailAdsDownload(url) {
   }
 }
 async function runFullFlowAndEmitLogs(numDays) { try { const importResult = await runImportNewOrders(undefined, numDays); return { ok: true, phases: [{ type: "import", status: "success", rows: importResult?.rows || 0 }], result: importResult }; } catch (error) { await setOrderImportProgress('FAILED', 'Order import failed', { error: error?.message || String(error) }); throw error; } }
-async function pollExtensionCommands(config = null) { config ||= await getCfg(); const identity = await getBaseShopAndIdentity(); return pollExtensionCommand({ base: identity.base, token: config.ingestToken, client: { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base }, logger: extensionLogger, runImport: (numDays) => runFullFlowAndEmitLogs(numDays), runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }), runTransactions: runImportTransactions, runSettlements: options => options.dateFrom && options.dateTo ? runSettlementRange(options) : runScheduledSettlementImport(options) }); }
+async function pollExtensionCommands(config = null) {
+  config ||= await getCfg();
+  const identity = await getBaseShopAndIdentity();
+  const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base, listingImageSync: true };
+  return pollExtensionCommand({ base: identity.base, token: config.ingestToken, client, logger: extensionLogger,
+    runImport: (numDays) => runFullFlowAndEmitLogs(numDays),
+    runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }),
+    runTransactions: runImportTransactions,
+    runSettlements: options => options.dateFrom && options.dateTo ? runSettlementRange(options) : runScheduledSettlementImport(options),
+    runListingImages: options => runListingImageBatch({ ...options, base: identity.base, token: config.ingestToken, client }),
+  });
+}
 async function getActivityCommands() {
   const config = await getCfg();
   if (!config.ingestUrl || !config.ingestToken) return [];

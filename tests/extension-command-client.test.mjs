@@ -2,6 +2,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { listAgentCommands, pollExtensionCommand, queueOrderImportCommand, queueAdsSpendCommand } from '../extensionCommandClient.js';
 
+test('image batch dispatcher passes lease authority without treating parent as an import batch', async () => {
+  const calls=[];
+  await pollExtensionCommand({base:'https://be.test',token:'token',client:{clientId:'rdc',label:'RDC',listingImageSync:true},
+    fetchImpl:async(url,options)=>{calls.push({url,body:JSON.parse(options.body)});return {ok:true,json:async()=>({data:url.endsWith('/claim')?{command:{id:'cmd',type:'SYNC_LISTING_IMAGES',imageSyncJobId:'parent'},leaseToken:'lease'}:{}})};},
+    runListingImages:async({command,leaseToken,onProgress})=>{assert.equal(command.imageSyncJobId,'parent');assert.equal(leaseToken,'lease');await onProgress({stage:'LISTING_IMAGES'});return {importedCount:2,failedCount:1};},
+  });
+  assert.equal(calls[0].body.listingImageSync,true);
+  assert.equal(calls.at(-1).body.importedCount,2);assert.equal(calls.at(-1).body.failedCount,1);
+  assert.notEqual(calls.at(-1).body.importJobId,'parent');
+});
+
 test('settlement range renews the command and reports aggregate imported rows', async () => {
   const calls = [];
   await pollExtensionCommand({
