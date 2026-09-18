@@ -94,8 +94,8 @@ test('CDN URL validation rejects protocol, credentials, ports and hostname looka
 
 function fixture({fatal=false, paused=false}={}) {
   let remaining = [{id:'item1',listingId:'listing1',asin,marketplaceCode:'US'},{id:'item2',listingId:'listing2',asin,marketplaceCode:'US'}];
-  const results=[], removed=[], visited=[];
-  const chromeApi={tabs:{create:async()=>({id:91}),update:async(id,input)=>{visited.push(input.url);},get:async()=>({status:'complete'}),remove:async id=>removed.push(id)},scripting:{executeScript:async()=>[{result:fatal?{errorCode:'AMAZON_CHALLENGE',errorMessage:'CAPTCHA'}:{asin,sourceUrl:url}}]}};
+  const results=[], removed=[], visited=[], created=[];
+  const chromeApi={tabs:{create:async input=>{created.push(input);return {id:91};},update:async(id,input)=>{visited.push(input.url);},get:async()=>({status:'complete'}),remove:async id=>removed.push(id)},scripting:{executeScript:async()=>[{result:fatal?{errorCode:'AMAZON_CHALLENGE',errorMessage:'CAPTCHA'}:{asin,sourceUrl:url}}]}};
   const fetchImpl=async (target,options={})=>{
     if(target===url)return new Response(new Uint8Array([255,216,255,224]),{headers:{'content-type':'image/jpeg'}});
     if(target.endsWith('/items/query')) return Response.json({data:{jobId:'job',status:paused?'PAUSED':'RUNNING',items:remaining}});
@@ -103,11 +103,11 @@ function fixture({fatal=false, paused=false}={}) {
     if(target.endsWith('/result')){assert.ok(options.body instanceof FormData);assert.equal(options.body.get('asin'),asin);assert.equal(options.body.get('leaseToken'),'lease'); results.push('UPLOADED');remaining=remaining.slice(1);return Response.json({data:{status:'SUCCEEDED'}});}
     throw new Error('Unexpected request '+target);
   };
-  return {chromeApi,fetchImpl,results,removed,visited};
+  return {chromeApi,fetchImpl,results,removed,visited,created};
 }
 test('batch uploads and acknowledges each item and closes only its owned tab', async()=>{
   const f=fixture();const result=await images.runListingImageBatch({base:'https://be.test',token:'token',client:{clientId:'client'},command:{id:'cmd'},leaseToken:'lease',onProgress:async()=>{},...f});
-  assert.equal(result.importedCount,2);assert.deepEqual(f.results,['UPLOADED','UPLOADED']);assert.deepEqual(f.removed,[91]);assert.equal(f.visited.length,2);
+  assert.equal(result.importedCount,2);assert.deepEqual(f.results,['UPLOADED','UPLOADED']);assert.deepEqual(f.created,[{url:`https://www.amazon.com/dp/${asin}`,active:true}]);assert.deepEqual(f.visited,[`https://www.amazon.com/dp/${asin}`]);assert.deepEqual(f.removed,[91]);
 });
 
 test('Page Not Found checkpoints failure without uploading and continues to the next listing without waiting', async () => {
@@ -130,7 +130,7 @@ test('Page Not Found checkpoints failure without uploading and continues to the 
   const result = await images.runListingImageBatch({ base: 'https://be.test', token: 'token', client: { clientId: 'client' }, command: { id: 'cmd' }, leaseToken: 'lease', onProgress: async () => {}, delay: async () => assert.fail('Not-found page must not wait for an image'), ...f });
   assert.deepEqual(result, { importedCount: 1, failedCount: 1 });
   assert.deepEqual(f.results, ['FAILED', 'UPLOADED']);
-  assert.equal(f.visited.length, 2);
+  assert.equal(f.visited.length, 1);
   assert.deepEqual(f.removed, [91]);
 });
 test('paused parent performs no Amazon work',async()=>{
@@ -146,10 +146,31 @@ test('lost command lease stops before browsing or uploading',async()=>{
   assert.equal(f.visited.length,0);assert.equal(f.results.length,0);
 });
 
-test('closing the worker tab pauses without failing all remaining listings',async()=>{
+test('closing the worker tab repeatedly pauses after one recovery without failing listings',async()=>{
   const f=fixture();
   f.chromeApi.tabs.get=async()=>{throw new Error('No tab with id: 91');};
   await assert.rejects(images.runListingImageBatch({base:'https://be.test',token:'token',client:{clientId:'client'},command:{id:'cmd'},leaseToken:'lease',onProgress:async()=>{},...f}),/tab.*unavailable/i);
   assert.deepEqual(f.results,['PAUSED']);
-  assert.equal(f.visited.length,1);
+  assert.equal(f.created.length,2);assert.equal(f.visited.length,0);
+});
+
+test('a lost worker tab is reopened once and the same pending listing is retried', async () => {
+  const f = fixture();
+  let created = 0;
+  f.chromeApi.tabs.create = async input => { f.created.push(input); return { id: ++created }; };
+  f.chromeApi.tabs.get = async id => { if (id === 1) throw new Error('No tab with id: 1'); return { status: 'complete' }; };
+  const result = await images.runListingImageBatch({ base: 'https://be.test', token: 'token', client: { clientId: 'client' }, command: { id: 'cmd' }, leaseToken: 'lease', onProgress: async () => {}, ...f });
+  assert.deepEqual(result, { importedCount: 2, failedCount: 0 });
+  assert.deepEqual(f.results, ['UPLOADED', 'UPLOADED']);
+  assert.equal(f.created.length,2);assert.equal(f.visited.length, 1);
+  assert.deepEqual(f.removed, [2]);
+});
+
+test('CAPTCHA still pauses when the tab disappears after detection', async () => {
+  const f = fixture({ fatal: true });
+  let checks = 0;
+  f.chromeApi.tabs.get = async () => { if (++checks > 1) throw new Error('Tab gone'); return { status: 'complete' }; };
+  await assert.rejects(images.runListingImageBatch({ base: 'https://be.test', token: 'token', client: { clientId: 'client' }, command: { id: 'cmd' }, leaseToken: 'lease', onProgress: async () => {}, ...f }), /CAPTCHA/);
+  assert.deepEqual(f.results, ['PAUSED']);
+  assert.equal(f.visited.length, 0);
 });

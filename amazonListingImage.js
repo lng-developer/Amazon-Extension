@@ -94,6 +94,7 @@ export async function runListingImageBatch({ base, token, client, command, lease
   let leaseError;
   let importedCount = 0;
   let failedCount = 0;
+  let tabRecoveries = 0;
   const renew = async () => {
     if (renewing || leaseError) return;
     renewing = true;
@@ -118,8 +119,9 @@ export async function runListingImageBatch({ base, token, client, command, lease
       let image;
       let blob;
       try {
-        if (!ownedTab) ownedTab = await chromeApi.tabs.create({url:'about:blank',active:false});
-        await chromeApi.tabs.update(ownedTab.id,{url:`https://www.amazon.com/dp/${item.asin}`});
+        const productUrl = `https://www.amazon.com/dp/${item.asin}`;
+        if (!ownedTab) ownedTab = await chromeApi.tabs.create({url:productUrl,active:true});
+        else await chromeApi.tabs.update(ownedTab.id,{url:productUrl});
         for (let attempt=0; attempt<120; attempt++) {
           checkLease();
           if ((await chromeApi.tabs.get(ownedTab.id)).status === 'complete') {
@@ -134,16 +136,22 @@ export async function runListingImageBatch({ base, token, client, command, lease
         blob = await downloadListingImage(image.sourceUrl, { fetchImpl, signal });
       } catch(error) {
         checkLease();
-        if (ownedTab) {
-          try { await chromeApi.tabs.get(ownedTab.id); }
-          catch {
-            await request('/pause',{...lease,errorMessage:'Amazon worker tab is unavailable. Resume to open a new tab.'});
-            throw imageError('AMAZON_TAB_UNAVAILABLE', 'Amazon worker tab is unavailable. Resume to open a new tab.');
-          }
-        }
         if (fatalCodes.has(error.code)) {
           await request('/pause',{...lease,errorMessage:error.message.slice(0,1000)});
           throw error;
+        }
+        if (ownedTab) {
+          try { await chromeApi.tabs.get(ownedTab.id); }
+          catch {
+            if (tabRecoveries < 1) {
+              tabRecoveries++;
+              ownedTab = null;
+              index--;
+              continue; // Re-query the parent and retry the same unacknowledged item.
+            }
+            await request('/pause',{...lease,errorMessage:'Amazon worker tab is unavailable. Resume to open a new tab.'});
+            throw imageError('AMAZON_TAB_UNAVAILABLE', 'Amazon worker tab is unavailable. Resume to open a new tab.');
+          }
         }
         await request(`/items/${encodeURIComponent(item.id)}/result`,{...lease,asin:item.asin,errorCode:error.code || 'IMAGE_FETCH_FAILED',errorMessage:error.message.slice(0,1000)});
         failedCount++; handled.add(item.id); continue;
