@@ -22,7 +22,7 @@ test('recognizes Amazon Page Not Found immediately without mistaking product tex
   assert.equal(extract(notFoundPage).errorCode, 'AMAZON_PAGE_NOT_FOUND');
   assert.equal(extract({ title: notFoundPage.title, text: notFoundPage.text }).sourceUrl, url);
   assert.equal(extract({ image: null, pageAsin: '', text: notFoundPage.text }).pending, true);
-  assert.equal(extract({ image: null, pageAsin: '', title: notFoundPage.title }).pending, true);
+  assert.equal(extract({ image: null, pageAsin: '', title: notFoundPage.title }).errorCode, 'AMAZON_PAGE_NOT_FOUND');
   assert.equal(extract({ ...notFoundPage, challenge: true }).errorCode, 'AMAZON_CHALLENGE');
 });
 test('falls back to the largest declared image, never invents an original URL', () => {

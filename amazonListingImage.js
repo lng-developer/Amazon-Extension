@@ -17,8 +17,7 @@ export function inspectListingMainImage(expectedAsin) {
   const asin = document.querySelector('#ASIN')?.value?.toUpperCase();
   if (pathAsin !== expectedAsin || (asin && asin !== expectedAsin)) return { errorCode: 'ASIN_MISMATCH', errorMessage: 'Amazon page ASIN does not match the requested listing.' };
   const img = document.querySelector('#landingImage');
-  if (!img && !asin && /\bpage not found\b/i.test(document.title || '')
-    && /we couldn['’]t find that page/i.test(text)) {
+  if (!img && !asin && /\bpage not found\b/i.test(document.title || '')) {
     return { errorCode: 'AMAZON_PAGE_NOT_FOUND', errorMessage: 'Amazon product page was not found. Existing listing image was left unchanged.' };
   }
   if (!img || !img.complete || !img.naturalWidth || !asin) return { pending: true };
