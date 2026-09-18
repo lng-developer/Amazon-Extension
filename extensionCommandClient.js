@@ -35,7 +35,7 @@ export async function listAgentCommands({ base, token, client, fetchImpl = fetch
   return result?.items || [];
 }
 
-export async function pollExtensionCommand({ base, token, client, runImport, runAds, runTransactions, runSettlements, logger, fetchImpl = fetch }) {
+export async function pollExtensionCommand({ base, token, client, runImport, runAds, runTransactions, runSettlements, runListingImages, logger, fetchImpl = fetch }) {
   if (!base || !token || !client?.clientId || !client?.label) return null;
   const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;
   await request(fetchImpl, `${root}/agent/heartbeat`, token, 'POST', client);
@@ -46,7 +46,7 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
   const lease = { ...client, leaseToken: claim.leaseToken };
   await request(fetchImpl, `${root}/agent/commands/${command.id}/start`, token, 'POST', lease);
   const activity = { commandId: command.id, taskType: command.type };
-  const activityLogger = ['IMPORT_NEW_ORDERS', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS'].includes(command.type) ? logger : null;
+  const activityLogger = ['IMPORT_NEW_ORDERS', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'SYNC_LISTING_IMAGES'].includes(command.type) ? logger : null;
   await activityLogger?.logTaskProcessing(activity, 'Command task started');
   let batchId = null;
   let lastRenewedAt = 0;
@@ -62,10 +62,12 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
     lastStage = stage;
   };
   try {
-    if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'TEST_CONNECTION'].includes(command.type)) {
+    if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'SYNC_LISTING_IMAGES', 'TEST_CONNECTION'].includes(command.type)) {
       throw new Error(`Unsupported command: ${command.type}`);
     }
-    const outcome = command.type === 'IMPORT_NEW_ORDERS'
+    const outcome = command.type === 'SYNC_LISTING_IMAGES'
+      ? await runListingImages({ command, leaseToken: claim.leaseToken, onProgress, activity })
+      : command.type === 'IMPORT_NEW_ORDERS'
       ? await runImport(command.numDays || 1, activity)
       : command.type === 'IMPORT_ADS_SPEND'
         ? await runAds({ dateFrom: command.dateFrom, dateTo: command.dateTo })

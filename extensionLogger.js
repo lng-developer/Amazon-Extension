@@ -22,6 +22,7 @@ function redactValue(value, depth = 0) {
 }
 
 const ACTIVITY_TYPES = {
+  SYNC_LISTING_IMAGES: 'Listing Images',
   IMPORT_ADS_SPEND: 'Ads Spend',
   IMPORT_NEW_ORDERS: 'Orders',
   IMPORT_SETTLEMENTS: 'Settlements',

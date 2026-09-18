@@ -3,6 +3,11 @@ import test from 'node:test';
 
 import { EXTENSION_LOG_STORAGE_KEY, buildActivityRuns, createExtensionLogger, formatVietnamTime } from '../extensionLogger.js';
 
+test('listing image batches have their own activity label', () => {
+  const [run] = buildActivityRuns([{ timestamp: new Date().toISOString(), level: 'info', message: 'Command started', context: { taskType: 'SYNC_LISTING_IMAGES', commandId: 'images' } }]);
+  assert.equal(run.label, 'Listing Images');
+});
+
 test('same transaction run stays together across a long silent gap', () => {
   const runs = buildActivityRuns([
     { timestamp: '2026-09-17T12:30:00Z', level: 'info', message: 'Transaction task started', context: { taskId: 'range-1' } },
