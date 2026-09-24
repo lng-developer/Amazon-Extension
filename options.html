@@ -64,24 +64,28 @@
           </button>
         </div>
 
-        <div class="divider"></div>
+        <p class="hint">Socket tự kết nối lại ở chế độ nền khi extension khởi động hoặc mất kết nối.</p>
+      </section>
 
-        <div class="field auto-field">
-          <label>Auto Connect Socket</label>
-          <div class="inline-control">
-            <input
-              id="socketAutoInterval"
-              type="number"
-              min="0"
-              step="1"
-              placeholder="60"
-            />
-            <button id="btnSaveSocketAutoInterval" class="btn btn-primary small">
-              Lưu
-            </button>
+      <section class="panel">
+        <div class="panel-header compact">
+          <div>
+            <h2>Ads Preview</h2>
+            <p>Kéo đủ report, chỉ tổng hợp tại extension; không gửi hoặc lưu vào LNG.</p>
           </div>
-          <p class="hint">Nhập số phút tự động kết nối lại socket. Đặt 0 để tắt.</p>
+          <span class="panel-icon">AD</span>
         </div>
+        <div class="inline-control">
+          <label class="sr-only" for="adsPreviewStartDate">Từ ngày</label>
+          <input id="adsPreviewStartDate" type="date" aria-label="Ads start date" />
+          <span class="range-separator" aria-hidden="true">—</span>
+          <label class="sr-only" for="adsPreviewEndDate">Đến ngày</label>
+          <input id="adsPreviewEndDate" type="date" aria-label="Ads end date" />
+          <button id="btnPreviewAds" class="btn btn-outline" type="button">Preview Full</button>
+          <button id="btnDryRunAds" class="btn btn-outline" type="button">Dry-run mapping</button>
+          <button id="btnImportAds" class="btn btn-primary" type="button">Import to LNG</button>
+        </div>
+        <pre id="adsPreviewResult" class="preview-output" aria-live="polite">Preview chỉ đọc Amazon. Dry-run mapping không lưu dữ liệu. Import to LNG cần xác nhận.</pre>
       </section>
 
       <!-- AUTO CONFIG MODAL -->
@@ -160,10 +164,10 @@
             <h2>Runtime Log</h2>
             <p>Theo dõi trạng thái extension theo thời gian thực.</p>
           </div>
-          <span class="panel-icon">📜</span>
+          <button id="clearRuntimeLog" class="panel-icon log-clear" type="button" title="Clear runtime log" aria-label="Clear runtime log">⌫</button>
         </div>
 
-        <pre id="log"></pre>
+        <div id="log" class="runtime-feed" role="log" aria-live="polite"></div>
       </section>
 
     </div>

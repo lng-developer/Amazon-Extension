@@ -4,14 +4,74 @@
 const $ = (s) => document.querySelector(s);
 const on = (el, ev, fn) => el && el.addEventListener(ev, fn);
 
-// Log kiểu cũ: append xuống cuối, không dùng mảng/ghi đè
-function log(...args) {
+const runtimeEntries = [];
+const RUNTIME_LOG_STORAGE_KEY = "runtimeLogEntries";
+const RUNTIME_LOG_LIMIT = 50;
+const ADS_LAST_RESULT_STORAGE_KEY = "adsLastResult";
+
+async function showAndPersistAdsResult(result, { kind, range }) {
+  const record = { kind, range, result, completedAt: Date.now() };
+  await chrome.storage.local.set({ [ADS_LAST_RESULT_STORAGE_KEY]: record });
+  const output = $("#adsPreviewResult");
+  if (output) output.textContent = JSON.stringify(record, null, 2);
+}
+
+function logText(value) {
+  if (typeof value === "string") {
+    const text = value.replace(/^\[\d{1,2}:\d{2}:\d{2}\]\s*/, "");
+    return text.length > 180 ? `${text.slice(0, 177)}…` : text;
+  }
+  if (value && typeof value === "object" && "ok" in value) return value.ok ? "OK" : "Failed";
+  return "[details]";
+}
+
+function logLevel(message, level) {
+  if (level) return level;
+  if (/❌|failed|error|unreachable/i.test(message)) return "error";
+  return /✅|completed|connected|success|\bok\b/i.test(message) ? "success" : "info";
+}
+
+function renderRuntimeLog() {
   const box = $("#log");
   if (!box) return;
-  const line =
-    `[${new Date().toLocaleTimeString()}] ` +
-    args.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
-  box.textContent += (box.textContent ? "\n" : "") + line;
+  box.replaceChildren(...runtimeEntries.map((entry) => {
+    const row = document.createElement("div");
+    row.className = `runtime-entry ${entry.level}`;
+    const dot = document.createElement("span"); dot.className = "runtime-dot";
+    const time = document.createElement("time"); time.textContent = entry.time;
+    const message = document.createElement("span"); message.className = "runtime-message"; message.textContent = entry.message;
+    row.append(dot, time, message);
+    if (entry.count > 1) { const count = document.createElement("span"); count.className = "runtime-count"; count.textContent = `×${entry.count}`; row.append(count); }
+    return row;
+  }));
+  box.scrollTop = box.scrollHeight;
+}
+
+function persistRuntimeLogEntry(message, level) {
+  chrome.runtime.sendMessage({
+    type: "PERSIST_RUNTIME_LOG",
+    payload: { message, level },
+  }).catch(() => {});
+}
+
+function addRuntimeLog(message, level, persist = true) {
+  const now = Date.now();
+  const last = runtimeEntries.at(-1);
+  if (last && last.message === message && now - last.at < 10_000) last.count += 1;
+  else runtimeEntries.push({ message, level: logLevel(message, level), time: new Date(now).toLocaleTimeString(), at: now, count: 1 });
+  if (runtimeEntries.length > RUNTIME_LOG_LIMIT) runtimeEntries.shift();
+  if (persist) persistRuntimeLogEntry(message, level);
+  renderRuntimeLog();
+}
+
+function log(...args) {
+  addRuntimeLog(args.map(logText).join(" "));
+}
+
+async function clearRuntimeLog() {
+  runtimeEntries.length = 0;
+  await chrome.runtime.sendMessage({ type: "CLEAR_RUNTIME_LOG" });
+  renderRuntimeLog();
 }
 
 function normalizeBaseUrl(u) {
@@ -35,18 +95,28 @@ function deriveApiUrls(base) {
 function setTodayDefault() {
   const d = $("#adsDate");
   if (d && !d.value) d.value = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const previewStartDate = $("#adsPreviewStartDate");
+  const previewEndDate = $("#adsPreviewEndDate");
+  if (previewStartDate && !previewStartDate.value) previewStartDate.value = yesterday;
+  if (previewEndDate && !previewEndDate.value) {
+    previewEndDate.value = previewStartDate?.value || yesterday;
+  }
+}
+
+function getAdsRange() {
+  const startDate = $("#adsPreviewStartDate")?.value;
+  const endDate = $("#adsPreviewEndDate")?.value || startDate;
+  if (!startDate || !endDate) throw new Error("Chọn khoảng ngày cần xem dữ liệu Ads.");
+  if (startDate > endDate) throw new Error("Ngày bắt đầu phải trước hoặc bằng ngày kết thúc.");
+  return { startDate, endDate };
 }
 
 function previewEndpoints() {
   const raw = $("#ingestUrl")?.value || "";
   const base = normalizeBaseUrl(raw);
 
-  const lines = base
-    ? ["⏱ Auto anchors: 00:00 | 04:00 | 08:00 | 12:00 | 16:00 | 20:00"]
-    : ["⚠️ Nhập API Base URL (ví dụ: https://api.lngmerch.co)"];
-
-  const box = $("#log");
-  if (box) box.textContent = lines.join("\n");
+  if (!base) log("⚠️ Nhập API Base URL (ví dụ: https://api.lngmerch.co)");
 }
 
 /* ========== Init ========== */
@@ -57,12 +127,25 @@ document.addEventListener("DOMContentLoaded", async () => {
       shopId = "",
       autoEnabled = false,
       adsHeaderLastSeen,
+      runtimeLogEntries = [],
+      adsLastResult,
     } = await chrome.storage.local.get([
       "ingestUrl",
       "shopId",
       "autoEnabled",
       "adsHeaderLastSeen",
+      RUNTIME_LOG_STORAGE_KEY,
+      ADS_LAST_RESULT_STORAGE_KEY,
     ]);
+
+    runtimeEntries.splice(0, runtimeEntries.length, ...runtimeLogEntries.slice(-RUNTIME_LOG_LIMIT).map((entry) => ({
+      message: logText(entry?.message || ""),
+      level: logLevel(entry?.message || "", entry?.level),
+      time: entry?.time || new Date(entry?.at || Date.now()).toLocaleTimeString(),
+      at: Number(entry?.at || Date.now()),
+      count: Math.max(1, Number(entry?.count || 1)),
+    })));
+    renderRuntimeLog();
 
     if ($("#ingestUrl")) $("#ingestUrl").value = ingestUrl;
     if ($("#shopId")) $("#shopId").value = shopId;
@@ -73,6 +156,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (autoToggle) autoToggle.checked = !!autoEnabled;
 
     setTodayDefault();
+    if (adsLastResult?.result) {
+      if ($("#adsPreviewStartDate") && adsLastResult.range?.startDate) $("#adsPreviewStartDate").value = adsLastResult.range.startDate;
+      if ($("#adsPreviewEndDate") && adsLastResult.range?.endDate) $("#adsPreviewEndDate").value = adsLastResult.range.endDate;
+      $("#adsPreviewResult").textContent = JSON.stringify(adsLastResult, null, 2);
+    }
     previewEndpoints();
 
     if (adsHeaderLastSeen) {
@@ -95,6 +183,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     log("Init error:", e?.message || e);
   }
 });
+
+on($("#clearRuntimeLog"), "click", clearRuntimeLog);
 
 /* ========== Live preview Base URL ========== */
 on($("#ingestUrl"), "input", previewEndpoints);
@@ -144,28 +234,6 @@ on($("#btnAutoRunNow"), "click", async () => {
 });
 
 /* ========== Export Ads theo ngày (nút riêng) ========== */
-on($("#testAds"), "click", async () => {
-  const date = $("#adsDate")?.value?.trim();
-  if (!date) return log("❌ Vui lòng nhập ngày (YYYY-MM-DD)");
-  try {
-    const res = await chrome.runtime.sendMessage({
-      type: "RUN_ADS_SPEND",
-      payload: { date },
-    });
-    if (res?.skipped && res?.reason === "ADS_TASK_ALREADY_RUNNING") {
-      log("Ads task đang chạy, bỏ qua request mới để tránh 401.");
-      return;
-    }
-    log("RUN_ADS_SPEND sent:", date);
-  } catch (e) {
-    if (e?.code === "ADS_TASK_ALREADY_RUNNING") {
-      log("Ads task đang chạy, bỏ qua request mới để tránh 401.");
-      return;
-    }
-    log("RUN_ADS_SPEND error:", e?.message || e);
-  }
-});
-
 /* ========== (Tùy chọn) Connect backend nếu có nút #btnConnect ========== */
 on($("#btnConnect"), "click", async () => {
   try {
@@ -207,67 +275,6 @@ on($("#btnSocketConnect"), "click", async () => {
     }
   } catch (e) {
     log("❌ SOCKET_CONNECT error:", e?.message || e);
-  }
-});
-
-/* ================================================================
-   AUTO CLICK Connect Socket — chu kỳ cấu hình bằng input (phút)
-   - Lưu vào chrome.storage.local key: socketAutoIntervalMin
-   - 0 hoặc trống = tắt auto
-   ================================================================ */
-const DEFAULT_SOCKET_AUTO_INTERVAL_MIN = 60;
-let _socketAutoTimer = null;
-
-function applySocketAutoInterval(minutes) {
-  if (_socketAutoTimer) {
-    clearInterval(_socketAutoTimer);
-    _socketAutoTimer = null;
-  }
-  const m = Number(minutes);
-  if (!m || m <= 0 || !Number.isFinite(m)) {
-    log("⏰ [Auto] Auto Connect Socket: TẮT");
-    return;
-  }
-  const ms = m * 60 * 1000;
-  _socketAutoTimer = setInterval(() => {
-    const btn = $("#btnSocketConnect");
-    if (!btn) return;
-    log(`⏰ [Auto] Tự động click Connect Socket (mỗi ${m} phút)...`);
-    btn.click();
-  }, ms);
-  log(`⏰ [Auto] Auto Connect Socket: BẬT — mỗi ${m} phút`);
-}
-
-(async () => {
-  try {
-    const { socketAutoIntervalMin } = await chrome.storage.local.get([
-      "socketAutoIntervalMin",
-    ]);
-    const initial =
-      socketAutoIntervalMin === undefined || socketAutoIntervalMin === null
-        ? DEFAULT_SOCKET_AUTO_INTERVAL_MIN
-        : Number(socketAutoIntervalMin);
-    const inp = $("#socketAutoInterval");
-    if (inp) inp.value = String(initial);
-    applySocketAutoInterval(initial);
-  } catch (e) {
-    log("⏰ [Auto] Init error:", e?.message || e);
-  }
-})();
-
-on($("#btnSaveSocketAutoInterval"), "click", async () => {
-  try {
-    const raw = $("#socketAutoInterval")?.value;
-    const minutes =
-      raw === "" || raw === null || raw === undefined ? 0 : Number(raw);
-    if (Number.isNaN(minutes) || minutes < 0) {
-      return log("❌ Vui lòng nhập số phút hợp lệ (>= 0).");
-    }
-    await chrome.storage.local.set({ socketAutoIntervalMin: minutes });
-    log(`💾 Đã lưu Auto Connect Socket interval = ${minutes} phút`);
-    applySocketAutoInterval(minutes);
-  } catch (e) {
-    log("❌ Save auto interval error:", e?.message || e);
   }
 });
 
@@ -450,35 +457,85 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
   
   if (msg?.type === "LOG") {
-    log(msg.payload);
+    addRuntimeLog(logText(msg.payload), undefined, false);
   }
   
   // Nhận debug logs từ background
   if (msg?.type === "DEBUG_LOG") {
-    const { message, level, timestamp } = msg.payload;
-    
-    // Tạo styled log message
-    let styledMessage = `[${timestamp}] ${message}`;
-    
-    // Thêm vào log box với styling dựa trên level
-    const logBox = $("#log");
-    if (logBox) {
-      const currentContent = logBox.textContent;
-      logBox.textContent = currentContent + (currentContent ? "\n" : "") + styledMessage;
-      
-      // Auto scroll to bottom
-      logBox.scrollTop = logBox.scrollHeight;
-      
-      // Add color styling based on level
-      if (level === 'error') {
-        // Highlight error messages
-        const lines = logBox.textContent.split('\n');
-        const lastLine = lines[lines.length - 1];
-        if (lastLine.includes('❌') || lastLine.includes('Failed') || lastLine.includes('error')) {
-          // Could add special styling here if needed
-        }
-      }
+    const { message, level } = msg.payload;
+    addRuntimeLog(message, level, false);
+  }
+});
+
+on($("#btnPreviewAds"), "click", async () => {
+  const output = $("#adsPreviewResult");
+  let range;
+  try { range = getAdsRange(); } catch (error) { return log(`❌ ${error.message}`); }
+
+  if (output) output.textContent = "Đang kéo report theo từng ngày từ Amazon…";
+  try {
+    const result = await chrome.runtime.sendMessage({
+      type: "PREVIEW_ADS_SPEND",
+      payload: range,
+    });
+    if (result?.skipped) {
+      if (output) output.textContent = "Ads đang chạy; hãy đợi task hiện tại hoàn tất rồi preview lại.";
+      return;
     }
+    if (!result?.ok) throw new Error(result?.message || "Amazon không trả dữ liệu preview");
+    await showAndPersistAdsResult(result, { kind: "preview", range });
+    log(`Ads preview hoàn tất: ${result.rawRecords || 0} records, spend ${result.totalSpend || 0}.`);
+  } catch (error) {
+    const message = error?.message || String(error);
+    if (output) output.textContent = `Không lấy được dữ liệu: ${message}`;
+    log("❌ Ads preview:", message);
+  }
+});
+
+on($("#btnDryRunAds"), "click", async () => {
+  const output = $("#adsPreviewResult");
+  let range;
+  try { range = getAdsRange(); } catch (error) { return log(`❌ ${error.message}`); }
+
+  if (output) output.textContent = "Đang lấy report từng ngày và kiểm tra mapping tại BE…";
+  try {
+    const result = await chrome.runtime.sendMessage({
+      type: "DRY_RUN_ADS_SPEND",
+      payload: range,
+    });
+    if (!result?.ok) throw new Error(result?.message || "Dry-run mapping thất bại");
+    await showAndPersistAdsResult(result, { kind: "dry-run", range });
+    log(`Ads dry-run: ${result.days?.length || 0} ngày đã kiểm tra.`);
+  } catch (error) {
+    const message = error?.message || String(error);
+    if (output) output.textContent = `Dry-run thất bại: ${message}`;
+    log("❌ Ads dry-run:", message);
+  }
+});
+
+on($("#btnImportAds"), "click", async () => {
+  const output = $("#adsPreviewResult");
+  let range;
+  try { range = getAdsRange(); } catch (error) { return log(`❌ ${error.message}`); }
+  if (!confirm(`Import Ads từ ${range.startDate} đến ${range.endDate} vào LNG? Chỉ tiếp tục nếu Dry-run mapping đã pass.`)) return;
+
+  if (output) output.textContent = "Đang import Ads theo từng ngày vào LNG…";
+  try {
+    const result = await chrome.runtime.sendMessage({
+      type: "RUN_ADS_SPEND",
+      payload: range,
+    });
+    if (result?.skipped) {
+      if (output) output.textContent = "Ads đang chạy; hãy đợi task hiện tại hoàn tất rồi import lại.";
+      return;
+    }
+    if (!result?.ok) throw new Error(result?.message || "Import Ads thất bại");
+    await showAndPersistAdsResult(result, { kind: "import", range });
+    log(`Ads imported: ${result.days?.length || 0} ngày.`);
+  } catch (error) {
+    const message = error?.message || String(error);
+    if (output) output.textContent = `Import thất bại: ${message}`;
+    log("❌ Ads import:", message);
   }
 });
 

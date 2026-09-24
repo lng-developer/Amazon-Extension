@@ -136,7 +136,6 @@
     const pagination = reportConfig?.offsetPagination || {};
 
     const cfg = await getCfg();
-    console.log("[ADS][DEBUG][cfg]", JSON.stringify(cfg, null, 2));
     bridgeLog("info", "[ADS_BRIDGE] Storage config loaded", {
       hasAccountId: !!cfg.adsAccountId,
       hasAdvertiserId: !!cfg.adsAdvertiserId,
@@ -154,7 +153,6 @@
         /csrf|token|account|advertiser|client/i.test(k) && v ? `${String(v).slice(0, 6)}...` : v,
       ])
     );
-    console.log("[APO][ADS] retrieveReport → headers(use)", safeHeadersForLog);
     bridgeLog("info", "[ADS_BRIDGE] retrieveReport headers built", {
       hasAccountId: !!headers["Amazon-Ads-Account-Id"],
       hasAdvertiserId: !!headers["Amazon-Advertising-Api-Advertiserid"],
@@ -168,7 +166,7 @@
       credentials: "include",
       mode: "cors",
       headers,
-      referrer: `${ADS_BASE}/cm/campaigns`,
+      referrer: `${ADS_BASE}/campaign-manager/all-campaigns`,
       referrerPolicy: "strict-origin-when-cross-origin",
       body: JSON.stringify(payload),
     });
@@ -266,7 +264,6 @@
       lastWrite = now;
 
       await saveCapturedAdsHeaders(data, "ads_bridge");
-      console.log("[APO][ADS] captured headers -> storage/candidate", data);
     } catch (e) {
       console.warn("[APO][ADS] save headers error:", e);
     }

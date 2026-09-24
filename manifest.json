@@ -30,11 +30,6 @@
       "matches": ["https://advertising.amazon.com/*"],
       "js": ["ads_bridge.js"],
       "run_at": "document_idle"
-    },
-    {
-      "matches": ["https://advertising.amazon.com/*"],
-      "js": ["ads_name_guard.js"],
-      "run_at": "document_idle"
     }
   ],
   "background": {

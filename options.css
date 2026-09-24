@@ -330,12 +330,29 @@ input::placeholder {
   flex: 1;
 }
 
+.range-separator {
+  align-self: center;
+  color: var(--muted, #8b8b8b);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* LOG */
 .panel-log {
   padding-bottom: 12px;
 }
 
-pre#log {
+.runtime-feed {
   width: 100%;
   min-height: 170px;
   max-height: 245px;
@@ -348,22 +365,34 @@ pre#log {
     linear-gradient(180deg, rgba(239, 35, 60, 0.05), rgba(255, 255, 255, 0.01)),
     #050505;
   color: #e2e2e2;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font: 11px/1.65 "SF Mono", "Fira Code", ui-monospace, monospace;
+  font: 11px/1.45 "SF Mono", "Fira Code", ui-monospace, monospace;
 }
 
-pre#log::-webkit-scrollbar,
+.preview-output {
+  max-height: 220px;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.32);
+  color: var(--text-soft);
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.runtime-feed::-webkit-scrollbar,
 .modal-list::-webkit-scrollbar {
   width: 5px;
 }
 
-pre#log::-webkit-scrollbar-track,
+.runtime-feed::-webkit-scrollbar-track,
 .modal-list::-webkit-scrollbar-track {
   background: transparent;
 }
 
-pre#log::-webkit-scrollbar-thumb,
+.runtime-feed::-webkit-scrollbar-thumb,
 .modal-list::-webkit-scrollbar-thumb {
   background: rgba(239, 35, 60, 0.45);
   border-radius: 999px;
@@ -485,3 +514,25 @@ pre#log::-webkit-scrollbar-thumb,
     gap: 12px;
   }
 }
+
+.log-clear {
+  color: var(--text-soft);
+  cursor: pointer;
+}
+
+.runtime-entry {
+  display: grid;
+  grid-template-columns: 8px 56px 1fr auto;
+  gap: 8px;
+  align-items: start;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.runtime-entry:last-child { border-bottom: 0; }
+.runtime-entry time { color: var(--text-muted); font-size: 10px; }
+.runtime-dot { width: 7px; height: 7px; border-radius: 50%; margin-top: 4px; background: #7e8ca3; }
+.runtime-entry.success .runtime-dot { background: #55c75a; }
+.runtime-entry.error .runtime-dot { background: var(--red); }
+.runtime-message { color: var(--text-soft); word-break: break-word; }
+.runtime-count { color: var(--text-muted); font-size: 10px; }

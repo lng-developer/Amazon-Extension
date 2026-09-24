@@ -7,6 +7,12 @@
    =============================== */
 
 import { io } from "./lib/socket.io.esm.min.js";
+import {
+  buildSafeUploadFeedCsrfDiagnostic,
+  canSubmitAmazonRow,
+  selectReadOnlyUploadFeedCsrfCapture,
+  shouldCloseDedicatedUploadFeedTab,
+} from "./lib/upload-feed-task-tab-policy.js";
 
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
 const adsApiLock = {
@@ -22,12 +28,10 @@ const uploadTrackingLock = {
   runId: "",
   startedAt: 0,
 };
+let importOrdersInProgress = false;
 
 // Global logger instance
 let extensionLogger = null;
-
-// Test connection polling
-let testConnectionInterval = null;
 
 // Initialize logger when we have identity
 async function initializeLogger() {
@@ -63,6 +67,9 @@ class ExtensionLogger {
 
   async submitLog(logType, message, options = {}) {
     try {
+      // Vòng đời task đã hiển thị trên UI; chỉ lưu lỗi để tránh Log Manager thành stream debug.
+      if (options.level !== 'error') return;
+
       const logData = {
         machineId: this.machineId,
         shopId: this.shopId,
@@ -143,7 +150,9 @@ class ExtensionLogger {
 
   async logConnectionStatus(status, details = {}, message) {
     return this.submitLog('connection_status', message, {
-      level: status === 'connected' ? 'info' : 'warn',
+      level: ['failed', 'disconnected', 'reconnect_failed', 'status_check_error', 'config_check_failed'].includes(status)
+        ? 'error'
+        : 'info',
       rawData: { status, ...details }
     });
   }
@@ -196,9 +205,29 @@ class ExtensionLogger {
 
 /* ========== Original Code ========== */
 
+const RUNTIME_LOG_STORAGE_KEY = "runtimeLogEntries";
+const RUNTIME_LOG_LIMIT = 50;
+let runtimeLogWrite = Promise.resolve();
+
+function persistRuntimeLog(message, level = "info") {
+  const normalizedMessage = String(message || "").replace(/^\[\d{1,2}:\d{2}:\d{2}\]\s*/, "");
+  const entry = { message: normalizedMessage, level, time: new Date().toLocaleTimeString(), at: Date.now(), count: 1 };
+  runtimeLogWrite = runtimeLogWrite
+    .then(async () => {
+      const stored = await chrome.storage.local.get([RUNTIME_LOG_STORAGE_KEY]);
+      const entries = Array.isArray(stored[RUNTIME_LOG_STORAGE_KEY]) ? stored[RUNTIME_LOG_STORAGE_KEY] : [];
+      const last = entries.at(-1);
+      if (last && last.message === entry.message && entry.at - Number(last.at || 0) < 10_000) last.count = Number(last.count || 1) + 1;
+      else entries.push(entry);
+      await chrome.storage.local.set({ [RUNTIME_LOG_STORAGE_KEY]: entries.slice(-RUNTIME_LOG_LIMIT) });
+    })
+    .catch((error) => console.warn("[RUNTIME-LOG] persist failed:", error?.message || error));
+}
+
 const log = (...args) => {
   const message = `[${new Date().toLocaleTimeString()}] ` + args.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ");
   console.log("[APO]", ...args);  // Giữ console.log cho debug
+  persistRuntimeLog(message);
   // Gửi đến popup để hiển thị trên màn hình
   chrome.runtime.sendMessage({ type: "LOG", payload: message }).catch(() => { });  // Ignore lỗi nếu popup không mở
 };
@@ -215,6 +244,7 @@ const AMAZON_UPLOADFEED_SNIFFER_FLAG = "__APO_UPLOADFEED_SNIFFER_INSTALLED__";
 globalThis.__UPLOADFEED_HELPER_BUILD__ = "uploadfeed-helper-v2026-05-12-01";
 console.log("[UPLOAD_TRACKING] HELPER BUILD LOADED", globalThis.__UPLOADFEED_HELPER_BUILD__);
 const ADS_BASE = "https://advertising.amazon.com";
+const ADS_CAMPAIGNS_URL = `${ADS_BASE}/campaign-manager/all-campaigns`;
 const ADS_RETRIEVE_URL =
   "https://advertising.amazon.com/a9g-api-gateway/cm/dds/retrieveReport";
 
@@ -231,6 +261,7 @@ const ADS_HEADER_STORAGE_KEYS = [
 const ADS_HEADER_REFRESH_TIMEOUT_MS = 25 * 1000;
 const ADS_TAB_LOAD_TIMEOUT_MS = 35 * 1000;
 const ADS_PAGE_SETTLE_MS = 3500;
+const ADS_LAST_RESULT_STORAGE_KEY = "adsLastResult";
 
 const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -448,7 +479,7 @@ async function clearAdsHeaders(reason = "unknown", options = {}) {
     return false;
   }
 
-  await chrome.storage.local.remove(ADS_HEADER_STORAGE_KEYS);
+  await chrome.storage.local.remove([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
   debugLog(`🧹 [ADS-AUTH] Cleared cached Ads headers: ${reason}`, "info");
   extensionLogger?.logInfo("[ADS-AUTH] Cleared cached Ads headers", { reason, runId: options.runId, taskName: options.taskName });
   return true;
@@ -674,7 +705,7 @@ async function saveUploadFeedCsrfTokenCapture(capture = {}) {
   const cache = {
     token,
     tokenLength: token.length,
-    source: ["formDataAppend", "formDataSet", "fetchFormData", "requestFormData", "xhrFormData", "consoleLog", "webRequestFormData"].includes(capture.source) ? capture.source : "formDataAppend",
+    source: ["formDataAppend", "formDataSet", "fetchFormData", "requestFormData", "xhrFormData", "consoleLog", "webRequestFormData", "readOnlyCookie", "readOnlyStorage", "readOnlyPage"].includes(capture.source) ? capture.source : "formDataAppend",
     capturedAt: Number(capture.capturedAt || Date.now()),
     url: String(capture.url || ""),
     pageTitle: String(capture.pageTitle || ""),
@@ -840,16 +871,81 @@ async function waitForSellerCentralTabComplete(tabId, timeoutMs = 35000) {
   });
 }
 
-async function findOrOpenSellerCentralFeedsTab() {
+async function findOrOpenSellerCentralFeedsTab({ tabId = null, dedicated = false, active = true } = {}) {
+  let tab = tabId ? await chrome.tabs.get(tabId).catch(() => null) : null;
+  if (tab?.id) {
+    if (!(tab.url || "").startsWith(SC_FEEDS_URL)) {
+      tab = await chrome.tabs.update(tab.id, { url: SC_FEEDS_URL, active });
+    } else if (active) {
+      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+      tab = await chrome.tabs.update(tab.id, { active: true });
+    }
+    return tab;
+  }
+
+  if (dedicated) {
+    return chrome.tabs.create({ url: SC_FEEDS_URL, active });
+  }
+
   const tabs = await chrome.tabs.query({ url: `${SC_BASE}/*` }).catch(() => []);
   const feedsTab = tabs.find((tab) => (tab.url || "").startsWith(SC_FEEDS_URL));
-  const tab = feedsTab || tabs[0];
+  tab = feedsTab || tabs[0];
 
   if (tab?.id) {
     return chrome.tabs.update(tab.id, { url: SC_FEEDS_URL, active: true });
   }
 
-  return chrome.tabs.create({ url: SC_FEEDS_URL, active: true });
+  return chrome.tabs.create({ url: SC_FEEDS_URL, active });
+}
+
+async function seedUploadFeedCsrfFromSellerCentralTab(tabId) {
+  const existing = await getUploadFeedCsrfCacheStatus();
+  if (existing.valid || !tabId) return existing;
+
+  const cookieToken = await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z");
+  const { token: pageToken, storageToken, pageHint } = await getSellerCentralPageCsrfFromTab(tabId);
+  const capture = {
+    ...selectReadOnlyUploadFeedCsrfCapture({ cookieToken, storageToken, pageToken }),
+    url: pageHint?.href || SC_FEEDS_URL,
+    pageTitle: pageHint?.title || "Seller Central Feeds",
+  };
+
+  if (isValidUploadFeedCsrfToken(capture.token)) {
+    await saveUploadFeedCsrfTokenCapture(capture);
+  }
+  return getUploadFeedCsrfCacheStatus();
+}
+
+const uploadFeedCsrfDiagnosticAtByTab = new Map();
+
+async function logUploadFeedCsrfDiagnostic(tabId) {
+  const now = Date.now();
+  if (!tabId || now - (uploadFeedCsrfDiagnosticAtByTab.get(tabId) || 0) < 30000) return;
+  uploadFeedCsrfDiagnosticAtByTab.set(tabId, now);
+
+  const cookies = await chrome.cookies.getAll({ url: `${SC_BASE}/` }).catch(() => []);
+  const [pageResult] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "ISOLATED",
+    func: () => {
+      const keysMatching = (storage) => Array.from({ length: storage.length }, (_, index) => storage.key(index))
+        .filter((key) => /csrf|token/i.test(String(key || "")));
+      return {
+        formFields: Array.from(document.querySelectorAll("input, select, textarea"))
+          .map((element) => element.getAttribute("name") || element.getAttribute("id") || "")
+          .filter(Boolean),
+        localStorageKeys: keysMatching(localStorage),
+        sessionStorageKeys: keysMatching(sessionStorage),
+        windowKeys: Object.keys(window).filter((key) => /csrf|token/i.test(key)),
+        scriptMentionsCsrf: Array.from(document.scripts || []).some((script) => /csrf/i.test(script.textContent || "")),
+      };
+    },
+  }).catch(() => []);
+  const diagnostic = buildSafeUploadFeedCsrfDiagnostic({
+    cookieNames: cookies.map((cookie) => cookie.name),
+    page: pageResult?.result || {},
+  });
+  logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF read-only diagnostic", diagnostic);
 }
 
 async function installUploadFeedCsrfSniffer(tabId) {
@@ -1259,7 +1355,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const url = tab?.url || "";
     if (!url.startsWith(SC_FEEDS_URL)) return;
     Promise.resolve(installUploadFeedCsrfSniffer(tabId))
-      .then((result) => {
+      .then(async (result) => {
+        if (result?.ok) await logUploadFeedCsrfDiagnostic(tabId);
         logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer auto-installed on feeds tab", {
           tabId,
           url,
@@ -1319,19 +1416,26 @@ async function getSellerCentralPageCsrfFromTab(tabId) {
             }
             return "";
           })(),
+          storageTokens: Object.keys(localStorage)
+            .filter((key) => /^csa-ctoken-/i.test(key))
+            .map((key) => localStorage.getItem(key) || ""),
           bodyText: (document.body?.innerText || "").slice(0, 1200),
         };
       },
     });
 
     const result = res?.result || {};
+    const storageToken = (result.storageTokens || []).find((value) => isValidUploadFeedCsrfToken(value)) || "";
+    const { storageTokens, ...safePageHint } = result;
     return {
       token: result.tokenFromDom || result.tokenFromHtml || "",
-      pageHint: result,
+      storageToken,
+      pageHint: safePageHint,
     };
   } catch (error) {
     return {
       token: "",
+      storageToken: "",
       pageHint: { error: error?.message || String(error) },
     };
   }
@@ -1351,14 +1455,15 @@ async function refreshSellerCentralUploadAuth() {
   await delayMs(1500);
 
   const cookieToken = await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z");
-  const { token: pageToken, pageHint } = await getSellerCentralPageCsrfFromTab(tab.id);
-  const csrfToken = cookieToken || pageToken || "";
+  const { token: pageToken, storageToken, pageHint } = await getSellerCentralPageCsrfFromTab(tab.id);
+  const csrfToken = cookieToken || storageToken || pageToken || "";
 
   extensionLogger?.logInfo("[UPLOAD_TRACKING] Seller Central auth refresh completed", {
     tabId: tab.id,
     url: pageHint?.href,
     title: pageHint?.title,
     cookieTokenFound: !!cookieToken,
+    storageTokenFound: !!storageToken,
     pageTokenFound: !!pageToken,
   });
 
@@ -1450,7 +1555,7 @@ function isUploadFeedAuthOrCsrfError(error = {}) {
 }
 
 async function getSellerCentralUploadPagePreflight(context = {}) {
-  const tab = await findOrOpenSellerCentralFeedsTab();
+  const tab = await findOrOpenSellerCentralFeedsTab({ tabId: context.sellerCentralTabId || null });
   if (!tab?.id) {
     return {
       ok: false,
@@ -1558,7 +1663,10 @@ async function getUploadFeedReadinessStatus(options = {}) {
     !preflight.allowUpload
   ));
 
-  const cacheStatus = await getUploadFeedCsrfCacheStatus();
+  let cacheStatus = await getUploadFeedCsrfCacheStatus();
+  if (sellerCentralReady && !cacheStatus.valid) {
+    cacheStatus = await seedUploadFeedCsrfFromSellerCentralTab(sellerCentralTabId);
+  }
   const csrfCacheValid = !!cacheStatus.valid;
   const needCsrfSeed = sellerCentralReady && !csrfCacheValid;
   const socketOk = !requireSocket || socketConnected;
@@ -1606,7 +1714,7 @@ async function getUploadFeedReadinessStatus(options = {}) {
  * - csrfToken=<long token>
   */
 async function uploadToAmazonFromSellerCentralTab(stableFileObj, uploadParams = {}) {
-  const tab = await findOrOpenSellerCentralFeedsTab();
+  const tab = await findOrOpenSellerCentralFeedsTab({ tabId: uploadParams.sellerCentralTabId || null });
   if (!tab?.id) {
     return {
       ok: false,
@@ -2011,19 +2119,9 @@ function validateConfirmShipmentTsv(tsvContent = "") {
     const trackingNumber = cols[indexByHeader["tracking-number"]] || "";
     const carrierCode = cols[indexByHeader["carrier-code"]] || "UNKNOWN";
     const originalShipDate = cols[shipDateIndex] || "";
-    let normalizedShipDate = normalizeShipDateForAmazonConfirmShipment(originalShipDate);
-    if (!originalShipDate || !/^\d{4}-\d{2}-\d{2}$/.test(originalShipDate) || originalShipDate !== normalizedShipDate) {
-      normalizedShipDateRows.push(rowIndex + 2);
-      shipDateNormalizationDetails.push({
-        rowNumber: rowIndex + 2,
-        originalShipDate,
-        normalizedShipDate,
-        clampedToMarketplaceToday: compareYmd(originalShipDate, marketplaceToday) > 0 && normalizedShipDate === marketplaceToday,
-      });
-    }
-    cols[shipDateIndex] = normalizedShipDate;
+    const normalizedShipDate = originalShipDate;
 
-    if (!orderId || !trackingNumber) {
+    if (!orderId || !canSubmitAmazonRow({ tracking: trackingNumber, carrier: carrierCode, shipDate: normalizedShipDate })) {
       invalidRows.push(rowIndex + 2);
     }
 
@@ -2034,7 +2132,7 @@ function validateConfirmShipmentTsv(tsvContent = "") {
   if (invalidRows.length) {
     throw createAmazonUploadError(
       "AMAZON_TSV_VALIDATION_FAILED",
-      `Confirm shipment TSV has empty order-id or tracking-number on row(s): ${invalidRows.slice(0, 20).join(", ")}.`
+      `Confirm shipment TSV has missing tracking/carrier or a non-derived ship-date on row(s): ${invalidRows.slice(0, 20).join(", ")}.`
     );
   }
 
@@ -2147,7 +2245,7 @@ async function uploadtracking(context = {}) {
     // Build TSV content
     const tsvLines = pendingOrders.map((o) => {
       const tracking = String(o.tracking || "").trim();
-      const shipDate = normalizeShipDateForAmazonConfirmShipment(new Date());
+      const shipDate = String(o.shipDate || "").trim();
       const { carrierCode, shipMethod } = resolveCarrierInfo(tracking);
 
       return `${o.orderId}\t${shipDate}\t${carrierCode}\t${tracking}\t${shipMethod}`;
@@ -2821,24 +2919,71 @@ async function runImportFBMOrders(referenceOverride, machineId, label) {
 /* ===============================
    ADS via content-script
    =============================== */
-async function ensureAdsTab() {
+function adsTabAccessError(url) {
+  try {
+    const parsed = new URL(url || "");
+    if (parsed.origin === ADS_BASE) return "";
+    return `Amazon Ads đã chuyển tab sang ${parsed.origin}. Hãy đăng nhập lại Amazon Ads rồi mở ${ADS_CAMPAIGNS_URL}.`;
+  } catch (_) {
+    return "Không xác định được URL tab Amazon Ads.";
+  }
+}
+
+async function persistManualAdsResult(kind, range, result) {
+  await chrome.storage.local.set({
+    [ADS_LAST_RESULT_STORAGE_KEY]: {
+      kind,
+      range,
+      result,
+      completedAt: Date.now(),
+    },
+  });
+}
+
+async function assertAdsTabAccessible(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  const accessError = adsTabAccessError(tab?.url);
+  if (accessError) throw new Error(accessError);
+  return tab;
+}
+
+async function ensureAdsTab({ active = false } = {}) {
   const tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
-  let tab = tabs.find((t) => t.url?.includes("/cm/")) || tabs[0];
+  let tab = tabs.find((t) => t.url?.includes("/campaign-manager/all-campaigns")) || tabs.find((t) => t.url?.includes("/cm/")) || tabs[0];
+  const created = !tab;
 
   if (!tab) {
     debugLog("🌐 [ADS-TAB] Opening Amazon Ads campaigns page...", "info");
     extensionLogger?.logInfo("[ADS-TAB] Opening Amazon Ads campaigns page");
     tab = await chrome.tabs.create({
-      url: `${ADS_BASE}/cm/campaigns`,
-      active: true,
+      url: ADS_CAMPAIGNS_URL,
+      active,
     });
-  } else {
-    debugLog(`🌐 [ADS-TAB] Reusing existing ads tab: ${tab.id}`, "info");
-    extensionLogger?.logInfo("[ADS-TAB] Reusing existing ads tab", { tabId: tab.id, url: tab.url });
   }
 
   await waitForAdsTabComplete(tab.id);
-  return tab.id;
+  const readyTab = await assertAdsTabAccessible(tab.id);
+  if (active) {
+    await chrome.windows.update(readyTab.windowId, { focused: true });
+    await chrome.tabs.update(tab.id, { active: true });
+    debugLog(`🌐 [ADS-TAB] Showing Ads tab ${tab.id}: ${readyTab.url}`, "info");
+  }
+  return { tabId: tab.id, created };
+}
+
+async function withForegroundAdsTab(fn) {
+  const tab = await ensureAdsTab({ active: true });
+  // Keep the visible Campaigns UI long enough for Amazon to finish its own
+  // charts/table requests before the report request is made.
+  await delayMs(ADS_PAGE_SETTLE_MS);
+  try {
+    const result = await fn();
+    if (tab.created) await chrome.tabs.remove(tab.tabId).catch(() => {});
+    return result;
+  } catch (error) {
+    // Keep a failed, auto-created tab visible so the user can resolve login/CSRF.
+    throw error;
+  }
 }
 
 async function injectAdsMainWorldSniffer(tabId) {
@@ -2941,7 +3086,6 @@ async function injectAdsMainWorldSniffer(tabId) {
         };
       },
     });
-    debugLog("✅ [ADS-SNIFFER] Main-world sniffer injected", "success");
     return true;
   } catch (e) {
     debugLog(`⚠️ [ADS-SNIFFER] Main-world injection skipped: ${e?.message || e}`, "info");
@@ -2950,12 +3094,16 @@ async function injectAdsMainWorldSniffer(tabId) {
 }
 
 async function ensureAdsBridgeInjected(tabId) {
+  const tab = await assertAdsTabAccessible(tabId);
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ["ads_bridge.js"],
     });
   } catch (e) {
+    if (/Cannot access contents of the page/i.test(e?.message || "")) {
+      throw new Error(`Extension không có quyền truy cập ${tab.url}. Reload Extension tại chrome://extensions rồi refresh trang Amazon Ads.`);
+    }
     // Nếu content script đã tồn tại hoặc tab chưa cho inject, sendMessage phía dưới sẽ xác nhận lại.
     debugLog(`ℹ️ [ADS-BRIDGE] executeScript note: ${e?.message || e}`, "info");
   }
@@ -2963,7 +3111,7 @@ async function ensureAdsBridgeInjected(tabId) {
 }
 
 async function adsRetrieveViaContentScript(payload, options = {}) {
-  const tabId = await ensureAdsTab();
+  const { tabId } = await ensureAdsTab();
   await ensureAdsBridgeInjected(tabId);
 
   const sendOnce = () =>
@@ -3099,7 +3247,7 @@ async function fetchAdsJsonCS(payload, options = {}) {
       }
     } catch (error) {
       lastError = error;
-      if (isAdsAuthError(error) && attempt < maxAttempts) {
+      if (!error?.adsRefreshFailed && isAdsAuthError(error) && attempt < maxAttempts) {
         if (!isAdsLockOwner(options.runId)) {
           const ownerError = createAdsError("ADS_LOCK_NOT_OWNER: cannot refresh Ads headers while another Ads task owns the lock", error.status || 0, error.responseText || error.message || "");
           ownerError.code = "ADS_LOCK_NOT_OWNER";
@@ -3255,6 +3403,7 @@ async function fetchAllCampaignSpend(
 
       if (!more.length) break;
       all = all.concat(more);
+      await delayMs(200);
     }
 
     const processedData = all.map((r) => ({
@@ -3305,11 +3454,131 @@ function campaignRowsToTxt(rows) {
   return [header, ...lines].join("\n");
 }
 
-async function runExportAdsSpend(date) {
-  return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked(date, lock));
+const MAX_ADS_RANGE_DAYS = 31;
+
+function adsDaysBetween(startDate, endDate = startDate) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate || "") || !/^\d{4}-\d{2}-\d{2}$/.test(endDate || "")) {
+    throw new Error("startDate and endDate must use YYYY-MM-DD");
+  }
+  const start = new Date(`${startDate}T00:00:00Z`);
+  const end = new Date(`${endDate}T00:00:00Z`);
+  if (
+    Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) ||
+    start.toISOString().slice(0, 10) !== startDate ||
+    end.toISOString().slice(0, 10) !== endDate ||
+    start > end
+  ) {
+    throw new Error("Khoảng ngày Ads không hợp lệ");
+  }
+
+  const days = [];
+  for (let cursor = start; cursor <= end; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+    days.push(cursor.toISOString().slice(0, 10));
+    if (days.length > MAX_ADS_RANGE_DAYS) {
+      throw new Error(`Chỉ cho phép tối đa ${MAX_ADS_RANGE_DAYS} ngày mỗi lần`);
+    }
+  }
+  return days;
 }
 
-async function runExportAdsSpendLocked(date, lock = {}) {
+function summarizeAdsRows(rows, startDate, endDate) {
+  const byCampaignName = new Map();
+  const byState = new Map();
+
+  for (const row of rows) {
+    const name = String(row.campaignName || "").trim() || "(unnamed)";
+    const spend = Number(row.spend || 0);
+    const state = String(row.state || "UNKNOWN");
+    const campaign = byCampaignName.get(name) || { campaignName: name, spend: 0, records: 0, states: new Set() };
+    campaign.spend += spend;
+    campaign.records += 1;
+    campaign.states.add(state);
+    byCampaignName.set(name, campaign);
+
+    const stateSummary = byState.get(state) || { records: 0, spend: 0 };
+    stateSummary.records += 1;
+    stateSummary.spend += spend;
+    byState.set(state, stateSummary);
+  }
+
+  const nonZeroRows = rows.filter((row) => Number(row.spend || 0) > 0);
+  return {
+    ok: true,
+    startDate,
+    endDate,
+    rawRecords: rows.length,
+    uniqueCampaignNames: byCampaignName.size,
+    recordsWithSpend: nonZeroRows.length,
+    totalSpend: Number(rows.reduce((total, row) => total + Number(row.spend || 0), 0).toFixed(2)),
+    byState: Object.fromEntries([...byState.entries()].map(([state, value]) => [state, { ...value, spend: Number(value.spend.toFixed(2)) }])),
+    topCampaigns: [...byCampaignName.values()]
+      .map((campaign) => ({ ...campaign, spend: Number(campaign.spend.toFixed(2)), states: [...campaign.states] }))
+      .sort((a, b) => b.spend - a.spend)
+      .slice(0, 20),
+  };
+}
+
+// Full, read-only inspection for a human before enabling scheduled imports.
+async function previewAdsSpend(date) {
+  return previewAdsSpendRange(date, date);
+}
+
+async function previewAdsSpendRange(startDate, endDate = startDate) {
+  const days = adsDaysBetween(startDate, endDate);
+  return withAdsApiLock("PREVIEW_ADS_SPEND", async (lock) => {
+    return withForegroundAdsTab(async () => {
+      await ensureFreshAdsHeaders({ ...lock, reason: "previewAdsSpend" });
+      const rows = [];
+      for (const day of days) {
+        rows.push(...await fetchAllCampaignSpend(day, day, 300, false, lock));
+      }
+      return { ...summarizeAdsRows(rows, startDate, endDate), days: days.length };
+    });
+  });
+}
+
+async function runExportAdsSpend(date, options = {}) {
+  return runExportAdsSpendRange(date, date, options);
+}
+
+function adsTaskSummary(result) {
+  return {
+    startDate: result?.startDate || "",
+    endDate: result?.endDate || "",
+    days: (result?.days || []).map((item) => ({
+      day: String(item?.ingest?.day || "").slice(0, 10),
+      importedRows: Number(item?.ingest?.importedRows ?? item?.rows ?? 0),
+      sellersAffected: Number(item?.ingest?.sellersAffected || 0),
+      shopSpend: Number(item?.ingest?.shopSpend || 0),
+      skipped: item?.ingest?.skipped === true,
+      message: String(item?.ingest?.message || "").slice(0, 240),
+    })),
+  };
+}
+
+async function runExportAdsSpendRange(startDate, endDate = startDate, options = {}) {
+  const days = adsDaysBetween(startDate, endDate);
+  return withAdsApiLock("IMPORT_ADS_SPEND", async (lock) => {
+    const run = async () => {
+      await ensureFreshAdsHeaders({ ...lock, reason: "runExportAdsSpendRange" });
+      const results = [];
+      for (const day of days) {
+        results.push(await runExportAdsSpendLocked(day, lock, { ...options, headersReady: true }));
+      }
+      return {
+        ok: true,
+        dryRun: options.dryRun === true,
+        startDate,
+        endDate,
+        days: results,
+        totalRows: results.reduce((total, result) => total + Number(result.rows || 0), 0),
+      };
+    };
+    return options.foreground ? withForegroundAdsTab(run) : run();
+  });
+}
+
+async function runExportAdsSpendLocked(date, lock = {}, options = {}) {
   const startTime = Date.now();
 
   // Initialize logger if not exists
@@ -3344,7 +3613,9 @@ async function runExportAdsSpendLocked(date, lock = {}) {
   const { adsSpendUrl } = deriveApiUrls(ingestUrl);
 
   // Đảm bảo Ads headers còn hạn trước khi gọi Ads API
-  await ensureFreshAdsHeaders({ ...lock, reason: "runExportAdsSpend" });
+  if (!options.headersReady) {
+    await ensureFreshAdsHeaders({ ...lock, reason: "runExportAdsSpend" });
+  }
 
   if (!date) {
     const error = new Error("date (YYYY-MM-DD) required");
@@ -3394,6 +3665,7 @@ async function runExportAdsSpendLocked(date, lock = {}) {
     const ingestRes = await postFileTo(adsSpendUrl, {
       shopId,
       day: date,
+      dryRun: options.dryRun === true,
       file: { name: `ads-spend-${date}.txt`, text: txt },
     });
 
@@ -3414,7 +3686,7 @@ async function runExportAdsSpendLocked(date, lock = {}) {
       }, `Xuất chi phí quảng cáo hoàn thành thành công cho ${date}`);
     }
 
-    return { ok: true, rows: rows.length, ingest: ingestRes };
+    return { ok: true, dryRun: options.dryRun === true, rows: rows.length, ingest: ingestRes };
 
   } catch (error) {
     // Log task failed
@@ -3457,6 +3729,7 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
   let finalTsvLength = 0;
   let preflight = null;
   let pageUploadResult = null;
+  let dedicatedSellerCentralTab = null;
 
   if (!extensionLogger) await initializeLogger();
 
@@ -3557,7 +3830,17 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
       message: `Starting upload to Amazon: ${stableFileObj.name}`,
     });
 
-    preflight = await getSellerCentralUploadPagePreflight({ taskId: uploadTaskId, batchId: uploadBatchId });
+    dedicatedSellerCentralTab = await findOrOpenSellerCentralFeedsTab({ dedicated: true, active: true });
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] opened dedicated Seller Central feeds tab", {
+      tabId: dedicatedSellerCentralTab?.id || null,
+      url: dedicatedSellerCentralTab?.url || SC_FEEDS_URL,
+    }, "info");
+
+    preflight = await getSellerCentralUploadPagePreflight({
+      taskId: uploadTaskId,
+      batchId: uploadBatchId,
+      sellerCentralTabId: dedicatedSellerCentralTab?.id || null,
+    });
     logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 07B Seller Central page preflight result", {
       ok: preflight.ok,
       tabId: preflight.tabId,
@@ -3662,7 +3945,10 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
       filename: stableFileObj.name,
     });
 
-    pageUploadResult = await uploadToAmazonFromSellerCentralTab(stableFileObj, uploadParams);
+    pageUploadResult = await uploadToAmazonFromSellerCentralTab(stableFileObj, {
+      ...uploadParams,
+      sellerCentralTabId: dedicatedSellerCentralTab?.id || null,
+    });
     const requestDuration = Date.now() - requestStartTime;
     const response = sellerCentralTabUploadResultToResponse(pageUploadResult);
     const contentType = response.headers.get("content-type") || "";
@@ -3812,6 +4098,7 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
       requestDuration,
       strategy: "sellerCentralTabPageContext",
       world: pageUploadResult?.world,
+      dedicatedSellerCentralTabId: dedicatedSellerCentralTab?.id || null,
     };
   } catch (error) {
     if (isUploadFeedAuthOrCsrfError(error)) {
@@ -4047,6 +4334,22 @@ async function runFullFlowAndEmitLogs(trigger = "auto") {
   }
 }
 
+async function runImportOrdersOnce(trigger) {
+  if (importOrdersInProgress) {
+    const message = "[ORDER-LOCK] Skip IMPORT_ORDERS: another order import is running";
+    debugLog(message, "info");
+    extensionLogger?.logInfo(message);
+    return { ok: true, skipped: true, reason: "IMPORT_ORDERS_ALREADY_RUNNING" };
+  }
+
+  importOrdersInProgress = true;
+  try {
+    return await runFullFlowAndEmitLogs(trigger);
+  } finally {
+    importOrdersInProgress = false;
+  }
+}
+
 //  Handle Confirm Shipping
 async function handleImportFBMOrders(trigger = "auto") {
   const { base, shopId, clientId, clientLabel } =
@@ -4117,12 +4420,6 @@ async function saveAdsHeadersIfAny(found) {
         capturedAt: now,
       },
     });
-    debugLog("[ADS-AUTH] Captured headers ignored while Ads API task is running", "info");
-    extensionLogger?.logInfo("[ADS-AUTH] Captured headers ignored while Ads API task is running", {
-      keys,
-      runId: adsApiLock.runId,
-      taskName: adsApiLock.taskName,
-    });
     return;
   }
 
@@ -4130,30 +4427,35 @@ async function saveAdsHeadersIfAny(found) {
   const merged = { ...current, ...clean };
   const changed = keys.some((k) => clean[k] && clean[k] !== current[k]);
   const hasCoreHeaders = isAdsHeaderComplete(merged);
+  const capturedComplete = isAdsHeaderComplete(clean);
+  const shouldLogCapture = capturedComplete && (changed || !current.adsHeaderLastSeen);
 
-  // Nếu Amazon vẫn gửi cùng token cũ, vẫn update lastSeen để chứng minh session còn sống.
+  // Chỉ header đầy đủ của cùng một request mới được xem là CSRF fresh.
+  // Partial capture phải không được gia hạn token cũ còn trong storage.
   if (!changed && hasCoreHeaders && now - lastAdsHeaderWriteAt < 5000) return;
 
   const payload = { ...clean };
-  if (hasCoreHeaders) payload.adsHeaderLastSeen = now;
+  if (capturedComplete) payload.adsHeaderLastSeen = now;
 
   await chrome.storage.local.set(payload);
   lastAdsHeaderWriteAt = now;
 
-  log("[ADS] headers captured:", keys.join(", "));
-  extensionLogger?.logInfo("[ADS-AUTH] Ads headers captured", {
-    keys,
-    changed,
-    hasCoreHeaders,
-    lastSeen: payload.adsHeaderLastSeen,
-  });
+  if (shouldLogCapture) {
+    log("[ADS] headers captured:", keys.join(", "));
+    extensionLogger?.logInfo("[ADS-AUTH] Ads headers captured", {
+      keys,
+      changed,
+      hasCoreHeaders,
+      lastSeen: payload.adsHeaderLastSeen,
+    });
+  }
 }
 
 /* ===============================
-   Đảm bảo CSRF headers còn hạn trước khi gọi Ads API
-   - Nếu headers chưa có hoặc > 30 phút → mở tab ads, đợi capture xong
+   CSRF headers: age is informational. Amazon decides whether a complete
+   session is still valid; refresh only after a real auth failure.
    =============================== */
-const ADS_HEADER_TTL_MS = 20 * 60 * 1000; // giảm TTL để hạn chế token cũ gây 401
+const ADS_HEADER_TTL_MS = 20 * 60 * 1000;
 
 async function forceRefreshAdsHeaders(options = {}) {
   const reason = typeof options === "string" ? options : options.reason || "manual";
@@ -4184,31 +4486,14 @@ async function forceRefreshAdsHeaders(options = {}) {
   debugLog(`🔄 [ADS-AUTH] Force refresh Ads headers — reason: ${reason}`, "info");
   extensionLogger?.logInfo("[ADS-AUTH] Force refresh Ads headers", { reason });
 
-  await clearAdsHeaders(reason, options);
-
-  const tabId = await ensureAdsTab();
-
-  // Navigate về trang Campaigns, inject sniffer, rồi reload để bắt request gốc sau khi sniffer đã sẵn sàng.
-  await chrome.tabs.update(tabId, { url: `${ADS_BASE}/cm/campaigns`, active: true });
-  await waitForAdsTabComplete(tabId);
-  await ensureAdsBridgeInjected(tabId);
-
-  await chrome.tabs.reload(tabId);
-  await waitForAdsTabComplete(tabId);
+  const { tabId } = await ensureAdsTab();
   await ensureAdsBridgeInjected(tabId);
   await delayMs(ADS_PAGE_SETTLE_MS);
 
-  let captured = await waitForAdsHeaderCapture({ since: startedAt });
-
-  if (!captured) {
-    // Lần dự phòng: nhiều khi Amazon Ads lazy-load sau vài giây hoặc cần thêm reload.
-    debugLog("🔁 [ADS-AUTH] First refresh did not capture headers, retrying once...", "info");
-    await chrome.tabs.reload(tabId);
-    await waitForAdsTabComplete(tabId);
-    await ensureAdsBridgeInjected(tabId);
-    await delayMs(ADS_PAGE_SETTLE_MS + 1500);
-    captured = await waitForAdsHeaderCapture({ since: startedAt, timeoutMs: ADS_HEADER_REFRESH_TIMEOUT_MS });
-  }
+  // A reload restarts this slow page and still does not guarantee a request
+  // that exposes CSRF. Wait once; if Amazon needs a new session, show an
+  // actionable error instead of repeatedly reloading the seller's tab.
+  const captured = await waitForAdsHeaderCapture({ since: startedAt, timeoutMs: ADS_HEADER_REFRESH_TIMEOUT_MS });
 
   let latest = await readAdsHeaderState();
   if (captured && !isAdsHeaderComplete(latest)) {
@@ -4244,22 +4529,27 @@ async function forceRefreshAdsHeaders(options = {}) {
 ${hint.title || ""}
 ${hint.bodyText || ""}`)
     ? "Amazon Ads đang yêu cầu login/reauth. Mở tab advertising.amazon.com, đăng nhập lại rồi chạy lại."
-    : "Không capture được Ads headers từ Amazon Ads page.";
+    : "Không capture được Ads headers từ Amazon Ads page. Giữ tab Ads mở cho tới khi tải xong, refresh thủ công một lần rồi chạy lại.";
 
-  throw createAdsError(`Không thể refresh Ads headers: ${reasonText}`, 401, JSON.stringify(hint).slice(0, 1000));
+  const error = createAdsError(`Không thể refresh Ads headers: ${reasonText}`, 401, JSON.stringify(hint).slice(0, 1000));
+  error.adsRefreshFailed = true;
+  throw error;
 }
 
 async function ensureFreshAdsHeaders(options = {}) {
   const { force = false, reason = "preflight" } = options;
   const st = await readAdsHeaderState();
   const age = st.adsHeaderLastSeen ? Date.now() - Number(st.adsHeaderLastSeen) : Infinity;
-  const isValid = isAdsHeaderComplete(st) && age < ADS_HEADER_TTL_MS;
+  const isComplete = isAdsHeaderComplete(st);
+  const isFresh = isComplete && age < ADS_HEADER_TTL_MS;
+  const status = !isComplete ? "missing" : isFresh ? "valid" : "stale";
 
-  debugLog(`🔑 [ADS-AUTH] Header status: ${isValid ? "valid" : "expired/missing"} — age ${Math.round(age / 1000)}s`, isValid ? "info" : "error");
+  debugLog(`🔑 [ADS-AUTH] Header status: ${status} — age ${Math.round(age / 1000)}s`, isComplete ? "info" : "error");
   extensionLogger?.logInfo("[ADS-AUTH] Header preflight", {
     force,
     reason,
-    isValid,
+    isComplete,
+    isFresh,
     ageSeconds: Math.round(age / 1000),
     hasAccountId: !!st.adsAccountId,
     hasAdvertiserId: !!st.adsAdvertiserId,
@@ -4269,7 +4559,9 @@ async function ensureFreshAdsHeaders(options = {}) {
     hasCsrfToken: !!st.adsCsrfToken,
   });
 
-  if (!force && isValid) return true;
+  // Do not reload a slow Ads page merely because the cached header is old.
+  // fetchAdsJsonCS refreshes after Amazon confirms an auth failure (401/403).
+  if (!force && isComplete) return true;
   return forceRefreshAdsHeaders({ ...options, reason });
 }
 
@@ -4278,6 +4570,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     try {
       if (!details?.url?.startsWith(ADS_BASE)) return;
+      // Ignore requests originated by the extension itself. A failed
+      // retrieveReport carries the old CSRF and must never become "fresh".
+      if (details.tabId < 0 || String(details.initiator || "").startsWith("chrome-extension://")) return;
       const found = collectAdsHeaders(details.requestHeaders || []);
       saveAdsHeadersIfAny(found);
     } catch { }
@@ -4285,106 +4580,6 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   { urls: [`${ADS_BASE}/*`] },
   ["requestHeaders", "extraHeaders"]
 );
-
-/* =========================
-   ADS — Check Campaign Names (using your existing bridge)
-   ========================= */
-
-function todayYMD() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-async function fetchEmployeeCodes() {
-  const { ingestUrl } = await getCfg();
-  const { getSeller } = deriveApiUrls(ingestUrl);
-  try {
-    const response = await fetch(getSeller, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    });
-
-    const data = await response.json();
-
-    if (!Array.isArray(data)) {
-      throw new Error("Invalid response format, expected an array");
-    }
-
-    console.log("✅ Danh sách mã nhân viên:", data);
-    return data; // Ví dụ: ["J2501","J2502","J2503",...]
-  } catch (error) {
-    console.error("❌ Lỗi khi lấy mã nhân viên:", error.message);
-    return [];
-  }
-}
-
-// background.js (hoặc module dùng để kiểm tra)
-function checkInvalidCampaignNames(campaigns, employeeCodes) {
-  // chuẩn hoá allowed: Set uppercase
-  const allowed = new Set(
-    (employeeCodes || []).map((c) => String(c).trim().toUpperCase())
-  );
-
-  // helper: lấy prefix hợp lệ dạng 1 chữ + 4 số ở đầu chuỗi
-  function extractPrefix5(name) {
-    if (!name) return "";
-    const s = String(name).trim();
-    const m = s.match(/^([A-Za-z]\d{4})/); // ^: ngay đầu chuỗi
-    return m ? m[1].toUpperCase() : ""; // VD: "J2501"
-  }
-
-  let totalChecked = 0;
-  const invalidList = [];
-
-  for (const c of campaigns || []) {
-    const name = (c.campaignName ?? c.name ?? "").trim();
-    if (!name) continue;
-    totalChecked++;
-
-    const prefix = extractPrefix5(name);
-    const isValid = prefix && allowed.has(prefix);
-
-    if (!isValid) {
-      invalidList.push({
-        name,
-        state: c.state || c.status || "Unknown",
-        prefixFound: prefix || null,
-      });
-    }
-  }
-
-  return {
-    ok: true,
-    total: totalChecked,
-    invalidCount: invalidList.length,
-    invalidList,
-  };
-}
-
-async function checkCampaign(date) {
-  return withAdsApiLock("CHECK_CAMPAIGN", (lock) => checkCampaignLocked(date, lock));
-}
-
-async function checkCampaignLocked(date, lock = {}) {
-  if (!date) throw new Error("date (YYYY-MM-DD) required");
-  const employeeCodes = await fetchEmployeeCodes();
-  await ensureFreshAdsHeaders({ ...lock, reason: "checkCampaign" });
-  const rows = await fetchAllCampaignSpend(date, date, 300, true, lock);
-
-  const result = checkInvalidCampaignNames(rows, employeeCodes);
-
-  return {
-    ok: true,
-    totalChecked: result?.total,
-    invalidCount: result?.invalidCount,
-    invalidList: result?.invalidList,
-  };
-}
 
 /* ================================================================
    SOCKET.IO AUTO CONNECT + KEEPALIVE (Realtime only)
@@ -4632,9 +4827,6 @@ export async function connectSocketIO(force = false) {
       socket = null;
       stopHeartbeat();
 
-      // Dừng test connection polling khi cleanup socket
-      stopTestConnectionPolling();
-
       // Dừng auto reconnect polling khi cleanup socket
       if (force) stopAutoReconnectPolling();
     }
@@ -4664,19 +4856,28 @@ export async function connectSocketIO(force = false) {
       timeout: 180000,
     });
 
+    const connected = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Socket connection timed out")), 15000);
+      socket.once("connect", () => {
+        clearTimeout(timeout);
+        resolve({ ok: true });
+      });
+      socket.once("connect_error", (error) => {
+        clearTimeout(timeout);
+        reject(error || new Error("Socket connection failed"));
+      });
+    });
+
     // Khi kết nối thành công
     socket.on("connect", () => {
       console.log("[SOCKET-LOG] Connected successfully", { socketId: socket?.id || null, timestamp: new Date().toISOString() });
       startHeartbeat();
-      startTestConnectionPolling();
       startAutoReconnectPolling();
-      Promise.resolve(startAutoConfigScheduler()).catch((error) => {
-        debugLog(`[AUTO-CFG] Socket start error: ${error.message}`, "error");
-        extensionLogger?.logError(error, { source: "socket_connect" }, "[AUTO-CFG] Socket start error");
+      Promise.resolve(clearLegacyAutoConfigAlarms()).catch((error) => {
+        debugLog(`[TASKS] Could not clear legacy alarms: ${error.message}`, "error");
       });
-      Promise.resolve(startAutoConfigSync()).catch((error) => {
-        debugLog(`[AUTO-CFG-SYNC] Socket start error: ${error.message}`, "error");
-        extensionLogger?.logError(error, { source: "socket_connect" }, "[AUTO-CFG-SYNC] Socket start error");
+      socket.emit("client:pull_pending_tasks", { shopId, machineId: clientId }, (result) => {
+        debugLog(`[TASKS] Pending tasks pulled: ${result?.count || 0}`, "info");
       });
 
       safeLogConnectionStatus('connected', {
@@ -4708,9 +4909,6 @@ export async function connectSocketIO(force = false) {
         message: `❌ Socket disconnected: ${reason}`,
       });
       stopHeartbeat();
-
-      // Dừng test connection polling khi socket ngắt kết nối
-      stopTestConnectionPolling();
 
       // Dừng auto reconnect polling khi socket ngắt kết nối
       // Keep auto reconnect polling alive during normal disconnects.
@@ -4854,7 +5052,7 @@ export async function connectSocketIO(force = false) {
     // });
     socket.on("server:task", (task) => handleServerTask(task));
 
-    return { ok: true };
+    return await connected;
   } finally {
     connectBusy = false;
   }
@@ -4864,25 +5062,9 @@ export async function connectSocketIO(force = false) {
    handleServerTask — dùng chung cho socket & test
    =============================== */
 async function handleServerTask(task) {
-  console.log('📨 [EXT-DEBUG] ===== RECEIVED SERVER TASK =====');
-  console.log('⏰ [EXT-DEBUG] Timestamp:', new Date().toISOString());
-  console.log('🔍 [EXT-DEBUG] Raw task object:', JSON.stringify(task, null, 2));
-
   const { type, payload } = task || {};
-  console.log('🏷️ [EXT-DEBUG] Task type:', type);
-  console.log('📦 [EXT-DEBUG] Payload keys:', Object.keys(payload || {}));
-  log(`✅ [EXT-DEBUG] Connected to server`, payload);
-  log(`🆔 [EXT-DEBUG] Socket ID:`, socket?.id || "NO_SOCKET");
-  log('🔗 [EXT-DEBUG] Socket connected:', !!socket?.connected);
-
-  const authData = {
-    shopId: "your_shop_id",
-    machineId: "your_machine_id",
-    label: "Extension Name",
-    version: "1.0.0"
-  };
-  log('🔑 [EXT-DEBUG] Auth data being sent:', authData);
-  log(`[SOCKET] Received task from server: ${type}`, payload);
+  const serverTaskId = task?.taskId || payload?.taskId || "unknown";
+  log(`[TASK] Nhận ${type || "UNKNOWN"} · ${serverTaskId}`);
   let identity;
   try {
     identity = await getBaseShopAndIdentity();
@@ -4898,9 +5080,32 @@ async function handleServerTask(task) {
   }
 
   const { base, shopId, clientId, clientLabel } = identity;
+  const reportServerTask = (status, extra = {}) => {
+    if (!serverTaskId || !socket?.connected) return;
+    socket.emit("client:task", {
+      eventId: `${serverTaskId}:${status}`,
+      taskId: serverTaskId,
+      type,
+      status,
+      shopId,
+      machineId: clientId,
+      source: "amazon_extension",
+      reportedAt: new Date().toISOString(),
+      ...extra,
+    }, (ack) => {
+      console.log(`[TASK_REPLY] BE acknowledged status=${status} taskId=${serverTaskId} ok=${!!ack?.ok}`);
+    });
+    console.log(`[TASK_REPLY] sent status=${status} taskId=${serverTaskId}`);
+  };
+  reportServerTask("received");
+  let taskResult;
 
   try {
     switch (type) {
+      case "CONNECTION_TEST":
+        console.log("[CONNECTION_TEST] BE task received");
+        break;
+
       case "IMPORT_FBM_ORDERS":
         console.log('📋 [EXT-DEBUG] Handling IMPORT_FBM_ORDERS');
 
@@ -4997,7 +5202,13 @@ async function handleServerTask(task) {
         }
 
         try {
-          await runFullFlowAndEmitLogs("click");
+          const importResult = await runImportOrdersOnce("socket");
+          if (importResult?.skipped) {
+            extensionLogger?.logInfo("[ORDER-LOCK] IMPORT_ORDERS skipped as duplicate", importResult);
+            const error = new Error("IMPORT_ORDERS_ALREADY_RUNNING: task skipped");
+            error.code = "IMPORT_ORDERS_ALREADY_RUNNING";
+            throw error;
+          }
 
           // Log task completed
           if (extensionLogger) {
@@ -5029,8 +5240,10 @@ async function handleServerTask(task) {
 
       case "IMPORT_ADS_SPEND":
         console.log('📋 [EXT-DEBUG] Handling IMPORT_ADS_SPEND');
-        if (!payload?.date) throw new Error("Missing payload.date");
-        console.log('📅 [EXT-DEBUG] Ads spend date:', payload.date);
+        const adsStartDate = payload?.startDate || payload?.date;
+        const adsEndDate = payload?.endDate || payload?.date;
+        if (!adsStartDate || !adsEndDate) throw new Error("Missing payload.startDate/endDate");
+        console.log('📅 [EXT-DEBUG] Ads spend range:', adsStartDate, adsEndDate);
 
         // Initialize logger if not exists
         if (!extensionLogger) {
@@ -5063,10 +5276,11 @@ async function handleServerTask(task) {
 
         let adsResult;
         try {
-          adsResult = await runExportAdsSpend(payload.date);
+          adsResult = await runExportAdsSpendRange(adsStartDate, adsEndDate, { foreground: payload?.source === "manual" });
+          taskResult = adsTaskSummary(adsResult);
           if (adsResult?.skipped && adsResult?.reason === "ADS_TASK_ALREADY_RUNNING") {
             extensionLogger?.logInfo("[ADS-LOCK] Skip IMPORT_ADS_SPEND, another Ads task is running", adsResult);
-            return adsResult;
+            break;
           }
 
           // Log task completed
@@ -5109,10 +5323,15 @@ async function handleServerTask(task) {
           level: "success",
           message: "✅ Import ads success!"
         });
-        return adsResult;
+        break;
 
       case "UPLOAD_TRACKING":
         console.log('📋 [EXT-DEBUG] ===== HANDLING UPLOAD_TRACKING =====');
+
+        if (payload?.source === "auto_scheduler" && !payload?.file) {
+          await runUploadTrackingWithLock({ source: "auto_scheduler" });
+          break;
+        }
 
         // Initialize logger if not exists
         if (!extensionLogger) {
@@ -5302,6 +5521,15 @@ async function handleServerTask(task) {
               if (payload?.batchId) {
                 await reportUploadResult(payload.batchId, "success");
               }
+              if (shouldCloseDedicatedUploadFeedTab({
+                created: !!uploadResult?.dedicatedSellerCentralTabId,
+                uploaded: uploadResult?.ok === true,
+              })) {
+                await chrome.tabs.remove(uploadResult.dedicatedSellerCentralTabId).catch(() => {});
+                logUploadTrackingDiagnostic("[UPLOAD_TRACKING] closed dedicated Seller Central feeds tab after success", {
+                  tabId: uploadResult.dedicatedSellerCentralTabId,
+                }, "success");
+              }
 
               if (extensionLogger) {
                 const uploadEndTime = Date.now();
@@ -5322,12 +5550,18 @@ async function handleServerTask(task) {
             });
 
             if (result?.skipped) {
-              debugLog("[UPLOAD_TRACKING] skipped because another upload is running", "info");
-              return result;
+              throw new Error("Upload skipped because another upload is running");
             }
 
             console.log("[EXT-DEBUG] Upload completed");
-            return result;
+            taskResult = {
+              upload: {
+                ok: true,
+                batchId: payload.batchId,
+                ordersCount: trackingData?.length || 0,
+              },
+            };
+            break;
           } catch (error) {
             console.error(`[EXT-DEBUG] Failed to upload ${file.filename}:`, error);
             console.log("[EXT-DEBUG] Reporting failure to server...");
@@ -5359,9 +5593,12 @@ async function handleServerTask(task) {
         break;
     }
 
-    console.log('✅ [EXT-DEBUG] Task processing completed successfully');
+    reportServerTask("completed", taskResult ? { result: taskResult } : {});
+    log(`[TASK] Hoàn tất ${type || "UNKNOWN"} · ${serverTaskId}`);
 
   } catch (e) {
+    reportServerTask("failed", { error: e?.message || String(e) });
+    log(`[TASK] Lỗi ${type || "UNKNOWN"} · ${e?.message || "Unknown error"}`);
     console.error("❌ [EXT-DEBUG] Task processing error:", e?.message || e);
     console.error("📋 [EXT-DEBUG] Error stack:", e?.stack);
     console.error("📦 [EXT-DEBUG] Task that caused error:", { type, payload });
@@ -5439,6 +5676,7 @@ chrome.storage.onChanged.addListener(async (changes) => {
 // Helper function để gửi log ra UI
 function debugLog(message, level = 'info') {
   console.log(message); // Vẫn log console để backup
+  persistRuntimeLog(message, level);
 
   // Gửi message tới popup để hiển thị
   chrome.runtime.sendMessage({
@@ -5777,322 +6015,30 @@ async function testConnection() {
   }
 }
 
-/* ===============================
-   AUTO CONFIG SCHEDULER
-   Reads backend config and reconciles chrome.alarms for production auto tasks.
-   =============================== */
+const LEGACY_AUTO_CONFIG_ALARMS = [
+  "AUTO_CFG_IMPORT_ORDER",
+  "AUTO_CFG_IMPORT_FBM",
+  "AUTO_CFG_IMPORT_ADS",
+  "AUTO_CFG_UPLOAD_TRACKING",
+  "AUTO_CFG_SYNC",
+];
 
-const autoConfigTimers = {}; // Legacy interval cleanup only; production scheduling uses chrome.alarms.
-const AUTO_CONFIG_TYPES = ["IMPORT_ORDER", "IMPORT_FBM", "IMPORT_ADS", "UPLOAD_TRACKING"];
-const AUTO_CONFIG_SYNC_ALARM = "AUTO_CFG_SYNC";
-const AUTO_CONFIG_DEBOUNCE_MS = 3000;
-let _autoConfigSyncTimer = null;
-let _lastAutoConfigSnapshot = null;
-let autoConfigSchedulerStarting = false;
-let autoConfigAlarmListenerRegistered = false;
-
-function yesterdayYMD() {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().slice(0, 10);
+async function clearLegacyAutoConfigAlarms() {
+  await Promise.all(LEGACY_AUTO_CONFIG_ALARMS.map((name) => chrome.alarms.clear(name)));
 }
 
-function getAutoConfigAlarmName(type) {
-  const names = {
-    IMPORT_ORDER: "AUTO_CFG_IMPORT_ORDER",
-    IMPORT_FBM: "AUTO_CFG_IMPORT_FBM",
-    IMPORT_ADS: "AUTO_CFG_IMPORT_ADS",
-    UPLOAD_TRACKING: "AUTO_CFG_UPLOAD_TRACKING",
-  };
-  return names[type] || null;
-}
-
-function isAutoConfigAlarmName(name) {
-  return name === AUTO_CONFIG_SYNC_ALARM || AUTO_CONFIG_TYPES.some((type) => getAutoConfigAlarmName(type) === name);
-}
-
-function autoConfigSnapshotForRecords(records = []) {
-  return JSON.stringify(
-    records
-      .map((r) => ({ type: r.type, status: r.status === true, time: Number.parseInt(r.time, 10) || 60 }))
-      .sort((a, b) => String(a.type).localeCompare(String(b.type)))
-  );
-}
-
-function getAutoConfigPeriodMinutes(record) {
-  return Math.max(1, Number.parseInt(record?.time, 10) || 60);
-}
-
-async function ensureAutoConfigSyncAlarm() {
-  await chrome.alarms.create(AUTO_CONFIG_SYNC_ALARM, { periodInMinutes: 10 });
-  debugLog("[AUTO-CFG] Alarm created AUTO_CFG_SYNC every 10 min", "info");
-}
-
-async function clearAutoConfigAlarms() {
-  const alarms = await chrome.alarms.getAll();
-  for (const alarm of alarms.filter((item) => isAutoConfigAlarmName(item.name))) {
-    await chrome.alarms.clear(alarm.name);
-    debugLog(`[AUTO-CFG] Alarm cleared ${alarm.name}`, "info");
-    extensionLogger?.logInfo("[AUTO-CFG] Alarm cleared", { name: alarm.name });
-  }
-}
-
-async function reconcileAutoConfigAlarms(records = []) {
-  const activeRecords = records.filter((record) => record.status === true && getAutoConfigAlarmName(record.type));
-  const desired = new Map();
-
-  for (const record of activeRecords) {
-    const name = getAutoConfigAlarmName(record.type);
-    const periodInMinutes = getAutoConfigPeriodMinutes(record);
-    desired.set(name, { record, periodInMinutes });
-  }
-  desired.set(AUTO_CONFIG_SYNC_ALARM, { periodInMinutes: 10 });
-
-  const existing = await chrome.alarms.getAll();
-  for (const alarm of existing.filter((item) => isAutoConfigAlarmName(item.name))) {
-    if (!desired.has(alarm.name)) {
-      await chrome.alarms.clear(alarm.name);
-      debugLog(`[AUTO-CFG] Alarm cleared ${alarm.name}`, "info");
-      extensionLogger?.logInfo("[AUTO-CFG] Alarm cleared", { name: alarm.name });
-    }
-  }
-
-  for (const [name, cfg] of desired.entries()) {
-    await chrome.alarms.create(name, { periodInMinutes: cfg.periodInMinutes });
-    debugLog(`[AUTO-CFG] Alarm created ${name} every ${cfg.periodInMinutes} min`, "success");
-    extensionLogger?.logInfo("[AUTO-CFG] Alarm created", { name, periodInMinutes: cfg.periodInMinutes, type: cfg.record?.type });
-  }
-
-  return { enabledCount: activeRecords.length, disabledCount: records.length - activeRecords.length, scheduler: "alarms" };
-}
-
-async function fetchAutoConfigRecords() {
-  const { ingestUrl, shopId } = await getCfg();
-  if (!ingestUrl || !shopId) {
-    throw new Error("Missing ingestUrl or shopId");
-  }
-
-  const res = await fetch(`${ingestUrl}/api/auto-config?shopId=${encodeURIComponent(shopId)}`);
-  const json = await res.json();
-  if (!json.success) throw new Error("API returned success=false");
-
-  return (json.data || []).filter((record) => record.shopId === shopId);
-}
-
-async function startAutoConfigScheduler(options = {}) {
-  const force = !!options.force;
-  const reason = options.reason || "manual";
-
-  if (autoConfigSchedulerStarting) {
-    debugLog(`[AUTO-CFG] Scheduler already starting; skipping duplicate call reason=${reason} force=${force}`, "info");
-    extensionLogger?.logInfo("[AUTO-CFG] Scheduler already starting; skipping duplicate call", { force, reason });
-    return { ok: true, skipped: true, reason: "AUTO_CONFIG_SCHEDULER_ALREADY_STARTING", force };
-  }
-
-  const now = Date.now();
-  if (!force && startAutoConfigScheduler._lastRun && now - startAutoConfigScheduler._lastRun < AUTO_CONFIG_DEBOUNCE_MS) {
-    debugLog(`[AUTO-CFG] Debounced duplicate call, keeping existing alarms reason=${reason} force=${force}`, "info");
-    extensionLogger?.logInfo("[AUTO-CFG] Debounced duplicate call, keeping existing alarms", { force, reason });
-    return { ok: true, skipped: true, reason: "AUTO_CONFIG_SCHEDULER_DEBOUNCED", force };
-  }
-  startAutoConfigScheduler._lastRun = now;
-  autoConfigSchedulerStarting = true;
-
-  try {
-    if (!extensionLogger) await initializeLogger();
-    const listenerReady = ensureAutoConfigAlarmListener();
-    if (!listenerReady) {
-      return {
-        ok: false,
-        error: "CHROME_ALARMS_UNAVAILABLE",
-        message: "chrome.alarms is unavailable. Check manifest permissions.",
-        force,
-        reason,
-      };
-    }
-
-    const records = await fetchAutoConfigRecords();
-    const snapshot = autoConfigSnapshotForRecords(records);
-    _lastAutoConfigSnapshot = snapshot;
-
-    await chrome.storage.local.set({
-      autoConfigRecordsSnapshot: records,
-      autoConfigLastLoadedAt: Date.now(),
-      autoConfigSnapshot: snapshot,
-    });
-
-    debugLog(`[AUTO-CFG] Loaded ${records.length} configs from API`, "info");
-    debugLog(`[AUTO-CFG] Scheduler starting reason=${reason} force=${force}`, "info");
-    extensionLogger?.logInfo("[AUTO-CFG] Scheduler starting", { total: records.length, scheduler: "alarms", force, reason });
-
-    for (const type of AUTO_CONFIG_TYPES) {
-      const record = records.find((item) => item.type === type);
-      const mins = record ? getAutoConfigPeriodMinutes(record) : "N/A";
-      if (record?.status === true) {
-        debugLog(`[AUTO-CFG] ${type} ON interval=${mins} min`, "success");
-      } else {
-        debugLog(`[AUTO-CFG] ${type} OFF interval=${mins} min`, "info");
-      }
-    }
-
-    const result = await reconcileAutoConfigAlarms(records);
-    debugLog("[AUTO-CFG] Config changed; alarms reconciled", "success");
-    return { ok: true, ...result, force, reason };
-  } catch (error) {
-    debugLog(`[AUTO-CFG] Scheduler error: ${error.message}`, "error");
-    extensionLogger?.logError(error, { scheduler: "alarms", force, reason }, "[AUTO-CFG] Scheduler error");
-    return { ok: false, error: error.message, force, reason };
-  } finally {
-    autoConfigSchedulerStarting = false;
-  }
-}
-
-async function stopAutoConfigScheduler() {
-  for (const [key, timer] of Object.entries(autoConfigTimers)) {
-    clearInterval(timer);
-    delete autoConfigTimers[key];
-    debugLog(`[AUTO-CFG] Stopped legacy timer: ${key}`, "info");
-    extensionLogger?.logInfo(`[AUTO-CFG] Legacy timer stopped: ${key}`);
-  }
-  await clearAutoConfigAlarms();
-}
-
-async function handleAutoConfigAlarm(alarm) {
-  if (!alarm?.name || !isAutoConfigAlarmName(alarm.name)) return;
-  debugLog(`[AUTO-CFG] Alarm tick ${alarm.name}`, "info");
-  extensionLogger?.logInfo("[AUTO-CFG] Alarm tick", { name: alarm.name, scheduledTime: alarm.scheduledTime });
-
-  try {
-    if (alarm.name === "AUTO_CFG_IMPORT_ORDER") {
-      await handleServerTask({ type: "IMPORT_ORDERS", payload: { source: "auto_alarm" } });
-    } else if (alarm.name === "AUTO_CFG_IMPORT_FBM") {
-      await handleServerTask({ type: "IMPORT_FBM_ORDERS", payload: { source: "auto_alarm" } });
-    } else if (alarm.name === "AUTO_CFG_IMPORT_ADS") {
-      const date = yesterdayYMD();
-      await handleServerTask({ type: "IMPORT_ADS_SPEND", payload: { date, source: "auto_alarm" } });
-    } else if (alarm.name === "AUTO_CFG_UPLOAD_TRACKING") {
-      await runUploadTrackingWithLock({ source: "auto_alarm" });
-    } else if (alarm.name === AUTO_CONFIG_SYNC_ALARM) {
-      const records = await fetchAutoConfigRecords();
-      const snapshot = autoConfigSnapshotForRecords(records);
-      if (snapshot === _lastAutoConfigSnapshot) {
-        debugLog("[AUTO-CFG-SYNC] No changes detected", "info");
-        return;
-      }
-      debugLog("[AUTO-CFG] Config changed; alarms reconciled", "info");
-      await startAutoConfigScheduler({
-        force: true,
-        reason: "AUTO_CFG_SYNC_CHANGED"
-      });
-    }
-  } catch (error) {
-    debugLog(`[AUTO-CFG] Alarm ${alarm.name} error: ${error.message}`, "error");
-    extensionLogger?.logError(error, { alarmName: alarm.name }, "[AUTO-CFG] Alarm error");
-  }
-}
-
-function ensureAutoConfigAlarmListener() {
-  if (!chrome?.alarms?.onAlarm) {
-    const message = "[AUTO-CFG] chrome.alarms unavailable. Check manifest permissions: add 'alarms'.";
-    debugLog(message, "error");
-    extensionLogger?.logInfo(message, {
-      missingPermission: "alarms",
-      manifestHint: "Add 'alarms' to permissions in manifest.json"
-    });
-    return false;
-  }
-
-  if (
-    autoConfigAlarmListenerRegistered ||
-    chrome.alarms.onAlarm.hasListener(handleAutoConfigAlarm)
-  ) {
-    autoConfigAlarmListenerRegistered = true;
-    return true;
-  }
-
-  chrome.alarms.onAlarm.addListener(handleAutoConfigAlarm);
-  autoConfigAlarmListenerRegistered = true;
-  debugLog("[AUTO-CFG] Alarm listener registered", "success");
-  extensionLogger?.logInfo("[AUTO-CFG] Alarm listener registered");
-  return true;
-}
-
-async function startAutoConfigSync() {
-  if (_autoConfigSyncTimer) {
-    clearInterval(_autoConfigSyncTimer);
-    _autoConfigSyncTimer = null;
-  }
-  const listenerReady = ensureAutoConfigAlarmListener();
-  if (!listenerReady) {
-    return { ok: false, error: "CHROME_ALARMS_UNAVAILABLE" };
-  }
-  await ensureAutoConfigSyncAlarm();
-  debugLog("[AUTO-CFG-SYNC] Started with chrome.alarms every 10 min", "info");
-  return { ok: true, scheduler: "alarms" };
-}
-
-async function stopAutoConfigSync() {
-  if (_autoConfigSyncTimer) {
-    clearInterval(_autoConfigSyncTimer);
-    _autoConfigSyncTimer = null;
-  }
-  await chrome.alarms.clear(AUTO_CONFIG_SYNC_ALARM);
-  debugLog("[AUTO-CFG-SYNC] Stopped", "info");
-}
-
-if (!ensureAutoConfigAlarmListener()) {
-  debugLog("[AUTO-CFG] Initial alarm listener registration skipped", "error");
-}
-
-// Bắt đầu polling connection status report mỗi 3 phút
-function startTestConnectionPolling() {
-  // Dừng polling cũ nếu có
-  stopTestConnectionPolling();
-
-  if (extensionLogger) {
-    extensionLogger.logInfo('Connection status polling started', { interval: '3min' });
-  }
-
-  // Report status ngay lập tức
-  testConnection();
-
-  // Sau đó report mỗi 3 phút
-  testConnectionInterval = setInterval(() => {
-    testConnection();
-  }, 180000); // 3 phút = 180000ms
-}
-
-// Dừng polling connection status report
-function stopTestConnectionPolling() {
-  if (testConnectionInterval) {
-    safeLogInfo('Connection status polling stopped');
-    clearInterval(testConnectionInterval);
-    testConnectionInterval = null;
-  }
-}
-
-// Bắt đầu auto reconnect polling mỗi 30 phút
+// Kiểm tra reconnect nền mỗi 10 phút.
 function startAutoReconnectPolling() {
   // Dừng polling cũ nếu có
   stopAutoReconnectPolling();
 
-  safeLogInfo('Auto reconnect polling started', { interval: '30min' });
-
-  // Polling mỗi 30 phút
+  // Socket khỏe không cần ghi log; chỉ ghi khi thực sự phải reconnect hoặc lỗi.
   autoReconnectInterval = setInterval(async () => {
     try {
       const { autoConnect } = await chrome.storage.local.get(['autoConnect']);
 
       // Chỉ auto reconnect nếu autoConnect được bật
       if (autoConnect !== false) {
-        if (extensionLogger) {
-          await extensionLogger.logInfo('Auto reconnect polling check', {
-            socketExists: !!socket,
-            socketConnected: socket?.connected || false,
-            timestamp: new Date().toISOString()
-          });
-        }
-
         // Nếu socket không tồn tại hoặc không connected, thử kết nối lại
         if (!socket || !socket.connected) {
           if (extensionLogger) {
@@ -6103,16 +6049,6 @@ function startAutoReconnectPolling() {
           }
 
           await connectSocketIO(true); // Force reconnect
-        } else {
-          if (extensionLogger) {
-            await extensionLogger.logInfo('Auto reconnect check - socket already connected', {
-              socketId: socket?.id || null
-            });
-          }
-        }
-      } else {
-        if (extensionLogger) {
-          await extensionLogger.logInfo('Auto reconnect skipped - autoConnect disabled');
         }
       }
     } catch (error) {
@@ -6122,7 +6058,7 @@ function startAutoReconnectPolling() {
         }, 'Auto reconnect polling error');
       }
     }
-  }, 600000); // 30 phút = 1800000ms
+  }, 600000); // 10 phút
 }
 
 // Dừng auto reconnect polling
@@ -6137,14 +6073,22 @@ function stopAutoReconnectPolling() {
 // Expose debug function globally
 globalThis.runExtensionDiagnostics = runExtensionDiagnostics;
 globalThis.testConnection = testConnection;
-globalThis.startTestConnectionPolling = startTestConnectionPolling;
-globalThis.stopTestConnectionPolling = stopTestConnectionPolling;
 globalThis.startAutoReconnectPolling = startAutoReconnectPolling;
 globalThis.stopAutoReconnectPolling = stopAutoReconnectPolling;
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
       if (msg.type === "PING") return sendResponse({ ok: true });
+
+      if (msg?.type === "PERSIST_RUNTIME_LOG") {
+        persistRuntimeLog(msg.payload?.message, msg.payload?.level);
+        return sendResponse({ ok: true });
+      }
+
+      if (msg?.type === "CLEAR_RUNTIME_LOG") {
+        await chrome.storage.local.remove(RUNTIME_LOG_STORAGE_KEY);
+        return sendResponse({ ok: true });
+      }
 
       if (msg?.type === "GET_LAST_UPLOAD_TRACKING_FINAL_TSV") {
         const data = await chrome.storage.local.get(["lastUploadTrackingFinalTsv"]);
@@ -6328,12 +6272,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return sendResponse({ ok: true });
       }
 
-      if (msg.type === "RELOAD_AUTO_CONFIG") {
-        const result = await startAutoConfigScheduler();
-        await startAutoConfigSync();
-        return sendResponse(result);
-      }
-
       if (msg.type === "ADS_BRIDGE_LOG") {
         const { level, message, rawData } = msg.payload || {};
         if (!extensionLogger) await initializeLogger();
@@ -6347,12 +6285,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return sendResponse({ ok: true });
       }
 
-      if (msg.type === "RUN_ADS_SPEND")
-        return sendResponse(await runExportAdsSpend(msg.payload?.date));
+      if (msg.type === "RUN_ADS_SPEND") {
+        const range = { startDate: msg.payload?.startDate, endDate: msg.payload?.endDate };
+        const result = await runExportAdsSpendRange(range.startDate, range.endDate, { foreground: true });
+        await persistManualAdsResult("import", range, result);
+        return sendResponse(result);
+      }
+
+      if (msg.type === "DRY_RUN_ADS_SPEND") {
+        const range = { startDate: msg.payload?.startDate, endDate: msg.payload?.endDate };
+        const result = await runExportAdsSpendRange(range.startDate, range.endDate, { dryRun: true, foreground: true });
+        await persistManualAdsResult("dry-run", range, result);
+        return sendResponse(result);
+      }
+
+      if (msg.type === "PREVIEW_ADS_SPEND") {
+        const range = { startDate: msg.payload?.startDate, endDate: msg.payload?.endDate };
+        const result = await previewAdsSpendRange(range.startDate, range.endDate);
+        await persistManualAdsResult("preview", range, result);
+        return sendResponse(result);
+      }
 
       // Manual full flow (CLICK) — emit log qua socket
       if (msg.type === "AUTO_RUN_NOW")
-        return sendResponse(await runFullFlowAndEmitLogs("click"));
+        return sendResponse(await runImportOrdersOnce("click"));
 
       if (msg?.type === "SOCKET_CONNECT") {
         const r = await connectSocketIO(true); // force reconnect
@@ -6363,11 +6319,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await chrome.storage.local.set({ autoConnect: !!msg.enabled });
         sendResponse({ ok: true, enabled: !!msg.enabled });
         return;
-      }
-
-      if (msg?.type === "ADS_CHECK_NAMES") {
-        const date = todayYMD();
-        return sendResponse(await checkCampaign(date));
       }
 
       if (msg?.type === "RUN_DIAGNOSTICS") {
@@ -6509,18 +6460,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return sendResponse(result);
       }
 
-      if (msg?.type === "START_TEST_POLLING") {
-        // Bắt đầu polling thủ công
-        startTestConnectionPolling();
-        return sendResponse({ ok: true, message: "Test connection polling started" });
-      }
-
-      if (msg?.type === "STOP_TEST_POLLING") {
-        // Dừng polling thủ công
-        stopTestConnectionPolling();
-        return sendResponse({ ok: true, message: "Test connection polling stopped" });
-      }
-
       if (msg?.type === "START_AUTO_RECONNECT") {
         // Bắt đầu auto reconnect polling thủ công
         startAutoReconnectPolling();
@@ -6582,16 +6521,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Không phụ thuộc socket, chỉ cần có shopId và ingestUrl
 (async () => {
   try {
-    const { ingestUrl, shopId } = await getCfg();
-    if (!ingestUrl || !shopId) {
-      debugLog("⚙️ [INIT] Chưa có shopId/ingestUrl — bỏ qua auto start", "info");
-      return;
-    }
-    debugLog("🚀 [INIT] Extension loaded — starting auto scheduler...", "info");
-    await startAutoConfigScheduler();
-    await startAutoConfigSync();
-    debugLog("✅ [INIT] Auto scheduler & sync started", "success");
+    await clearLegacyAutoConfigAlarms();
+    debugLog("✅ [INIT] Legacy extension schedules cleared; waiting for backend tasks", "success");
   } catch (e) {
-    debugLog(`❌ [INIT] Auto start error: ${e.message}`, "error");
+    debugLog(`❌ [INIT] Could not clear legacy schedules: ${e.message}`, "error");
   }
 })();
