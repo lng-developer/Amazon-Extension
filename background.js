@@ -995,14 +995,20 @@ async function logUploadFeedCsrfDiagnostic(tabId) {
         nativeUploadForm: (() => {
           const fileInput = document.querySelector('input[type="file"]');
           const form = fileInput?.closest("form") || null;
+          const labelOf = (element) => element.getAttribute("aria-label") || element.value || element.textContent || "";
           return {
             action: form?.action || "",
             method: form?.method || "",
             fileInputCount: document.querySelectorAll('input[type="file"]').length,
             submitControls: Array.from(form?.querySelectorAll('button, input[type="submit"]') || [])
-              .map((element) => element.getAttribute("aria-label") || element.value || element.textContent || "")
+              .map(labelOf)
               .map((value) => value.trim())
               .filter(Boolean),
+            availableControls: Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'))
+              .map(labelOf)
+              .map((value) => value.trim())
+              .filter(Boolean)
+              .slice(0, 30),
           };
         })(),
       };

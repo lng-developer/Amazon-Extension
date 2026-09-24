@@ -64,12 +64,14 @@ test("keeps native upload diagnostics to structural metadata", () => {
       method: "post",
       fileInputCount: 1,
       submitControls: ["Upload now"],
+      availableControls: ["Download Template", "Upload now"],
     }),
     {
       actionPath: "/order-reports-and-feeds/api/uploadFeed",
       method: "POST",
       fileInputCount: 1,
       submitControls: ["Upload now"],
+      availableControls: ["Download Template", "Upload now"],
     },
   );
 });
