@@ -13,6 +13,7 @@ import {
   selectReadOnlyUploadFeedCsrfCapture,
   shouldCloseDedicatedUploadFeedTab,
 } from "./lib/upload-feed-task-tab-policy.js";
+import { shouldCloseAutoCreatedAdsTab } from "./lib/ads-task-tab-policy.js";
 
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
 const adsApiLock = {
@@ -2986,6 +2987,20 @@ async function withForegroundAdsTab(fn) {
   }
 }
 
+async function withAutoCreatedAdsTab(fn) {
+  const tab = await ensureAdsTab();
+  try {
+    const result = await fn();
+    if (shouldCloseAutoCreatedAdsTab({ created: tab.created, completed: true })) {
+      await chrome.tabs.remove(tab.tabId).catch(() => {});
+    }
+    return result;
+  } catch (error) {
+    // Keep a failed, auto-created tab available for login/CSRF recovery.
+    throw error;
+  }
+}
+
 async function injectAdsMainWorldSniffer(tabId) {
   try {
     await chrome.scripting.executeScript({
@@ -3574,7 +3589,7 @@ async function runExportAdsSpendRange(startDate, endDate = startDate, options = 
         totalRows: results.reduce((total, result) => total + Number(result.rows || 0), 0),
       };
     };
-    return options.foreground ? withForegroundAdsTab(run) : run();
+    return options.foreground ? withForegroundAdsTab(run) : withAutoCreatedAdsTab(run);
   });
 }
 
