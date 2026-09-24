@@ -46,6 +46,21 @@ Number of records with warnings: 0`);
   });
 });
 
+test("treats Amazon's successful counter as activated records", () => {
+  const result = parseAmazonProcessingReport(`Feed Processing Summary:
+	Number of records processed		2
+	Number of records successful		2
+`);
+
+  assert.deepEqual(result, {
+    status: "submitted",
+    recordsProcessed: 2,
+    recordsActivated: 2,
+    errorCount: 0,
+    warningCount: 0,
+  });
+});
+
 test("uses the history row as Done even when the downloaded report omits Status", () => {
   const event = buildAmazonFeedDoneEvent({
     batchId: "batch-1",
