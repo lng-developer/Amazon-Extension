@@ -10,10 +10,12 @@ import { io } from "./lib/socket.io.esm.min.js";
 import {
   buildSafeUploadFeedCsrfDiagnostic,
   canSubmitAmazonRow,
+  getReadOnlyUploadFeedWarmupSelectors,
   selectReadOnlyUploadFeedCsrfCapture,
   shouldCloseDedicatedUploadFeedTab,
 } from "./lib/upload-feed-task-tab-policy.js";
 import { shouldCloseAutoCreatedAdsTab } from "./lib/ads-task-tab-policy.js";
+import { shouldReconnectSocket } from "./lib/socket-reconnect-policy.js";
 
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
 const adsApiLock = {
@@ -30,6 +32,8 @@ const uploadTrackingLock = {
   startedAt: 0,
 };
 let importOrdersInProgress = false;
+const SOCKET_RECONNECT_ALARM = "SOCKET_RECONNECT";
+const SOCKET_RECONNECT_PERIOD_MINUTES = 1;
 
 // Global logger instance
 let extensionLogger = null;
@@ -899,17 +903,57 @@ async function findOrOpenSellerCentralFeedsTab({ tabId = null, dedicated = false
   return chrome.tabs.create({ url: SC_FEEDS_URL, active });
 }
 
+async function warmUpUploadFeedFormReadOnly(tabId) {
+  if (!tabId) return { clicked: false, reason: "missing_tab" };
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "ISOLATED",
+    args: [getReadOnlyUploadFeedWarmupSelectors()],
+    func: (selectors) => {
+      const isUploadControl = (element) => /upload|add\s+file|new\s+upload/i.test(
+        `${element.getAttribute("aria-label") || ""} ${element.textContent || ""}`
+      );
+      const target = selectors
+        .flatMap((selector) => [...document.querySelectorAll(selector)])
+        .find((element) => !element.disabled && isUploadControl(element));
+      if (!target) return { clicked: false, reason: "upload_control_not_found" };
+      target.click();
+      return { clicked: true, control: target.getAttribute("aria-label") || target.textContent?.trim() || "upload" };
+    },
+  }).catch((error) => [{ result: { clicked: false, reason: error?.message || "warmup_failed" } }]);
+  return result?.result || { clicked: false, reason: "warmup_failed" };
+}
+
 async function seedUploadFeedCsrfFromSellerCentralTab(tabId) {
   const existing = await getUploadFeedCsrfCacheStatus();
   if (existing.valid || !tabId) return existing;
 
   const cookieToken = await getCookie(`${SC_BASE}/`, "anti-csrftoken-a2z");
-  const { token: pageToken, storageToken, pageHint } = await getSellerCentralPageCsrfFromTab(tabId);
-  const capture = {
+  let { token: pageToken, storageToken, pageHint } = await getSellerCentralPageCsrfFromTab(tabId);
+  let capture = {
     ...selectReadOnlyUploadFeedCsrfCapture({ cookieToken, storageToken, pageToken }),
     url: pageHint?.href || SC_FEEDS_URL,
     pageTitle: pageHint?.title || "Seller Central Feeds",
   };
+
+  if (!isValidUploadFeedCsrfToken(capture.token)) {
+    const warmup = await warmUpUploadFeedFormReadOnly(tabId);
+    if (warmup.clicked) {
+      await delayMs(800);
+      ({ token: pageToken, storageToken, pageHint } = await getSellerCentralPageCsrfFromTab(tabId));
+      capture = {
+        ...selectReadOnlyUploadFeedCsrfCapture({ cookieToken, storageToken, pageToken }),
+        url: pageHint?.href || SC_FEEDS_URL,
+        pageTitle: pageHint?.title || "Seller Central Feeds",
+      };
+    }
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] read-only upload form warm-up", {
+      tabId,
+      clicked: warmup.clicked,
+      reason: warmup.reason || "",
+      tokenFound: isValidUploadFeedCsrfToken(capture.token),
+    }, warmup.clicked ? "info" : "error");
+  }
 
   if (isValidUploadFeedCsrfToken(capture.token)) {
     await saveUploadFeedCsrfTokenCapture(capture);
@@ -4659,6 +4703,20 @@ function stopHeartbeat() {
   hbTimer = null;
 }
 
+function ensureSocketReconnectAlarm() {
+  chrome.alarms.create(SOCKET_RECONNECT_ALARM, {
+    periodInMinutes: SOCKET_RECONNECT_PERIOD_MINUTES,
+  });
+}
+
+async function reconnectSocketIfNeeded(source) {
+  const { autoConnect } = await chrome.storage.local.get(["autoConnect"]);
+  if (!shouldReconnectSocket({ autoConnect, connected: socket?.connected })) return;
+
+  safeLogConnectionStatus("reconnecting", { source }, `Socket reconnect triggered by ${source}`);
+  await connectSocketIO();
+}
+
 /**
  * Kết nối Socket.IO.
  * - force = true: luôn ngắt và tạo lại kết nối (dùng cho nút Connect hoặc đổi shop/ingestUrl)
@@ -6532,11 +6590,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== SOCKET_RECONNECT_ALARM) return;
+  reconnectSocketIfNeeded("alarm").catch((error) => {
+    safeLogConnectionStatus("reconnect_failed", { source: "alarm", error: error?.message }, `Socket alarm reconnect failed: ${error?.message || error}`);
+  });
+});
+
 // ── Khởi động tự động khi background script load ──
 // Không phụ thuộc socket, chỉ cần có shopId và ingestUrl
 (async () => {
   try {
     await clearLegacyAutoConfigAlarms();
+    ensureSocketReconnectAlarm();
+    await reconnectSocketIfNeeded("service_worker_start");
     debugLog("✅ [INIT] Legacy extension schedules cleared; waiting for backend tasks", "success");
   } catch (e) {
     debugLog(`❌ [INIT] Could not clear legacy schedules: ${e.message}`, "error");

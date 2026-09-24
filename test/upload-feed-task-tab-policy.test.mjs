@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildSafeUploadFeedCsrfDiagnostic,
   canSubmitAmazonRow,
+  getReadOnlyUploadFeedWarmupSelectors,
   selectReadOnlyUploadFeedCsrfCapture,
   shouldCloseDedicatedUploadFeedTab,
 } from "../lib/upload-feed-task-tab-policy.js";
@@ -34,6 +35,14 @@ test("uses the Seller Central storage token when no cookie exists", () => {
     selectReadOnlyUploadFeedCsrfCapture({ storageToken: "storage", pageToken: "page" }),
     { token: "storage", source: "readOnlyStorage" },
   );
+});
+
+test("uses upload-form controls only for read-only CSRF warm-up", () => {
+  assert.deepEqual(getReadOnlyUploadFeedWarmupSelectors(), [
+    '[data-testid*="upload" i]',
+    'button[aria-label*="upload" i]',
+    'button',
+  ]);
 });
 
 test("keeps CSRF diagnostics metadata-only", () => {
