@@ -23,6 +23,7 @@ import {
   buildAmazonFeedDoneEvent,
   findNewAmazonFeedRow,
   nextAmazonFeedWatchState,
+  shouldRefreshAmazonFeedHistory,
 } from "./lib/amazon-feed-history.js";
 
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
@@ -2129,6 +2130,25 @@ async function readAmazonFeedHistory(tabId) {
   return result?.result || [];
 }
 
+async function refreshAmazonFeedHistory(tabId) {
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: () => {
+      const refreshControl = [...document.querySelectorAll('button, input[type="button"], input[type="submit"]')]
+        .find((element) => String(element.value || element.textContent || "").trim().toLowerCase() === "refresh");
+      if (!refreshControl || refreshControl.disabled) return { clicked: false };
+      refreshControl.click();
+      return { clicked: true };
+    },
+  });
+  if (result?.result?.clicked) {
+    await waitForSellerCentralTabComplete(tabId);
+    await delayMs(300);
+  }
+  return result?.result || { clicked: false };
+}
+
 async function readAmazonProcessingReport(tabId, reportHref) {
   const [result] = await chrome.scripting.executeScript({
     target: { tabId },
@@ -2205,6 +2225,7 @@ async function pollAmazonFeedWatch(watch) {
     if (!tab) tab = await findOrOpenSellerCentralFeedsTab({ dedicated: true, active: false });
     if (!tab?.id) return;
     await waitForSellerCentralTabComplete(tab.id);
+    if (shouldRefreshAmazonFeedHistory(watch)) await refreshAmazonFeedHistory(tab.id);
     const rows = await readAmazonFeedHistory(tab.id);
     const row = watch.amazonBatchId
       ? rows.find((item) => String(item.amazonBatchId) === String(watch.amazonBatchId))
