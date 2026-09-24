@@ -1,0 +1,61 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  findNewAmazonFeedRow,
+  nextAmazonFeedWatchState,
+  parseAmazonProcessingReport,
+} from "../lib/amazon-feed-history.js";
+
+test("selects the upload-history row that did not exist before submission", () => {
+  const row = findNewAmazonFeedRow({
+    beforeBatchIds: ["93613020711"],
+    rows: [
+      { amazonBatchId: "93703020720", status: "Done", reportHref: "/report/93703020720" },
+      { amazonBatchId: "93613020711", status: "Done" },
+    ],
+  });
+
+  assert.deepEqual(row, {
+    amazonBatchId: "93703020720",
+    status: "done",
+    reportHref: "/report/93703020720",
+  });
+});
+
+test("parses Amazon Processing Report counters", () => {
+  const result = parseAmazonProcessingReport(`Status: Done
+Number of records processed from this upload: 1
+Number of records that were activated: 1
+Number of records with errors: 0
+Number of records with warnings: 0`);
+
+  assert.deepEqual(result, {
+    status: "done",
+    recordsProcessed: 1,
+    recordsActivated: 1,
+    errorCount: 0,
+    warningCount: 0,
+  });
+});
+
+test("preserves a resumed watch as polling-only", () => {
+  const next = nextAmazonFeedWatchState({
+    batchId: "batch-1",
+    amazonBatchId: "93703020720",
+    expectedRows: 1,
+  }, { amazonBatchId: "93703020720", status: "In Progress" });
+
+  assert.equal(next.action, "poll");
+  assert.equal(next.status, "processing");
+});
+
+test("stops only after a terminal status is acknowledged", () => {
+  const next = nextAmazonFeedWatchState({ batchId: "batch-1", expectedRows: 1 }, {
+    amazonBatchId: "93703020720",
+    status: "Done",
+  });
+
+  assert.equal(next.action, "fetch_report");
+  assert.equal(next.terminal, false);
+});

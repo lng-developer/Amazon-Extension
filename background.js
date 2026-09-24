@@ -19,6 +19,11 @@ import {
 } from "./lib/upload-feed-task-tab-policy.js";
 import { shouldCloseAutoCreatedAdsTab } from "./lib/ads-task-tab-policy.js";
 import { shouldReconnectSocket } from "./lib/socket-reconnect-policy.js";
+import {
+  findNewAmazonFeedRow,
+  nextAmazonFeedWatchState,
+  parseAmazonProcessingReport,
+} from "./lib/amazon-feed-history.js";
 
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
 const adsApiLock = {
@@ -37,6 +42,9 @@ const uploadTrackingLock = {
 let importOrdersInProgress = false;
 const SOCKET_RECONNECT_ALARM = "SOCKET_RECONNECT";
 const SOCKET_RECONNECT_PERIOD_MINUTES = 1;
+const AMAZON_FEED_WATCH_ALARM = "AMAZON_FEED_WATCH";
+const AMAZON_FEED_WATCH_PERIOD_MINUTES = 0.5;
+const AMAZON_FEED_WATCHES_KEY = "amazonFeedWatches";
 
 // Global logger instance
 let extensionLogger = null;
@@ -2106,6 +2114,143 @@ async function uploadToAmazonViaNativeSellerCentralForm(stableFileObj, uploadPar
   return { ...(res?.result || {}), world: "MAIN" };
 }
 
+async function readAmazonFeedHistory(tabId) {
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: () => [...document.querySelectorAll("tr")].map((row) => {
+      const cells = [...row.querySelectorAll("td")].map((cell) => cell.innerText.trim());
+      const amazonBatchId = cells.find((cell) => /^\d{8,}$/.test(cell.replace(/\s/g, ""))) || "";
+      const status = cells.find((cell) => /Status\s*:\s*(Done|In Progress|Error|Failed)/i.test(cell)) || "";
+      const report = [...row.querySelectorAll("a")].find((link) => /processing report/i.test(link.textContent || ""));
+      return { amazonBatchId: amazonBatchId.replace(/\s/g, ""), status, reportHref: report?.href || "" };
+    }).filter((row) => row.amazonBatchId),
+  });
+  return result?.result || [];
+}
+
+async function readAmazonProcessingReport(tabId, reportHref) {
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    args: [reportHref],
+    func: async (href) => {
+      const response = await fetch(new URL(href, location.href).href, { credentials: "include" });
+      if (!response.ok) throw new Error(`Processing Report request failed: ${response.status}`);
+      return await response.text();
+    },
+  });
+  return String(result?.result || "");
+}
+
+async function getAmazonFeedWatches() {
+  const stored = await chrome.storage.local.get([AMAZON_FEED_WATCHES_KEY]);
+  return stored[AMAZON_FEED_WATCHES_KEY] && typeof stored[AMAZON_FEED_WATCHES_KEY] === "object"
+    ? stored[AMAZON_FEED_WATCHES_KEY]
+    : {};
+}
+
+async function saveAmazonFeedWatch(watch) {
+  const watches = await getAmazonFeedWatches();
+  watches[watch.batchId] = watch;
+  await chrome.storage.local.set({ [AMAZON_FEED_WATCHES_KEY]: watches });
+  chrome.alarms.create(AMAZON_FEED_WATCH_ALARM, { periodInMinutes: AMAZON_FEED_WATCH_PERIOD_MINUTES });
+  return watch;
+}
+
+async function removeAmazonFeedWatch(batchId) {
+  const watches = await getAmazonFeedWatches();
+  delete watches[batchId];
+  await chrome.storage.local.set({ [AMAZON_FEED_WATCHES_KEY]: watches });
+  if (Object.keys(watches).length === 0) await chrome.alarms.clear(AMAZON_FEED_WATCH_ALARM);
+}
+
+async function reportAmazonFeedStatus(event) {
+  if (!socket?.connected) return { ok: false, code: "SOCKET_OFFLINE" };
+  const { shopId, clientId } = await getBaseShopAndIdentity();
+  return await new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve({ ok: false, code: "ACK_TIMEOUT" }), 10000);
+    socket.emit("client:amazon_feed_status", {
+      ...event,
+      shopId,
+      machineId: clientId,
+      reportedAt: new Date().toISOString(),
+    }, (ack) => {
+      clearTimeout(timeout);
+      resolve(ack || { ok: false, code: "EMPTY_ACK" });
+    });
+  });
+}
+
+async function reportAmazonFeedTaskTerminal(watch, status) {
+  if (!socket?.connected || !watch.taskId) return;
+  const { shopId, clientId } = await getBaseShopAndIdentity();
+  socket.emit("client:task", {
+    eventId: `${watch.taskId}:${status}`,
+    taskId: watch.taskId,
+    type: "UPLOAD_TRACKING",
+    status: status === "done" ? "completed" : "failed",
+    shopId,
+    machineId: clientId,
+    source: "amazon_extension",
+    reportedAt: new Date().toISOString(),
+    ...(status === "done" ? { result: { upload: { ok: true, batchId: watch.batchId, ordersCount: watch.expectedRows } } } : { error: `Amazon Processing Report finished with ${status}` }),
+  });
+}
+
+async function pollAmazonFeedWatch(watch) {
+  let tab = null;
+  try {
+    tab = watch.sellerCentralTabId ? await chrome.tabs.get(watch.sellerCentralTabId).catch(() => null) : null;
+    if (!tab) tab = await findOrOpenSellerCentralFeedsTab({ dedicated: true, active: false });
+    if (!tab?.id) return;
+    await waitForSellerCentralTabComplete(tab.id);
+    const rows = await readAmazonFeedHistory(tab.id);
+    const row = watch.amazonBatchId
+      ? rows.find((item) => String(item.amazonBatchId) === String(watch.amazonBatchId))
+      : findNewAmazonFeedRow({ beforeBatchIds: watch.beforeBatchIds || [], rows });
+    if (!row) return;
+
+    const next = nextAmazonFeedWatchState({ ...watch, sellerCentralTabId: tab.id }, row);
+    await saveAmazonFeedWatch(next);
+    if (next.action === "poll") {
+      await reportAmazonFeedStatus({ batchId: next.batchId, amazonBatchId: next.amazonBatchId, status: "processing" });
+      return;
+    }
+
+    if (next.action === "fetch_report") {
+      if (!row.reportHref) return;
+      const reportText = await readAmazonProcessingReport(tab.id, row.reportHref);
+      const report = parseAmazonProcessingReport(reportText);
+      const ack = await reportAmazonFeedStatus({
+        batchId: next.batchId,
+        amazonBatchId: next.amazonBatchId,
+        ...report,
+        reportText,
+      });
+      if (!ack?.ok || !ack?.terminal) return;
+      await reportAmazonFeedTaskTerminal(next, ack.status);
+      await removeAmazonFeedWatch(next.batchId);
+      if (next.createdDedicatedTab) await chrome.tabs.remove(tab.id).catch(() => {});
+      return;
+    }
+
+    const ack = await reportAmazonFeedStatus({ batchId: next.batchId, amazonBatchId: next.amazonBatchId, status: "failed", failureReason: "Amazon feed history reports failure" });
+    if (ack?.ok && ack?.terminal) {
+      await reportAmazonFeedTaskTerminal(next, ack.status);
+      await removeAmazonFeedWatch(next.batchId);
+      if (next.createdDedicatedTab) await chrome.tabs.remove(tab.id).catch(() => {});
+    }
+  } catch (error) {
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] Amazon feed watch poll failed", { batchId: watch.batchId, message: error?.message || String(error) }, "error");
+  }
+}
+
+async function pollAmazonFeedWatches() {
+  const watches = await getAmazonFeedWatches();
+  await Promise.all(Object.values(watches).map((watch) => pollAmazonFeedWatch(watch)));
+}
+
 function sellerCentralTabUploadResultToResponse(result = {}) {
   const contentType = result.contentType || "";
   const textBody = result.textPreview || "";
@@ -3929,6 +4074,7 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
   let preflight = null;
   let pageUploadResult = null;
   let dedicatedSellerCentralTab = null;
+  let historyBeforeBatchIds = [];
 
   if (!extensionLogger) await initializeLogger();
 
@@ -4068,6 +4214,9 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
       sellerCentralReady: preflight.allowUpload,
       strategy: "nativeSellerCentralForm",
     }, "success");
+    historyBeforeBatchIds = (await readAmazonFeedHistory(dedicatedSellerCentralTab.id).catch(() => []))
+      .map((row) => row.amazonBatchId)
+      .filter(Boolean);
 
     const cookieFlags = {
       sessionId: !!(await getCookie(`${SC_BASE}/`, "session-id")),
@@ -4260,6 +4409,7 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
       strategy: "sellerCentralTabPageContext",
       world: pageUploadResult?.world,
       dedicatedSellerCentralTabId: dedicatedSellerCentralTab?.id || null,
+      historyBeforeBatchIds,
     };
   } catch (error) {
     if (isUploadFeedAuthOrCsrfError(error)) {
@@ -4310,47 +4460,6 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
 
 async function DO_NOT_USE_uploadToAmazonLegacyBackgroundUpload() {
   throw new Error("Deprecated: uploadFeed must use Seller Central page-context upload. Do not use background upload.");
-}
-
-async function reportUploadResult(batchId, status, errorMessage = null) {
-  const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
-  log(`[UPLOAD_TRACKING] Reporting upload result for batch ${batchId}: ${status}${errorMessage ? " - " + errorMessage : ""}`);
-  try {
-    const reportData = {
-      batchId,
-      status, // 'success' | 'failed'
-      timestamp: new Date().toISOString(),
-      machineId: clientId,
-      label: clientLabel,
-      shopId
-    };
-
-    if (errorMessage) {
-      reportData.error = errorMessage;
-    }
-
-    // Report back to server via Socket.IO
-    if (socket && socket.connected) {
-      socket.emit('upload:result', reportData);
-      console.log(`[UPLOAD_TRACKING] Reported ${status} for batch ${batchId}`);
-    }
-
-    // Also log via standard logging
-    await postLogSingle({
-      base,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: "auto",
-      level: status === 'success' ? "success" : "error",
-      message: status === 'success'
-        ? `✅ Upload tracking batch ${batchId} success!`
-        : `❌ Upload tracking batch ${batchId} failed: ${errorMessage}`
-    });
-
-  } catch (error) {
-    console.error(`[UPLOAD_TRACKING] Failed to report result:`, error);
-  }
 }
 
 async function postLogSingle({
@@ -4809,6 +4918,13 @@ function ensureSocketReconnectAlarm() {
   chrome.alarms.create(SOCKET_RECONNECT_ALARM, {
     periodInMinutes: SOCKET_RECONNECT_PERIOD_MINUTES,
   });
+}
+
+async function ensureAmazonFeedWatchAlarm() {
+  const watches = await getAmazonFeedWatches();
+  if (Object.keys(watches).length > 0) {
+    chrome.alarms.create(AMAZON_FEED_WATCH_ALARM, { periodInMinutes: AMAZON_FEED_WATCH_PERIOD_MINUTES });
+  }
 }
 
 async function reconnectSocketIfNeeded(source) {
@@ -5274,6 +5390,7 @@ async function handleServerTask(task) {
   };
   reportServerTask("received");
   let taskResult;
+  let deferTaskCompletion = false;
 
   try {
     switch (type) {
@@ -5633,7 +5750,7 @@ async function handleServerTask(task) {
             const error = new Error("UPLOAD_TRACKING payload.file is required");
             debugLog(`[UPLOAD_TRACKING] ${error.message}`, "error");
             if (payload?.batchId) {
-              await reportUploadResult(payload.batchId, "failed", error.message);
+              await reportAmazonFeedStatus({ batchId: payload.batchId, status: "failed", failureReason: error.message });
               error._uploadTrackingReported = true;
             }
             if (extensionLogger) {
@@ -5691,24 +5808,25 @@ async function handleServerTask(task) {
             const result = await withUploadTrackingLock("UPLOAD_TRACKING_SOCKET", async () => {
               const uploadResult = await uploadToAmazon(fileObj, trackingUploadParams);
               console.log(`[EXT-DEBUG] Successfully uploaded ${file.filename}`);
-              console.log("[EXT-DEBUG] Reporting success to server...");
-
-              if (payload?.batchId) {
-                await reportUploadResult(payload.batchId, "success");
-              }
-              if (shouldCloseDedicatedUploadFeedTab({
-                created: !!uploadResult?.dedicatedSellerCentralTabId,
-                uploaded: uploadResult?.ok === true,
-              })) {
-                await chrome.tabs.remove(uploadResult.dedicatedSellerCentralTabId).catch(() => {});
-                logUploadTrackingDiagnostic("[UPLOAD_TRACKING] closed dedicated Seller Central feeds tab after success", {
-                  tabId: uploadResult.dedicatedSellerCentralTabId,
-                }, "success");
-              }
+              console.log("[EXT-DEBUG] Native upload submitted; waiting for Amazon Processing Report...");
+              const watch = {
+                batchId: payload.batchId,
+                taskId: serverTaskId,
+                expectedRows: trackingData?.length || uploadParams?.ordersCount || 0,
+                sellerCentralTabId: uploadResult?.dedicatedSellerCentralTabId || null,
+                createdDedicatedTab: !!uploadResult?.dedicatedSellerCentralTabId,
+                beforeBatchIds: uploadResult?.historyBeforeBatchIds || [],
+                status: "submitted",
+                createdAt: new Date().toISOString(),
+              };
+              await saveAmazonFeedWatch(watch);
+              await reportAmazonFeedStatus({ batchId: payload.batchId, status: "submitted" });
+              deferTaskCompletion = true;
+              await pollAmazonFeedWatch(watch);
 
               if (extensionLogger) {
                 const uploadEndTime = Date.now();
-                await extensionLogger.logTaskCompleted({
+                await extensionLogger.logTaskProcessing({
                   taskId: uploadTaskId,
                   taskType: type,
                   batchId: payload?.batchId,
@@ -5718,7 +5836,7 @@ async function handleServerTask(task) {
                   duration: uploadEndTime - uploadStartTime,
                   memoryUsage: performance.memory?.usedJSHeapSize / 1024 / 1024,
                   cpuUsage: 0
-                }, `[UPLOAD_TRACKING] Upload tracking completed successfully: ${file.filename}`);
+                }, `[UPLOAD_TRACKING] Native upload submitted; waiting for Amazon Processing Report: ${file.filename}`);
               }
 
               return uploadResult;
@@ -5742,7 +5860,7 @@ async function handleServerTask(task) {
             console.log("[EXT-DEBUG] Reporting failure to server...");
 
             if (payload?.batchId) {
-              await reportUploadResult(payload.batchId, "failed", error.message);
+              await reportAmazonFeedStatus({ batchId: payload.batchId, status: "failed", failureReason: error.message });
               error._uploadTrackingReported = true;
             }
 
@@ -5768,8 +5886,12 @@ async function handleServerTask(task) {
         break;
     }
 
-    reportServerTask("completed", taskResult ? { result: taskResult } : {});
-    log(`[TASK] Hoàn tất ${type || "UNKNOWN"} · ${serverTaskId}`);
+    if (!deferTaskCompletion) {
+      reportServerTask("completed", taskResult ? { result: taskResult } : {});
+      log(`[TASK] Hoàn tất ${type || "UNKNOWN"} · ${serverTaskId}`);
+    } else {
+      log(`[TASK] Đã submit ${type || "UNKNOWN"}; chờ Amazon Processing Report · ${serverTaskId}`);
+    }
 
   } catch (e) {
     reportServerTask("failed", { error: e?.message || String(e) });
@@ -5782,7 +5904,7 @@ async function handleServerTask(task) {
     if (type === "UPLOAD_TRACKING" && payload?.batchId && !e?._uploadTrackingReported) {
       console.log('📝 [EXT-DEBUG] Reporting task error to server...');
       try {
-        await reportUploadResult(payload.batchId, 'failed', e?.message || 'Unknown error');
+        await reportAmazonFeedStatus({ batchId: payload.batchId, status: "failed", failureReason: e?.message || "Unknown error" });
       } catch (reportError) {
         console.error('❌ [EXT-DEBUG] Failed to report error:', reportError);
       }
@@ -6693,10 +6815,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== SOCKET_RECONNECT_ALARM) return;
-  reconnectSocketIfNeeded("alarm").catch((error) => {
-    safeLogConnectionStatus("reconnect_failed", { source: "alarm", error: error?.message }, `Socket alarm reconnect failed: ${error?.message || error}`);
-  });
+  if (alarm.name === SOCKET_RECONNECT_ALARM) {
+    reconnectSocketIfNeeded("alarm").catch((error) => {
+      safeLogConnectionStatus("reconnect_failed", { source: "alarm", error: error?.message }, `Socket alarm reconnect failed: ${error?.message || error}`);
+    });
+  }
+  if (alarm.name === AMAZON_FEED_WATCH_ALARM) pollAmazonFeedWatches();
 });
 
 // ── Khởi động tự động khi background script load ──
@@ -6705,7 +6829,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   try {
     await clearLegacyAutoConfigAlarms();
     ensureSocketReconnectAlarm();
+    await ensureAmazonFeedWatchAlarm();
     await reconnectSocketIfNeeded("service_worker_start");
+    await pollAmazonFeedWatches();
     debugLog("✅ [INIT] Legacy extension schedules cleared; waiting for backend tasks", "success");
   } catch (e) {
     debugLog(`❌ [INIT] Could not clear legacy schedules: ${e.message}`, "error");
