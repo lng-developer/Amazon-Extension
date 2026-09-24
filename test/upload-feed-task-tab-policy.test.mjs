@@ -5,6 +5,7 @@ import {
   buildSafeUploadFeedCsrfDiagnostic,
   canSubmitAmazonRow,
   getReadOnlyUploadFeedWarmupSelectors,
+  shouldNavigateSellerCentralFeedsTab,
   selectReadOnlyUploadFeedCsrfCapture,
   shouldCloseDedicatedUploadFeedTab,
 } from "../lib/upload-feed-task-tab-policy.js";
@@ -43,6 +44,16 @@ test("uses upload-form controls only for read-only CSRF warm-up", () => {
     'button[aria-label*="upload" i]',
     'button',
   ]);
+});
+
+test("keeps the active feeds page intact during a readiness check", () => {
+  assert.equal(
+    shouldNavigateSellerCentralFeedsTab({
+      currentUrl: "https://sellercentral.amazon.com/order-reports-and-feeds/feeds",
+      targetUrl: "https://sellercentral.amazon.com/order-reports-and-feeds/feeds",
+    }),
+    false,
+  );
 });
 
 test("keeps CSRF diagnostics metadata-only", () => {

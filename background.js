@@ -13,6 +13,7 @@ import {
   getReadOnlyUploadFeedWarmupSelectors,
   selectReadOnlyUploadFeedCsrfCapture,
   shouldCloseDedicatedUploadFeedTab,
+  shouldNavigateSellerCentralFeedsTab,
 } from "./lib/upload-feed-task-tab-policy.js";
 import { shouldCloseAutoCreatedAdsTab } from "./lib/ads-task-tab-policy.js";
 import { shouldReconnectSocket } from "./lib/socket-reconnect-policy.js";
@@ -879,7 +880,7 @@ async function waitForSellerCentralTabComplete(tabId, timeoutMs = 35000) {
 async function findOrOpenSellerCentralFeedsTab({ tabId = null, dedicated = false, active = true } = {}) {
   let tab = tabId ? await chrome.tabs.get(tabId).catch(() => null) : null;
   if (tab?.id) {
-    if (!(tab.url || "").startsWith(SC_FEEDS_URL)) {
+    if (shouldNavigateSellerCentralFeedsTab({ currentUrl: tab.url, targetUrl: SC_FEEDS_URL })) {
       tab = await chrome.tabs.update(tab.id, { url: SC_FEEDS_URL, active });
     } else if (active) {
       await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
@@ -893,10 +894,17 @@ async function findOrOpenSellerCentralFeedsTab({ tabId = null, dedicated = false
   }
 
   const tabs = await chrome.tabs.query({ url: `${SC_BASE}/*` }).catch(() => []);
-  const feedsTab = tabs.find((tab) => (tab.url || "").startsWith(SC_FEEDS_URL));
+  const feedsTab = tabs.find((tab) => !shouldNavigateSellerCentralFeedsTab({ currentUrl: tab.url, targetUrl: SC_FEEDS_URL }));
   tab = feedsTab || tabs[0];
 
   if (tab?.id) {
+    if (feedsTab) {
+      if (active) {
+        await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+        tab = await chrome.tabs.update(tab.id, { active: true });
+      }
+      return tab;
+    }
     return chrome.tabs.update(tab.id, { url: SC_FEEDS_URL, active: true });
   }
 
