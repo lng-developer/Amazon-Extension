@@ -11,6 +11,7 @@ import {
   buildSafeUploadFeedCsrfDiagnostic,
   canSubmitAmazonRow,
   getReadOnlyUploadFeedWarmupSelectors,
+  getNativeUploadFormSelectors,
   selectReadOnlyUploadFeedCsrfCapture,
   shouldCloseDedicatedUploadFeedTab,
   shouldNavigateSellerCentralFeedsTab,
@@ -1999,6 +2000,112 @@ async function uploadToAmazonFromSellerCentralTab(stableFileObj, uploadParams = 
   }
 }
 
+async function uploadToAmazonViaNativeSellerCentralForm(stableFileObj, uploadParams = {}) {
+  const tab = await findOrOpenSellerCentralFeedsTab({ tabId: uploadParams.sellerCentralTabId || null });
+  if (!tab?.id) {
+    return { ok: false, status: 0, code: "AMAZON_UPLOAD_CONTEXT_BLOCKED", textPreview: "Seller Central feeds tab is unavailable" };
+  }
+
+  await waitForSellerCentralTabComplete(tab.id);
+  const fileText = await stableFileObj.text();
+  const filename = stableFileObj.name || uploadParams.filename || "confirmShipment.txt";
+  const contentType = stableFileObj.type || uploadParams.contentType || "text/tab-separated-values; charset=utf-8";
+  const selectors = getNativeUploadFormSelectors();
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    args: [fileText, filename, contentType, selectors],
+    func: async (fileTextArg, filenameArg, contentTypeArg, nativeSelectors) => {
+      const input = document.querySelector(nativeSelectors.fileInput);
+      const submit = document.querySelector(nativeSelectors.submit);
+      if (!(input instanceof HTMLInputElement) || !(submit instanceof HTMLInputElement)) {
+        return { ok: false, status: 0, code: "AMAZON_NATIVE_UPLOAD_CONTROL_MISSING", textPreview: "Seller Central native upload controls are unavailable" };
+      }
+
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([fileTextArg], filenameArg, { type: contentTypeArg }));
+      try {
+        input.files = transfer.files;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      } catch (error) {
+        return { ok: false, status: 0, code: "AMAZON_NATIVE_FILE_ASSIGN_FAILED", textPreview: error?.message || String(error) };
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      if (submit.disabled) {
+        return { ok: false, status: 0, code: "AMAZON_NATIVE_UPLOAD_NOT_ENABLED", textPreview: "Seller Central did not enable Upload now after the file change" };
+      }
+
+      let settled = false;
+      let resolveNetwork;
+      const networkResult = new Promise((resolve) => { resolveNetwork = resolve; });
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        resolveNetwork(value);
+      };
+      const nativeFetch = window.fetch;
+      const nativeXhrOpen = XMLHttpRequest.prototype.open;
+      const nativeXhrSend = XMLHttpRequest.prototype.send;
+      window.fetch = async function (...args) {
+        const response = await nativeFetch.apply(this, args);
+        try {
+          const text = await response.clone().text();
+          finish({ status: response.status, statusText: response.statusText, url: response.url, contentType: response.headers.get("content-type") || "", textPreview: text.slice(0, 1000) });
+        } catch { }
+        return response;
+      };
+      XMLHttpRequest.prototype.open = function (method, url, ...args) {
+        this.__apoNativeUploadUrl = String(url || "");
+        return nativeXhrOpen.call(this, method, url, ...args);
+      };
+      XMLHttpRequest.prototype.send = function (...args) {
+        this.addEventListener("loadend", () => {
+          try {
+            finish({
+              status: this.status,
+              statusText: this.statusText,
+              url: this.responseURL || this.__apoNativeUploadUrl || "",
+              contentType: this.getResponseHeader("content-type") || "",
+              textPreview: typeof this.responseText === "string" ? this.responseText.slice(0, 1000) : "",
+            });
+          } catch { }
+        }, { once: true });
+        return nativeXhrSend.apply(this, args);
+      };
+
+      try {
+        submit.click();
+        const outcome = await Promise.race([
+          networkResult,
+          new Promise((resolve) => setTimeout(() => resolve(null), 30000)),
+        ]);
+        if (!outcome) {
+          return { ok: false, status: 0, code: "AMAZON_NATIVE_UPLOAD_UNCONFIRMED", textPreview: "Seller Central did not expose an upload response within 30 seconds" };
+        }
+        let json = null;
+        try { json = JSON.parse(outcome.textPreview || ""); } catch { }
+        return {
+          ok: outcome.status >= 200 && outcome.status < 300,
+          ...outcome,
+          json,
+          jsonParseOk: json !== null,
+          csrfIncluded: true,
+          csrfSource: "nativeSellerCentralForm",
+          csrfTokenLength: 0,
+          nativeUi: true,
+        };
+      } finally {
+        window.fetch = nativeFetch;
+        XMLHttpRequest.prototype.open = nativeXhrOpen;
+        XMLHttpRequest.prototype.send = nativeXhrSend;
+      }
+    },
+  });
+  return { ...(res?.result || {}), world: "MAIN" };
+}
+
 function sellerCentralTabUploadResultToResponse(result = {}) {
   const contentType = result.contentType || "";
   const textBody = result.textPreview || "";
@@ -3957,48 +4064,10 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
       );
     }
 
-    const readiness = await getUploadFeedReadinessStatus({
-      skipSellerCentralPreflight: true,
-      preflight,
-    });
-    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed readiness before request", {
-      ok: readiness.ok,
-      sellerCentralReady: readiness.sellerCentralReady,
-      csrfCacheValid: readiness.csrfCacheValid,
-      csrfTokenFound: readiness.csrfTokenFound,
-      csrfTokenLength: readiness.csrfTokenLength,
-      csrfSource: readiness.csrfSource || "none",
-      csrfAgeMin: readiness.csrfAgeMin,
-      isTestToken: readiness.isTestToken,
-      needLogin: readiness.needLogin,
-      needCsrfSeed: readiness.needCsrfSeed,
-    }, readiness.ok ? "success" : "error");
-
-    if (!readiness.sellerCentralReady) {
-      throw createAmazonUploadError(
-        "AMAZON_AUTH_REQUIRED",
-        "Amazon Seller Central feeds page is not ready for upload. Log in, clear any OTP/captcha/marketplace selector, then retry.",
-        { preflight, retryable: true, userActionRequired: true }
-      );
-    }
-
-    if (!readiness.csrfCacheValid) {
-      if (readiness.csrfTokenFound) {
-        await clearUploadFeedCsrfCache("csrf_cache_invalid_before_upload", {
-          code: "AMAZON_UPLOAD_CSRF_SEED_REQUIRED",
-          status: 0,
-        });
-      }
-      throw createAmazonUploadError(
-        "AMAZON_UPLOAD_CSRF_SEED_REQUIRED",
-        "Open Seller Central feeds page and perform one manual upload to seed uploadFeed csrfToken.",
-        {
-          retryable: true,
-          userActionRequired: true,
-          event: "csrf_seed_required",
-        }
-      );
-    }
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] native Seller Central upload is ready", {
+      sellerCentralReady: preflight.allowUpload,
+      strategy: "nativeSellerCentralForm",
+    }, "success");
 
     const cookieFlags = {
       sessionId: !!(await getCookie(`${SC_BASE}/`, "session-id")),
@@ -4011,8 +4080,8 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
     }
 
     logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 08 FormData contract expected", {
-      fields: "feedFile|feedName|feedVersion|csrfToken",
-      csrfExpected: true,
+      fields: "native #fileToUpload + input[name=upload]",
+      csrfExpected: false,
       csrfHeaderIncluded: false,
       finalTsvHeader,
       finalTsvFirstDataLine,
@@ -4032,12 +4101,12 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
       tsvChecksum: finalTsvChecksum,
     });
     logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 10 request sending", {
-      strategy: "sellerCentralTabPageContext",
-      uploadPath: AMAZON_UPLOADFEED_URL_PATH,
+      strategy: "nativeSellerCentralForm",
+      uploadPath: "Seller Central UI handler",
       filename: stableFileObj.name,
     });
 
-    pageUploadResult = await uploadToAmazonFromSellerCentralTab(stableFileObj, {
+    pageUploadResult = await uploadToAmazonViaNativeSellerCentralForm(stableFileObj, {
       ...uploadParams,
       sellerCentralTabId: dedicatedSellerCentralTab?.id || null,
     });

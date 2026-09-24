@@ -5,6 +5,7 @@ import {
   buildSafeUploadFeedCsrfDiagnostic,
   canSubmitAmazonRow,
   getReadOnlyUploadFeedWarmupSelectors,
+  getNativeUploadFormSelectors,
   summarizeNativeUploadForm,
   shouldNavigateSellerCentralFeedsTab,
   selectReadOnlyUploadFeedCsrfCapture,
@@ -74,6 +75,13 @@ test("keeps native upload diagnostics to structural metadata", () => {
       availableControls: ["Download Template", "Upload now"],
     },
   );
+});
+
+test("targets the native Seller Central file input and submit control", () => {
+  assert.deepEqual(getNativeUploadFormSelectors(), {
+    fileInput: "#fileToUpload",
+    submit: 'input[name="upload"][type="submit"]',
+  });
 });
 
 test("keeps CSRF diagnostics metadata-only", () => {
