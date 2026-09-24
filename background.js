@@ -20,9 +20,9 @@ import {
 import { shouldCloseAutoCreatedAdsTab } from "./lib/ads-task-tab-policy.js";
 import { shouldReconnectSocket } from "./lib/socket-reconnect-policy.js";
 import {
+  buildAmazonFeedDoneEvent,
   findNewAmazonFeedRow,
   nextAmazonFeedWatchState,
-  parseAmazonProcessingReport,
 } from "./lib/amazon-feed-history.js";
 
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
@@ -2221,13 +2221,11 @@ async function pollAmazonFeedWatch(watch) {
     if (next.action === "fetch_report") {
       if (!row.reportHref) return;
       const reportText = await readAmazonProcessingReport(tab.id, row.reportHref);
-      const report = parseAmazonProcessingReport(reportText);
-      const ack = await reportAmazonFeedStatus({
+      const ack = await reportAmazonFeedStatus(buildAmazonFeedDoneEvent({
         batchId: next.batchId,
         amazonBatchId: next.amazonBatchId,
-        ...report,
         reportText,
-      });
+      }));
       if (!ack?.ok || !ack?.terminal) return;
       await reportAmazonFeedTaskTerminal(next, ack.status);
       await removeAmazonFeedWatch(next.batchId);

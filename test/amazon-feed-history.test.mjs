@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildAmazonFeedDoneEvent,
   findNewAmazonFeedRow,
   nextAmazonFeedWatchState,
   parseAmazonProcessingReport,
@@ -37,6 +38,17 @@ Number of records with warnings: 0`);
     errorCount: 0,
     warningCount: 0,
   });
+});
+
+test("uses the history row as Done even when the downloaded report omits Status", () => {
+  const event = buildAmazonFeedDoneEvent({
+    batchId: "batch-1",
+    amazonBatchId: "93703020720",
+    reportText: "Number of records processed from this upload: 1\nNumber of records that were activated: 1\nNumber of records with errors: 0\nNumber of records with warnings: 0",
+  });
+
+  assert.equal(event.status, "done");
+  assert.equal(event.recordsActivated, 1);
 });
 
 test("preserves a resumed watch as polling-only", () => {
