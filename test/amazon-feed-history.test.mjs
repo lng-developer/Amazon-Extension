@@ -9,9 +9,10 @@ import {
   shouldRefreshAmazonFeedHistory,
 } from "../lib/amazon-feed-history.js";
 
-test("refreshes only the dedicated feed tab created for an upload watch", () => {
-  assert.equal(shouldRefreshAmazonFeedHistory({ createdDedicatedTab: true }), true);
-  assert.equal(shouldRefreshAmazonFeedHistory({ createdDedicatedTab: false }), false);
+test("reloads only a dedicated feed tab when an alarm polls it", () => {
+  assert.equal(shouldRefreshAmazonFeedHistory({ createdDedicatedTab: true }, "alarm"), true);
+  assert.equal(shouldRefreshAmazonFeedHistory({ createdDedicatedTab: true }, "initial"), false);
+  assert.equal(shouldRefreshAmazonFeedHistory({ createdDedicatedTab: false }, "alarm"), false);
 });
 
 test("selects the upload-history row that did not exist before submission", () => {

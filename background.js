@@ -44,7 +44,7 @@ let importOrdersInProgress = false;
 const SOCKET_RECONNECT_ALARM = "SOCKET_RECONNECT";
 const SOCKET_RECONNECT_PERIOD_MINUTES = 1;
 const AMAZON_FEED_WATCH_ALARM = "AMAZON_FEED_WATCH";
-const AMAZON_FEED_WATCH_PERIOD_MINUTES = 0.5;
+const AMAZON_FEED_WATCH_PERIOD_MINUTES = 1;
 const AMAZON_FEED_WATCHES_KEY = "amazonFeedWatches";
 
 // Global logger instance
@@ -2130,23 +2130,11 @@ async function readAmazonFeedHistory(tabId) {
   return result?.result || [];
 }
 
-async function refreshAmazonFeedHistory(tabId) {
-  const [result] = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: "MAIN",
-    func: () => {
-      const refreshControl = [...document.querySelectorAll('button, input[type="button"], input[type="submit"]')]
-        .find((element) => String(element.value || element.textContent || "").trim().toLowerCase() === "refresh");
-      if (!refreshControl || refreshControl.disabled) return { clicked: false };
-      refreshControl.click();
-      return { clicked: true };
-    },
-  });
-  if (result?.result?.clicked) {
-    await waitForSellerCentralTabComplete(tabId);
-    await delayMs(300);
-  }
-  return result?.result || { clicked: false };
+async function reloadAmazonFeedHistoryTab(tabId) {
+  await chrome.tabs.reload(tabId);
+  const completed = await waitForSellerCentralTabComplete(tabId);
+  await delayMs(300);
+  return { reloaded: true, completed };
 }
 
 async function readAmazonProcessingReport(tabId, reportHref) {
@@ -2218,14 +2206,22 @@ async function reportAmazonFeedTaskTerminal(watch, status) {
   });
 }
 
-async function pollAmazonFeedWatch(watch) {
+async function pollAmazonFeedWatch(watch, { source = "initial" } = {}) {
   let tab = null;
   try {
     tab = watch.sellerCentralTabId ? await chrome.tabs.get(watch.sellerCentralTabId).catch(() => null) : null;
     if (!tab) tab = await findOrOpenSellerCentralFeedsTab({ dedicated: true, active: false });
     if (!tab?.id) return;
     await waitForSellerCentralTabComplete(tab.id);
-    if (shouldRefreshAmazonFeedHistory(watch)) await refreshAmazonFeedHistory(tab.id);
+    if (shouldRefreshAmazonFeedHistory(watch, source)) {
+      const reload = await reloadAmazonFeedHistoryTab(tab.id);
+      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] Amazon feed history reloaded", {
+        batchId: watch.batchId,
+        tabId: tab.id,
+        source,
+        completed: reload.completed,
+      }, reload.completed ? "success" : "error");
+    }
     const rows = await readAmazonFeedHistory(tab.id);
     const row = watch.amazonBatchId
       ? rows.find((item) => String(item.amazonBatchId) === String(watch.amazonBatchId))
@@ -2265,9 +2261,9 @@ async function pollAmazonFeedWatch(watch) {
   }
 }
 
-async function pollAmazonFeedWatches() {
+async function pollAmazonFeedWatches({ source = "alarm" } = {}) {
   const watches = await getAmazonFeedWatches();
-  await Promise.all(Object.values(watches).map((watch) => pollAmazonFeedWatch(watch)));
+  await Promise.all(Object.values(watches).map((watch) => pollAmazonFeedWatch(watch, { source })));
 }
 
 function sellerCentralTabUploadResultToResponse(result = {}) {
@@ -5841,7 +5837,7 @@ async function handleServerTask(task) {
               await saveAmazonFeedWatch(watch);
               await reportAmazonFeedStatus({ batchId: payload.batchId, status: "submitted" });
               deferTaskCompletion = true;
-              await pollAmazonFeedWatch(watch);
+              await pollAmazonFeedWatch(watch, { source: "initial" });
 
               if (extensionLogger) {
                 const uploadEndTime = Date.now();
@@ -6839,7 +6835,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       safeLogConnectionStatus("reconnect_failed", { source: "alarm", error: error?.message }, `Socket alarm reconnect failed: ${error?.message || error}`);
     });
   }
-  if (alarm.name === AMAZON_FEED_WATCH_ALARM) pollAmazonFeedWatches();
+  if (alarm.name === AMAZON_FEED_WATCH_ALARM) pollAmazonFeedWatches({ source: "alarm" });
 });
 
 // ── Khởi động tự động khi background script load ──
@@ -6850,7 +6846,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     ensureSocketReconnectAlarm();
     await ensureAmazonFeedWatchAlarm();
     await reconnectSocketIfNeeded("service_worker_start");
-    await pollAmazonFeedWatches();
+    await pollAmazonFeedWatches({ source: "startup" });
     debugLog("✅ [INIT] Legacy extension schedules cleared; waiting for backend tasks", "success");
   } catch (e) {
     debugLog(`❌ [INIT] Could not clear legacy schedules: ${e.message}`, "error");
