@@ -5,6 +5,7 @@ import {
   buildSafeUploadFeedCsrfDiagnostic,
   canSubmitAmazonRow,
   getReadOnlyUploadFeedWarmupSelectors,
+  summarizeNativeUploadForm,
   shouldNavigateSellerCentralFeedsTab,
   selectReadOnlyUploadFeedCsrfCapture,
   shouldCloseDedicatedUploadFeedTab,
@@ -53,6 +54,23 @@ test("keeps the active feeds page intact during a readiness check", () => {
       targetUrl: "https://sellercentral.amazon.com/order-reports-and-feeds/feeds",
     }),
     false,
+  );
+});
+
+test("keeps native upload diagnostics to structural metadata", () => {
+  assert.deepEqual(
+    summarizeNativeUploadForm({
+      action: "https://sellercentral.amazon.com/order-reports-and-feeds/api/uploadFeed",
+      method: "post",
+      fileInputCount: 1,
+      submitControls: ["Upload now"],
+    }),
+    {
+      actionPath: "/order-reports-and-feeds/api/uploadFeed",
+      method: "POST",
+      fileInputCount: 1,
+      submitControls: ["Upload now"],
+    },
   );
 });
 

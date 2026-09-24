@@ -14,6 +14,7 @@ import {
   selectReadOnlyUploadFeedCsrfCapture,
   shouldCloseDedicatedUploadFeedTab,
   shouldNavigateSellerCentralFeedsTab,
+  summarizeNativeUploadForm,
 } from "./lib/upload-feed-task-tab-policy.js";
 import { shouldCloseAutoCreatedAdsTab } from "./lib/ads-task-tab-policy.js";
 import { shouldReconnectSocket } from "./lib/socket-reconnect-policy.js";
@@ -991,6 +992,19 @@ async function logUploadFeedCsrfDiagnostic(tabId) {
         sessionStorageKeys: keysMatching(sessionStorage),
         windowKeys: Object.keys(window).filter((key) => /csrf|token/i.test(key)),
         scriptMentionsCsrf: Array.from(document.scripts || []).some((script) => /csrf/i.test(script.textContent || "")),
+        nativeUploadForm: (() => {
+          const fileInput = document.querySelector('input[type="file"]');
+          const form = fileInput?.closest("form") || null;
+          return {
+            action: form?.action || "",
+            method: form?.method || "",
+            fileInputCount: document.querySelectorAll('input[type="file"]').length,
+            submitControls: Array.from(form?.querySelectorAll('button, input[type="submit"]') || [])
+              .map((element) => element.getAttribute("aria-label") || element.value || element.textContent || "")
+              .map((value) => value.trim())
+              .filter(Boolean),
+          };
+        })(),
       };
     },
   }).catch(() => []);
@@ -999,6 +1013,10 @@ async function logUploadFeedCsrfDiagnostic(tabId) {
     page: pageResult?.result || {},
   });
   logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF read-only diagnostic", diagnostic);
+  logUploadTrackingDiagnostic(
+    "[UPLOAD_TRACKING] native upload form diagnostic",
+    summarizeNativeUploadForm(pageResult?.result?.nativeUploadForm),
+  );
 }
 
 async function installUploadFeedCsrfSniffer(tabId) {
@@ -1706,6 +1724,7 @@ async function getUploadFeedReadinessStatus(options = {}) {
 
   const sellerCentralReady = options.skipSellerCentralPreflight && !preflight ? true : !!preflight?.allowUpload;
   const sellerCentralTabId = preflight?.tabId || null;
+  if (sellerCentralTabId) await logUploadFeedCsrfDiagnostic(sellerCentralTabId);
   const sellerCentralUrl = preflight?.finalUrl || "";
   const sellerCentralTitle = preflight?.pageTitle || "";
   const needLogin = !!(preflight && (
