@@ -34,7 +34,7 @@ function logLevel(message, level) {
 function renderRuntimeLog() {
   const box = $("#log");
   if (!box) return;
-  box.replaceChildren(...runtimeEntries.map((entry) => {
+  box.replaceChildren(...runtimeEntries.slice().reverse().map((entry) => {
     const row = document.createElement("div");
     row.className = `runtime-entry ${entry.level}`;
     const dot = document.createElement("span"); dot.className = "runtime-dot";
@@ -44,7 +44,7 @@ function renderRuntimeLog() {
     if (entry.count > 1) { const count = document.createElement("span"); count.className = "runtime-count"; count.textContent = `×${entry.count}`; row.append(count); }
     return row;
   }));
-  box.scrollTop = box.scrollHeight;
+  box.scrollTop = 0;
 }
 
 function persistRuntimeLogEntry(message, level) {
@@ -413,87 +413,6 @@ on($("#btnOpenAmazon"), "click", async () => {
     log("   3. Navigate to Order Reports");
     log("   4. Come back and test upload");
   }
-});
-
-/* ========== Auto Config Modal ========== */
-
-const TYPE_LABEL = {
-  IMPORT_ORDER:    "📦 Import Orders",
-  IMPORT_FBM:      "🚚 Import FBM",
-  IMPORT_ADS:      "📈 Import Ads",
-  UPLOAD_TRACKING: "📤 Upload Tracking",
-  PULL_TRACKING:   "🔄 Pull Tracking",
-};
-
-let _autoConfigTimer = null;
-
-function renderAutoConfigList(records) {
-  const list = $("#autoConfigList");
-  if (!list) return;
-  if (!records.length) {
-    list.innerHTML = '<div style="color:#9ca3af;font-size:12px;text-align:center;padding:20px;">Khong co du lieu</div>';
-    return;
-  }
-  list.innerHTML = records.map(r => {
-    const statusColor = r.status ? "#16a34a" : "#dc2626";
-    const statusText  = r.status ? "Bat" : "Tat";
-    const label       = TYPE_LABEL[r.type] || r.type;
-    const updatedAt   = new Date(r.updated_at).toLocaleString("vi-VN");
-    return '<div style="border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;">'
-      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
-      + '<span style="font-weight:700;font-size:12px;color:#374151;">' + label + '</span>'
-      + '<span style="font-size:12px;font-weight:600;color:' + statusColor + ';">' + statusText + '</span>'
-      + '</div>'
-      + '<div style="font-size:11px;color:#6b7280;display:flex;flex-direction:column;gap:2px;">'
-      + '<span>Shop: <b style="color:#111827;">' + r.shopName + '</b></span>'
-      + '<span>Interval: <b style="color:#111827;">' + r.time + ' phut</b></span>'
-      + '<span>' + r.describe + '</span>'
-      + '<span>Cap nhat: ' + updatedAt + '</span>'
-      + '</div></div>';
-  }).join("");
-}
-
-async function loadAutoConfig() {
-  try {
-    const { ingestUrl = "", shopId = "" } = await chrome.storage.local.get(["ingestUrl", "shopId"]);
-    if (!ingestUrl || !shopId) return log("Chua co API Base URL hoac Shop ID");
-
-    const list = $("#autoConfigList");
-    if (list) list.innerHTML = `<div style="color:#9ca3af;font-size:12px;text-align:center;padding:20px;">Dang tai...</div>`;
-
-    const res = await fetch(`${ingestUrl}/api/auto-config?shopId=${shopId}`);
-    const json = await res.json();
-    if (!json.success) return log("API tra loi:", JSON.stringify(json));
-
-    const records = (json.data || []).filter(r => r.shopId === shopId);
-    renderAutoConfigList(records);
-    log("✅ Auto config da duoc cap nhat");
-  } catch (e) {
-    log("Auto Config load error:", e?.message || e);
-    const list = $("#autoConfigList");
-    if (list) list.innerHTML = `<div style="color:#dc2626;font-size:12px;text-align:center;padding:20px;">Loi tai du lieu</div>`;
-  }
-}
-
-
-on($("#btnAutoConfig"), "click", async () => {
-  clearInterval(_autoConfigTimer);
-  const overlay = $("#autoConfigOverlay");
-  if (overlay) overlay.style.display = "flex";
-  await loadAutoConfig();
-  _autoConfigTimer = setInterval(async () => {
-    log("🔄 [Auto Config] Auto refresh...");
-    await loadAutoConfig();
-  }, 5 * 60 * 1000);
-});
-
-on($("#reloadAutoConfig"), "click", () => loadAutoConfig());
-
-on($("#closeAutoConfig"), "click", () => {
-  const overlay = $("#autoConfigOverlay");
-  if (overlay) overlay.style.display = "none";
-  clearInterval(_autoConfigTimer);
-  _autoConfigTimer = null;
 });
 
 /* ========== Nhận cập nhật từ background ========== */

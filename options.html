@@ -30,8 +30,8 @@
         <section id="panel-operations" class="tab-panel is-active" role="tabpanel" aria-labelledby="tab-operations" data-panel="operations">
           <div class="status-card"><span class="status-icon">✓</span><div><strong>Sẵn sàng nhận task</strong><p>Socket tự kết nối lại khi extension khởi động hoặc mất kết nối.</p></div></div>
           <section class="surface-card">
-            <div class="section-heading"><div><h2>Vận hành nhanh</h2><p>Kết nối extension hoặc xem lịch chạy của shop.</p></div></div>
-            <div class="button-stack"><button id="btnSocketConnect" class="btn btn-primary" type="button">Kết nối Socket</button><button id="btnAutoConfig" class="btn btn-secondary" type="button">Xem Auto Config</button></div>
+            <div class="section-heading"><div><h2>Vận hành nhanh</h2><p>Kết nối extension để nhận task từ backend.</p></div></div>
+            <div class="button-stack"><button id="btnSocketConnect" class="btn btn-primary" type="button">Kết nối Socket</button></div>
           </section>
         </section>
 
@@ -60,10 +60,6 @@
 
       <div id="configOverlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="config-title">
         <section class="modal-box"><div class="modal-header"><div><p class="modal-kicker">Thiết lập extension</p><h2 id="config-title">Cấu hình kết nối</h2></div><button id="closeConfig" class="icon-button" type="button" aria-label="Đóng cấu hình">✕</button></div><div class="field-grid"><label>API Base URL<input id="ingestUrl" placeholder="https://api.lngmerch.co" /></label><label>Shop ID<input id="shopId" placeholder="Shop ID" /></label></div><button id="saveBtn" class="btn btn-primary modal-action" type="button">Lưu cấu hình</button></section>
-      </div>
-
-      <div id="autoConfigOverlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="auto-config-title">
-        <section class="modal-box"><div class="modal-header"><div><p class="modal-kicker">Configuration center</p><h2 id="auto-config-title">Auto Config</h2></div><button id="closeAutoConfig" class="icon-button" type="button" aria-label="Đóng Auto Config">✕</button></div><div id="autoConfigList" class="modal-list"><div class="modal-loading">Đang tải cấu hình...</div></div><button id="reloadAutoConfig" class="btn btn-primary modal-action" type="button">Tải lại cấu hình</button></section>
       </div>
     </div>
     <script type="module" src="options.js"></script>

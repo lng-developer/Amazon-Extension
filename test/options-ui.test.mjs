@@ -35,3 +35,13 @@ test("popup can open the same control surface in a full-page tab", () => {
   assert.match(popupScript, /options\.html\?view=full/);
   assert.match(popupCss, /\.is-full-page/);
 });
+
+test("runtime log renders the newest entry at the top", () => {
+  assert.match(popupScript, /runtimeEntries\.slice\(\)\.reverse\(\)\.map/);
+  assert.match(popupScript, /box\.scrollTop = 0/);
+});
+
+test("popup does not expose legacy Auto Config controls", () => {
+  assert.doesNotMatch(popupHtml, /btnAutoConfig|autoConfigOverlay/);
+  assert.doesNotMatch(popupScript, /loadAutoConfig|_autoConfigTimer/);
+});
