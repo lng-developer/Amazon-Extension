@@ -119,6 +119,54 @@ function previewEndpoints() {
   if (!base) log("⚠️ Nhập API Base URL (ví dụ: https://api.lngmerch.co)");
 }
 
+function activatePopupTab(tabName) {
+  const selected = String(tabName || "operations");
+  document.querySelectorAll("[data-tab]").forEach((button) => {
+    const active = button.dataset.tab === selected;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+  });
+  document.querySelectorAll("[data-panel]").forEach((panel) => {
+    const active = panel.dataset.panel === selected;
+    panel.classList.toggle("is-active", active);
+    panel.hidden = !active;
+  });
+}
+
+function initPopupTabs() {
+  const tabs = [...document.querySelectorAll("[data-tab]")];
+  tabs.forEach((tab, index) => {
+    on(tab, "click", () => activatePopupTab(tab.dataset.tab));
+    on(tab, "keydown", (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const nextIndex = event.key === 'Home' ? 0
+        : event.key === 'End' ? tabs.length - 1
+          : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+      tabs[nextIndex].focus();
+      activatePopupTab(tabs[nextIndex].dataset.tab);
+    });
+  });
+}
+
+function toggleOverlay(id, open) {
+  const overlay = $(id);
+  if (overlay) overlay.style.display = open ? "flex" : "none";
+}
+
+if (new URLSearchParams(location.search).get("view") === "full") {
+  document.documentElement.classList.add("is-full-page");
+  document.body.classList.add("is-full-page");
+}
+
+initPopupTabs();
+on($("#btnOpenDashboard"), "click", async () => {
+  await chrome.tabs.create({ url: chrome.runtime.getURL("options.html?view=full") });
+});
+on($("#btnOpenConfig"), "click", () => toggleOverlay("#configOverlay", true));
+on($("#closeConfig"), "click", () => toggleOverlay("#configOverlay", false));
+
 /* ========== Init ========== */
 document.addEventListener("DOMContentLoaded", async () => {
   try {
@@ -202,6 +250,7 @@ on($("#saveBtn"), "click", async () => {
     await chrome.storage.local.set({ ingestUrl, shopId });
     log("Saved config", { ingestUrl, shopId });
     previewEndpoints();
+    toggleOverlay("#configOverlay", false);
   } catch (e) {
     log("Save error:", e?.message || e);
   }

@@ -2,176 +2,70 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>APO LNG - Control Panel</title>
+    <title>APO Control</title>
     <link rel="stylesheet" href="options.css" />
   </head>
-
   <body>
     <div class="app-shell">
-
-      <!-- HERO HEADER -->
-      <section class="hero">
-        <div class="hero-left">
+      <header class="app-header">
+        <div class="brand">
           <div class="brand-mark">LNG</div>
-          <div>
-            <div class="eyebrow">Amazon / Etsy Automation</div>
-            <h1>APO Control</h1>
-          </div>
+          <div><p class="eyebrow">Automation control</p><h1>APO Control</h1></div>
         </div>
-
-        <div class="hero-right">
-          <span class="status-dot"></span>
-          <span class="version-badge">v3.2-Test</span>
+        <div class="header-actions">
+          <span class="connection-badge"><i></i> Sẵn sàng</span>
+          <button id="btnOpenDashboard" class="icon-button" type="button" title="Mở màn hình rộng" aria-label="Mở màn hình rộng">↗</button>
+          <button id="btnOpenConfig" class="icon-button" type="button" title="Cấu hình" aria-label="Mở cấu hình">⚙</button>
         </div>
-      </section>
+      </header>
 
-      <!-- CONFIG PANEL -->
-      <section class="panel panel-config">
-        <div class="panel-header">
-          <div>
-            <h2>System Configuration</h2>
-            <p>Thiết lập API, shop và kết nối extension.</p>
-          </div>
-          <span class="panel-icon">⚙️</span>
-        </div>
+      <nav class="app-tabs" role="tablist" aria-label="Điều hướng APO Control">
+        <button id="tab-operations" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="panel-operations" data-tab="operations">Vận hành</button>
+        <button id="tab-ads" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-ads" data-tab="ads">Ads</button>
+        <button id="tab-upload" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-upload" data-tab="upload">Upload tracking</button>
+        <button id="tab-logs" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="panel-logs" data-tab="logs">Nhật ký</button>
+      </nav>
 
-        <div class="field-grid">
-          <div class="field">
-            <label>API Base URL</label>
-            <input id="ingestUrl" placeholder="https://api.lngmerch.co" />
-          </div>
+      <main class="tab-content">
+        <section id="panel-operations" class="tab-panel is-active" role="tabpanel" aria-labelledby="tab-operations" data-panel="operations">
+          <div class="status-card"><span class="status-icon">✓</span><div><strong>Sẵn sàng nhận task</strong><p>Socket tự kết nối lại khi extension khởi động hoặc mất kết nối.</p></div></div>
+          <section class="surface-card">
+            <div class="section-heading"><div><h2>Vận hành nhanh</h2><p>Kết nối extension hoặc xem lịch chạy của shop.</p></div></div>
+            <div class="button-stack"><button id="btnSocketConnect" class="btn btn-primary" type="button">Kết nối Socket</button><button id="btnAutoConfig" class="btn btn-secondary" type="button">Xem Auto Config</button></div>
+          </section>
+        </section>
 
-          <div class="field">
-            <label>Shop ID</label>
-            <input id="shopId" placeholder="6881aba9c1bbdfc541b5cd4d" />
-          </div>
-        </div>
+        <section id="panel-ads" class="tab-panel" role="tabpanel" aria-labelledby="tab-ads" data-panel="ads" hidden>
+          <section class="surface-card">
+            <div class="section-heading"><div><h2>Ads</h2><p>Chọn khoảng ngày trước khi preview hoặc import.</p></div><span class="section-tag">AMZ</span></div>
+            <div class="date-grid"><label>Từ ngày<input id="adsPreviewStartDate" type="date" aria-label="Ads start date" /></label><label>Đến ngày<input id="adsPreviewEndDate" type="date" aria-label="Ads end date" /></label></div>
+            <div class="button-stack button-stack-three"><button id="btnPreviewAds" class="btn btn-secondary" type="button">Preview</button><button id="btnDryRunAds" class="btn btn-secondary" type="button">Dry-run</button><button id="btnImportAds" class="btn btn-primary" type="button">Import vào LNG</button></div>
+            <pre id="adsPreviewResult" class="preview-output" aria-live="polite">Preview chỉ đọc Amazon. Dry-run không lưu dữ liệu. Import vào LNG cần xác nhận.</pre>
+          </section>
+        </section>
 
-        <div class="action-grid">
-          <button id="saveBtn" class="btn btn-primary">
-            <span>💾</span>
-            Save Config
-          </button>
+        <section id="panel-upload" class="tab-panel" role="tabpanel" aria-labelledby="tab-upload" data-panel="upload" hidden>
+          <section class="surface-card">
+            <div class="section-heading"><div><h2>Amazon Upload Tracking</h2><p>Kiểm tra trạng thái Seller Central trước khi gửi feed.</p></div><span class="section-tag">TSV</span></div>
+            <div class="button-stack"><button id="btnCheckUploadFeedReadiness" class="btn btn-primary" type="button">Kiểm tra sẵn sàng</button><button id="btnDownloadFinalTsv" class="btn btn-secondary" type="button">Tải Final TSV</button></div>
+            <div id="finalTsvFallbackBox" class="final-tsv" style="display:none;"><label for="finalTsvFallbackText">Final TSV</label><textarea id="finalTsvFallbackText" rows="8"></textarea><button id="btnCopyFinalTsv" class="btn btn-secondary" type="button">Sao chép TSV</button></div>
+            <details class="advanced-tools"><summary>UploadFeed Debug (công cụ nâng cao)</summary><div class="debug-actions"><button id="btnInstallUploadFeedSniffer" class="btn btn-quiet" type="button">Install Sniffer</button><button id="btnVerifyUploadFeedSniffer" class="btn btn-quiet" type="button">Verify Sniffer</button><button id="btnCheckUploadFeedCache" class="btn btn-quiet" type="button">Check Cache</button><button id="btnClearUploadFeedCache" class="btn btn-quiet" type="button">Clear Cache</button><button id="btnSocketResetBusy" class="btn btn-quiet" type="button">Reset Busy Lock</button></div></details>
+          </section>
+        </section>
 
-          <button id="btnSocketConnect" class="btn btn-dark">
-            <span>🔌</span>
-            Connect Socket
-          </button>
+        <section id="panel-logs" class="tab-panel" role="tabpanel" aria-labelledby="tab-logs" data-panel="logs" hidden>
+          <section class="surface-card log-card"><div class="section-heading"><div><h2>Runtime log</h2><p>50 sự kiện gần nhất trên extension này.</p></div><button id="clearRuntimeLog" class="text-button" type="button">Xóa log</button></div><div id="log" class="runtime-feed" role="log" aria-live="polite"></div></section>
+        </section>
+      </main>
 
-          <button id="btnAutoConfig" class="btn btn-outline">
-            <span>⚙️</span>
-            Auto Config
-          </button>
-        </div>
-
-        <p class="hint">Socket tự kết nối lại ở chế độ nền khi extension khởi động hoặc mất kết nối.</p>
-      </section>
-
-      <section class="panel">
-        <div class="panel-header compact">
-          <div>
-            <h2>Ads Preview</h2>
-            <p>Kéo đủ report, chỉ tổng hợp tại extension; không gửi hoặc lưu vào LNG.</p>
-          </div>
-          <span class="panel-icon">AD</span>
-        </div>
-        <div class="inline-control">
-          <label class="sr-only" for="adsPreviewStartDate">Từ ngày</label>
-          <input id="adsPreviewStartDate" type="date" aria-label="Ads start date" />
-          <span class="range-separator" aria-hidden="true">—</span>
-          <label class="sr-only" for="adsPreviewEndDate">Đến ngày</label>
-          <input id="adsPreviewEndDate" type="date" aria-label="Ads end date" />
-          <button id="btnPreviewAds" class="btn btn-outline" type="button">Preview Full</button>
-          <button id="btnDryRunAds" class="btn btn-outline" type="button">Dry-run mapping</button>
-          <button id="btnImportAds" class="btn btn-primary" type="button">Import to LNG</button>
-        </div>
-        <pre id="adsPreviewResult" class="preview-output" aria-live="polite">Preview chỉ đọc Amazon. Dry-run mapping không lưu dữ liệu. Import to LNG cần xác nhận.</pre>
-      </section>
-
-      <!-- AUTO CONFIG MODAL -->
-      <div id="autoConfigOverlay" class="modal-overlay">
-        <div class="modal-box">
-          <div class="modal-header">
-            <div>
-              <span class="modal-kicker">Configuration Center</span>
-              <h3>Auto Config</h3>
-            </div>
-            <button id="closeAutoConfig" class="modal-close">✕</button>
-          </div>
-
-          <div id="autoConfigList" class="modal-list">
-            <div class="modal-loading">Đang tải cấu hình...</div>
-          </div>
-
-          <button id="reloadAutoConfig" class="btn btn-primary modal-action">
-            🔄 Reload Config
-          </button>
-        </div>
+      <div id="configOverlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="config-title">
+        <section class="modal-box"><div class="modal-header"><div><p class="modal-kicker">Thiết lập extension</p><h2 id="config-title">Cấu hình kết nối</h2></div><button id="closeConfig" class="icon-button" type="button" aria-label="Đóng cấu hình">✕</button></div><div class="field-grid"><label>API Base URL<input id="ingestUrl" placeholder="https://api.lngmerch.co" /></label><label>Shop ID<input id="shopId" placeholder="Shop ID" /></label></div><button id="saveBtn" class="btn btn-primary modal-action" type="button">Lưu cấu hình</button></section>
       </div>
 
-      <!-- LOG PANEL -->
-      <section class="panel panel-uploadfeed-debug">
-        <div class="panel-header compact">
-          <div>
-            <h2>UploadFeed Debug</h2>
-            <p>Seller Central uploadFeed CSRF sniffer tools.</p>
-          </div>
-          <span class="panel-icon">UF</span>
-        </div>
-
-        <div class="action-grid">
-          <button id="btnCheckUploadFeedReadiness" class="btn btn-outline">
-            Check Readiness
-          </button>
-
-          <button id="btnInstallUploadFeedSniffer" class="btn btn-outline">
-            Install Sniffer
-          </button>
-
-          <button id="btnVerifyUploadFeedSniffer" class="btn btn-outline">
-            Verify Sniffer
-          </button>
-
-          <button id="btnCheckUploadFeedCache" class="btn btn-outline">
-            Check Cache
-          </button>
-
-          <button id="btnClearUploadFeedCache" class="btn btn-outline">
-            Clear Cache
-          </button>
-
-          <button id="btnSocketResetBusy" class="btn btn-outline">
-            Socket Reset Busy
-          </button>
-
-          <button id="btnDownloadFinalTsv" class="btn btn-outline">
-            Download Final TSV
-          </button>
-        </div>
-
-        <div class="field" id="finalTsvFallbackBox" style="display:none;margin-top:12px;">
-          <label>Final upload tracking TSV fallback</label>
-          <textarea id="finalTsvFallbackText" rows="8" style="width:100%;font-family:monospace;font-size:11px;"></textarea>
-          <button id="btnCopyFinalTsv" class="btn btn-primary small" style="margin-top:8px;">
-            Copy TSV
-          </button>
-        </div>
-      </section>
-
-      <section class="panel panel-log">
-        <div class="panel-header compact">
-          <div>
-            <h2>Runtime Log</h2>
-            <p>Theo dõi trạng thái extension theo thời gian thực.</p>
-          </div>
-          <button id="clearRuntimeLog" class="panel-icon log-clear" type="button" title="Clear runtime log" aria-label="Clear runtime log">⌫</button>
-        </div>
-
-        <div id="log" class="runtime-feed" role="log" aria-live="polite"></div>
-      </section>
-
+      <div id="autoConfigOverlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="auto-config-title">
+        <section class="modal-box"><div class="modal-header"><div><p class="modal-kicker">Configuration center</p><h2 id="auto-config-title">Auto Config</h2></div><button id="closeAutoConfig" class="icon-button" type="button" aria-label="Đóng Auto Config">✕</button></div><div id="autoConfigList" class="modal-list"><div class="modal-loading">Đang tải cấu hình...</div></div><button id="reloadAutoConfig" class="btn btn-primary modal-action" type="button">Tải lại cấu hình</button></section>
+      </div>
     </div>
-
     <script type="module" src="options.js"></script>
   </body>
 </html>
