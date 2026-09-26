@@ -6,11 +6,21 @@ import {
   canSubmitAmazonRow,
   getReadOnlyUploadFeedWarmupSelectors,
   getNativeUploadFormSelectors,
+  normalizeShipDateForAmazonConfirmShipment,
   summarizeNativeUploadForm,
   shouldNavigateSellerCentralFeedsTab,
   selectReadOnlyUploadFeedCsrfCapture,
   shouldCloseDedicatedUploadFeedTab,
 } from "../lib/upload-feed-task-tab-policy.js";
+
+test("clamps a future ship date to the Los Angeles marketplace date", () => {
+  assert.equal(
+    normalizeShipDateForAmazonConfirmShipment("2026-09-26", {
+      now: new Date("2026-09-26T06:26:12.077Z"),
+    }),
+    "2026-09-25",
+  );
+});
 
 test("requires server-derived ship date before Amazon submission", () => {
   assert.equal(canSubmitAmazonRow({ tracking: "921", carrier: "USPS", shipDate: "" }), false);

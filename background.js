@@ -8,11 +8,14 @@
 
 import { io } from "./lib/socket.io.esm.min.js";
 import {
+  AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE,
   buildSafeUploadFeedCsrfDiagnostic,
   canSubmitAmazonRow,
+  formatDateYmdInTimeZone,
   getReadOnlyUploadFeedWarmupSelectors,
   getNativeUploadFormSelectors,
   selectReadOnlyUploadFeedCsrfCapture,
+  normalizeShipDateForAmazonConfirmShipment,
   shouldCloseDedicatedUploadFeedTab,
   shouldNavigateSellerCentralFeedsTab,
   summarizeNativeUploadForm,
@@ -1565,52 +1568,6 @@ async function refreshSellerCentralUploadAuth() {
   return csrfToken;
 }
 
-const AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE = "America/Los_Angeles";
-
-function formatDateYmdInTimeZone(date = new Date(), timeZone = AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE) {
-  const d = date instanceof Date ? date : new Date(date);
-  const safeDate = Number.isNaN(d.getTime()) ? new Date() : d;
-
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(safeDate);
-
-  const byType = Object.fromEntries(parts.map((p) => [p.type, p.value]));
-  return `${byType.year}-${byType.month}-${byType.day}`;
-}
-
-function compareYmd(a = "", b = "") {
-  return String(a || "").localeCompare(String(b || ""));
-}
-
-function normalizeShipDateForAmazonConfirmShipment(value = new Date(), options = {}) {
-  const now = options.now instanceof Date ? options.now : new Date();
-  const marketplaceToday = formatDateYmdInTimeZone(
-    now,
-    AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE
-  );
-
-  const raw = String(value || "").trim();
-  let candidate = "";
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-    candidate = raw;
-  } else {
-    const parsed = value instanceof Date ? value : new Date(raw || now);
-    candidate = Number.isNaN(parsed.getTime())
-      ? marketplaceToday
-      : formatDateYmdInTimeZone(parsed, AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE);
-  }
-
-  if (compareYmd(candidate, marketplaceToday) > 0) {
-    return marketplaceToday;
-  }
-
-  return candidate || marketplaceToday;
-}
 
 function isHtmlResponse(contentType = "", text = "") {
   const ct = String(contentType || "").toLowerCase();
@@ -2455,7 +2412,7 @@ function validateConfirmShipmentTsv(tsvContent = "") {
   const invalidRows = [];
   const normalizedShipDateRows = [];
   const shipDateNormalizationDetails = [];
-  const marketplaceToday = formatDateYmdInTimeZone(new Date(), AMAZON_CONFIRM_SHIPMENT_MARKETPLACE_TIME_ZONE);
+  const marketplaceToday = formatDateYmdInTimeZone(new Date());
   const shipDateIndex = indexByHeader["ship-date"];
 
   const normalizedRows = trimmedLines.slice(1).map((line, rowIndex) => {
@@ -2464,7 +2421,18 @@ function validateConfirmShipmentTsv(tsvContent = "") {
     const trackingNumber = cols[indexByHeader["tracking-number"]] || "";
     const carrierCode = cols[indexByHeader["carrier-code"]] || "UNKNOWN";
     const originalShipDate = cols[shipDateIndex] || "";
-    const normalizedShipDate = originalShipDate;
+    const normalizedShipDate = normalizeShipDateForAmazonConfirmShipment(originalShipDate);
+
+    if (normalizedShipDate !== originalShipDate) {
+      normalizedShipDateRows.push(rowIndex + 2);
+      shipDateNormalizationDetails.push({
+        rowNumber: rowIndex + 2,
+        originalShipDate,
+        normalizedShipDate,
+        clampedToMarketplaceToday: normalizedShipDate === marketplaceToday,
+      });
+      cols[shipDateIndex] = normalizedShipDate;
+    }
 
     if (!orderId || !canSubmitAmazonRow({ tracking: trackingNumber, carrier: carrierCode, shipDate: normalizedShipDate })) {
       invalidRows.push(rowIndex + 2);
