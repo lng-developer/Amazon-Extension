@@ -20,7 +20,10 @@ import {
   shouldNavigateSellerCentralFeedsTab,
   summarizeNativeUploadForm,
 } from "./lib/upload-feed-task-tab-policy.js";
-import { shouldCloseAutoCreatedAdsTab } from "./lib/ads-task-tab-policy.js";
+import {
+  shouldCloseAutoCreatedAdsTab,
+  shouldReloadDedicatedAdsTab,
+} from "./lib/ads-task-tab-policy.js";
 import { shouldReconnectSocket } from "./lib/socket-reconnect-policy.js";
 import {
   buildAmazonFeedDoneEvent,
@@ -3284,31 +3287,29 @@ async function ensureAdsTab({ active = false } = {}) {
   return { tabId: tab.id, created };
 }
 
+async function openDedicatedAdsTab() {
+  debugLog("🌐 [ADS-TAB] Opening dedicated Amazon Ads campaigns tab...", "info");
+  const tab = await chrome.tabs.create({ url: ADS_CAMPAIGNS_URL, active: true });
+  await waitForAdsTabComplete(tab.id);
+  const readyTab = await assertAdsTabAccessible(tab.id);
+  await chrome.windows.update(readyTab.windowId, { focused: true });
+  await chrome.tabs.update(tab.id, { active: true });
+  return { tabId: tab.id, created: true };
+}
+
 async function withForegroundAdsTab(fn) {
-  const tab = await ensureAdsTab({ active: true });
+  const tab = await openDedicatedAdsTab();
   // Keep the visible Campaigns UI long enough for Amazon to finish its own
   // charts/table requests before the report request is made.
   await delayMs(ADS_PAGE_SETTLE_MS);
   try {
-    const result = await fn();
-    if (tab.created) await chrome.tabs.remove(tab.tabId).catch(() => {});
-    return result;
-  } catch (error) {
-    // Keep a failed, auto-created tab visible so the user can resolve login/CSRF.
-    throw error;
-  }
-}
-
-async function withAutoCreatedAdsTab(fn) {
-  const tab = await ensureAdsTab();
-  try {
-    const result = await fn();
+    const result = await fn(tab);
     if (shouldCloseAutoCreatedAdsTab({ created: tab.created, completed: true })) {
       await chrome.tabs.remove(tab.tabId).catch(() => {});
     }
     return result;
   } catch (error) {
-    // Keep a failed, auto-created tab available for login/CSRF recovery.
+    // Keep a failed, auto-created tab visible so the user can resolve login/CSRF.
     throw error;
   }
 }
@@ -3438,7 +3439,8 @@ async function ensureAdsBridgeInjected(tabId) {
 }
 
 async function adsRetrieveViaContentScript(payload, options = {}) {
-  const { tabId } = await ensureAdsTab();
+  const tabId = options.adsTabId || (await ensureAdsTab()).tabId;
+  await assertAdsTabAccessible(tabId);
   await ensureAdsBridgeInjected(tabId);
 
   const sendOnce = () =>
@@ -3853,11 +3855,12 @@ async function previewAdsSpend(date) {
 async function previewAdsSpendRange(startDate, endDate = startDate) {
   const days = adsDaysBetween(startDate, endDate);
   return withAdsApiLock("PREVIEW_ADS_SPEND", async (lock) => {
-    return withForegroundAdsTab(async () => {
-      await ensureFreshAdsHeaders({ ...lock, reason: "previewAdsSpend" });
+    return withForegroundAdsTab(async (tab) => {
+      const requestOptions = { ...lock, adsTabId: tab.tabId };
+      await ensureFreshAdsHeaders({ ...requestOptions, reason: "previewAdsSpend" });
       const rows = [];
       for (const day of days) {
-        rows.push(...await fetchAllCampaignSpend(day, day, 300, false, lock));
+        rows.push(...await fetchAllCampaignSpend(day, day, 300, false, requestOptions));
       }
       return { ...summarizeAdsRows(rows, startDate, endDate), days: days.length };
     });
@@ -3886,11 +3889,12 @@ function adsTaskSummary(result) {
 async function runExportAdsSpendRange(startDate, endDate = startDate, options = {}) {
   const days = adsDaysBetween(startDate, endDate);
   return withAdsApiLock("IMPORT_ADS_SPEND", async (lock) => {
-    const run = async () => {
-      await ensureFreshAdsHeaders({ ...lock, reason: "runExportAdsSpendRange" });
+    const run = async (tab) => {
+      const requestOptions = { ...lock, adsTabId: tab.tabId };
+      await ensureFreshAdsHeaders({ ...requestOptions, reason: "runExportAdsSpendRange" });
       const results = [];
       for (const day of days) {
-        results.push(await runExportAdsSpendLocked(day, lock, { ...options, headersReady: true }));
+        results.push(await runExportAdsSpendLocked(day, requestOptions, { ...options, headersReady: true }));
       }
       return {
         ok: true,
@@ -3901,7 +3905,7 @@ async function runExportAdsSpendRange(startDate, endDate = startDate, options = 
         totalRows: results.reduce((total, result) => total + Number(result.rows || 0), 0),
       };
     };
-    return options.foreground ? withForegroundAdsTab(run) : withAutoCreatedAdsTab(run);
+    return withForegroundAdsTab(run);
   });
 }
 
@@ -4739,14 +4743,23 @@ async function forceRefreshAdsHeaders(options = {}) {
   debugLog(`🔄 [ADS-AUTH] Force refresh Ads headers — reason: ${reason}`, "info");
   extensionLogger?.logInfo("[ADS-AUTH] Force refresh Ads headers", { reason });
 
-  const { tabId } = await ensureAdsTab();
+  const tabId = options.adsTabId || (await openDedicatedAdsTab()).tabId;
+  await assertAdsTabAccessible(tabId);
   await ensureAdsBridgeInjected(tabId);
   await delayMs(ADS_PAGE_SETTLE_MS);
 
-  // A reload restarts this slow page and still does not guarantee a request
-  // that exposes CSRF. Wait once; if Amazon needs a new session, show an
-  // actionable error instead of repeatedly reloading the seller's tab.
-  const captured = await waitForAdsHeaderCapture({ since: startedAt, timeoutMs: ADS_HEADER_REFRESH_TIMEOUT_MS });
+  let captured = await waitForAdsHeaderCapture({ since: startedAt, timeoutMs: ADS_HEADER_REFRESH_TIMEOUT_MS });
+  let reloads = 0;
+  if (shouldReloadDedicatedAdsTab({ captured, reloads })) {
+    reloads += 1;
+    const reloadedAt = Date.now();
+    debugLog(`🔄 [ADS-AUTH] Reloading dedicated Ads tab ${tabId} to capture fresh headers`, "info");
+    await chrome.tabs.reload(tabId);
+    await waitForAdsTabComplete(tabId);
+    await assertAdsTabAccessible(tabId);
+    await ensureAdsBridgeInjected(tabId);
+    captured = await waitForAdsHeaderCapture({ since: reloadedAt, timeoutMs: ADS_HEADER_REFRESH_TIMEOUT_MS });
+  }
 
   let latest = await readAdsHeaderState();
   if (captured && !isAdsHeaderComplete(latest)) {
@@ -4782,7 +4795,7 @@ async function forceRefreshAdsHeaders(options = {}) {
 ${hint.title || ""}
 ${hint.bodyText || ""}`)
     ? "Amazon Ads đang yêu cầu login/reauth. Mở tab advertising.amazon.com, đăng nhập lại rồi chạy lại."
-    : "Không capture được Ads headers từ Amazon Ads page. Giữ tab Ads mở cho tới khi tải xong, refresh thủ công một lần rồi chạy lại.";
+    : "Không capture được Ads headers sau khi extension đã reload tab Ads chuyên dụng một lần. Kiểm tra tab này đã tải xong rồi chạy lại.";
 
   const error = createAdsError(`Không thể refresh Ads headers: ${reasonText}`, 401, JSON.stringify(hint).slice(0, 1000));
   error.adsRefreshFailed = true;
