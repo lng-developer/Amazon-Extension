@@ -31,6 +31,8 @@ import {
   nextAmazonFeedWatchState,
   shouldRefreshAmazonFeedHistory,
 } from "./lib/amazon-feed-history.js";
+import { finalizeAmazonFeedWatch as finalizeAmazonFeedWatchState, stopAmazonFeedWatches } from "./lib/amazon-feed-watch-control.js";
+import { buildAmazonFeedResult, upsertAmazonFeedResult } from "./lib/amazon-feed-results.js";
 
 const ADS_LOCK_STALE_MS = 5 * 60 * 1000;
 const adsApiLock = {
@@ -52,6 +54,9 @@ const SOCKET_RECONNECT_PERIOD_MINUTES = 1;
 const AMAZON_FEED_WATCH_ALARM = "AMAZON_FEED_WATCH";
 const AMAZON_FEED_WATCH_PERIOD_MINUTES = 1;
 const AMAZON_FEED_WATCHES_KEY = "amazonFeedWatches";
+const AMAZON_FEED_TERMINAL_EVENTS_KEY = "amazonFeedTerminalEvents";
+const AMAZON_FEED_RESULTS_KEY = "amazonFeedResults";
+const AMAZON_FEED_RESULTS_LIMIT = 20;
 
 // Global logger instance
 let extensionLogger = null;
@@ -63,7 +68,6 @@ async function initializeLogger() {
       const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
       if (base && shopId && clientId) {
         extensionLogger = new ExtensionLogger(clientId, shopId, clientLabel || 'Unknown Shop', base);
-        console.log('[LOGGER] Extension logger initialized', { clientId, shopId, clientLabel, base });
       }
     } catch (error) {
       console.error('[LOGGER] Failed to initialize extension logger:', error);
@@ -265,7 +269,6 @@ const AMAZON_UPLOADFEED_CSRF_CACHE_KEY = "amazonUploadFeedCsrfCache";
 const AMAZON_UPLOADFEED_CSRF_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const AMAZON_UPLOADFEED_SNIFFER_FLAG = "__APO_UPLOADFEED_SNIFFER_INSTALLED__";
 globalThis.__UPLOADFEED_HELPER_BUILD__ = "uploadfeed-helper-v2026-05-12-01";
-console.log("[UPLOAD_TRACKING] HELPER BUILD LOADED", globalThis.__UPLOADFEED_HELPER_BUILD__);
 const ADS_BASE = "https://advertising.amazon.com";
 const ADS_CAMPAIGNS_URL = `${ADS_BASE}/campaign-manager/all-campaigns`;
 const ADS_RETRIEVE_URL =
@@ -367,7 +370,6 @@ async function withAdsApiLock(taskName, fn, options = {}) {
   await persistAdsLockState();
 
   debugLog(`[ADS-LOCK] Acquired ${taskName} runId=${runId}`, "success");
-  log(`[ADS-LOCK] Acquired ${taskName} runId=${runId}`);
   extensionLogger?.logInfo(`[ADS-LOCK] Acquired ${taskName}`, { runId, taskName, startedAt: adsApiLock.startedAt });
 
   try {
@@ -651,8 +653,7 @@ function logUploadTrackingDiagnostic(message, fields = {}, level = "info") {
     .map(([key, value]) => `${key}=${typeof value === "object" ? JSON.stringify(value) : String(value)}`)
     .join(" ");
   const fullMessage = inlineFields ? `${message} ${inlineFields}` : message;
-  debugLog(fullMessage, level);
-  extensionLogger?.logInfo(fullMessage, safeFields);
+  if (level === "error") debugLog(fullMessage, level);
 }
 
 function isValidUploadFeedCsrfToken(value) {
@@ -1434,40 +1435,6 @@ globalThis.testUploadFeedSnifferCaptureNow = async function () {
   };
 };
 
-console.log("[UPLOAD_TRACKING] Service Worker uploadFeed debug helpers exposed", {
-  installUploadFeedSnifferNow: typeof globalThis.installUploadFeedSnifferNow,
-  verifyUploadFeedSnifferNow: typeof globalThis.verifyUploadFeedSnifferNow,
-  checkUploadFeedCsrfCacheNow: typeof globalThis.checkUploadFeedCsrfCacheNow,
-  clearUploadFeedCsrfCacheNow: typeof globalThis.clearUploadFeedCsrfCacheNow,
-  testUploadFeedSnifferCaptureNow: typeof globalThis.testUploadFeedSnifferCaptureNow
-});
-
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  try {
-    if (changeInfo.status !== "complete") return;
-    const url = tab?.url || "";
-    if (!url.startsWith(SC_FEEDS_URL)) return;
-    Promise.resolve(installUploadFeedCsrfSniffer(tabId))
-      .then(async (result) => {
-        if (result?.ok) await logUploadFeedCsrfDiagnostic(tabId);
-        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer auto-installed on feeds tab", {
-          tabId,
-          url,
-          ok: !!result?.ok,
-        }, result?.ok ? "success" : "error");
-      })
-      .catch((error) => {
-        logUploadTrackingDiagnostic("[UPLOAD_TRACKING] uploadFeed CSRF sniffer auto-install failed on feeds tab", {
-          tabId,
-          url,
-          error: error?.message || String(error),
-        }, "error");
-      });
-  } catch (error) {
-    console.warn("[UPLOAD_TRACKING] feeds tab sniffer auto-install exception:", error?.message || error);
-  }
-});
-
 async function getSellerCentralPageCsrfFromTab(tabId) {
   try {
     const [res] = await chrome.scripting.executeScript({
@@ -2126,11 +2093,15 @@ async function saveAmazonFeedWatch(watch) {
   return watch;
 }
 
-async function removeAmazonFeedWatch(batchId) {
-  const watches = await getAmazonFeedWatches();
-  delete watches[batchId];
-  await chrome.storage.local.set({ [AMAZON_FEED_WATCHES_KEY]: watches });
-  if (Object.keys(watches).length === 0) await chrome.alarms.clear(AMAZON_FEED_WATCH_ALARM);
+async function clearAmazonFeedWatches(reason = "manual") {
+  const result = await stopAmazonFeedWatches({
+    storage: chrome.storage.local,
+    alarms: chrome.alarms,
+    watchesKey: AMAZON_FEED_WATCHES_KEY,
+    alarmName: AMAZON_FEED_WATCH_ALARM,
+  });
+  logUploadTrackingDiagnostic("[UPLOAD_TRACKING] Amazon feed watches stopped", { reason, ...result }, "success");
+  return { ok: true, ...result };
 }
 
 async function reportAmazonFeedStatus(event) {
@@ -2166,6 +2137,72 @@ async function reportAmazonFeedTaskTerminal(watch, status) {
   });
 }
 
+async function persistAmazonFeedResult({ watch, event, ack }) {
+  const stored = await chrome.storage.local.get([AMAZON_FEED_RESULTS_KEY]);
+  const results = Array.isArray(stored[AMAZON_FEED_RESULTS_KEY]) ? stored[AMAZON_FEED_RESULTS_KEY] : [];
+  const result = buildAmazonFeedResult({ watch, event, ack });
+  await chrome.storage.local.set({
+    [AMAZON_FEED_RESULTS_KEY]: upsertAmazonFeedResult(results, result, AMAZON_FEED_RESULTS_LIMIT),
+  });
+  return result;
+}
+
+async function finalizeTerminalAmazonFeedWatch({ watch, event, tabId }) {
+  let ack = null;
+  try {
+    ack = await reportAmazonFeedStatus(event);
+  } catch (error) {
+    logUploadTrackingDiagnostic("[UPLOAD_TRACKING] Amazon terminal status acknowledgement failed", {
+      batchId: watch.batchId,
+      message: error?.message || String(error),
+    }, "error");
+  }
+
+  const acknowledged = !!ack?.ok && !!ack?.terminal;
+  const result = await persistAmazonFeedResult({ watch, event, ack });
+  const cleanup = await finalizeAmazonFeedWatchState({
+    storage: chrome.storage.local,
+    alarms: chrome.alarms,
+    removeTab: (id) => chrome.tabs.remove(id),
+    watchesKey: AMAZON_FEED_WATCHES_KEY,
+    pendingEventsKey: AMAZON_FEED_TERMINAL_EVENTS_KEY,
+    alarmName: AMAZON_FEED_WATCH_ALARM,
+    watch,
+    event,
+    acknowledged,
+    tabId,
+  });
+
+  if (acknowledged) await reportAmazonFeedTaskTerminal(watch, ack.status);
+  logUploadTrackingDiagnostic("[UPLOAD_TRACKING] Amazon feed watch finalized", {
+    batchId: watch.batchId,
+    status: event.status,
+    acknowledged,
+    result,
+    ...cleanup,
+  }, acknowledged ? "success" : "error");
+  return { ack, cleanup };
+}
+
+async function flushPendingAmazonFeedTerminalEvents() {
+  if (!socket?.connected) return;
+  const stored = await chrome.storage.local.get([AMAZON_FEED_TERMINAL_EVENTS_KEY]);
+  const pendingEvents = stored[AMAZON_FEED_TERMINAL_EVENTS_KEY] || {};
+  const remaining = {};
+
+  for (const [batchId, pending] of Object.entries(pendingEvents)) {
+    const ack = await reportAmazonFeedStatus(pending.event).catch(() => null);
+    if (ack?.ok && ack?.terminal) {
+      await persistAmazonFeedResult({ watch: pending.watch, event: pending.event, ack });
+      await reportAmazonFeedTaskTerminal(pending.watch, ack.status);
+      logUploadTrackingDiagnostic("[UPLOAD_TRACKING] queued Amazon terminal status delivered", { batchId, status: ack.status }, "success");
+    } else {
+      remaining[batchId] = pending;
+    }
+  }
+  await chrome.storage.local.set({ [AMAZON_FEED_TERMINAL_EVENTS_KEY]: remaining });
+}
+
 async function pollAmazonFeedWatch(watch, { source = "initial" } = {}) {
   let tab = null;
   try {
@@ -2196,26 +2233,32 @@ async function pollAmazonFeedWatch(watch, { source = "initial" } = {}) {
     }
 
     if (next.action === "fetch_report") {
-      if (!row.reportHref) return;
-      const reportText = await readAmazonProcessingReport(tab.id, row.reportHref);
-      const ack = await reportAmazonFeedStatus(buildAmazonFeedDoneEvent({
-        batchId: next.batchId,
-        amazonBatchId: next.amazonBatchId,
-        reportText,
-      }));
-      if (!ack?.ok || !ack?.terminal) return;
-      await reportAmazonFeedTaskTerminal(next, ack.status);
-      await removeAmazonFeedWatch(next.batchId);
-      if (next.createdDedicatedTab) await chrome.tabs.remove(tab.id).catch(() => {});
+      let event;
+      try {
+        if (!row.reportHref) throw new Error("Amazon Processing Report link is unavailable");
+        const reportText = await readAmazonProcessingReport(tab.id, row.reportHref);
+        event = buildAmazonFeedDoneEvent({
+          batchId: next.batchId,
+          amazonBatchId: next.amazonBatchId,
+          reportText,
+        });
+      } catch (error) {
+        event = {
+          batchId: next.batchId,
+          amazonBatchId: next.amazonBatchId,
+          status: "needs_review",
+          failureReason: error?.message || "Unable to read Amazon Processing Report",
+        };
+      }
+      await finalizeTerminalAmazonFeedWatch({ watch: next, event, tabId: tab.id });
       return;
     }
 
-    const ack = await reportAmazonFeedStatus({ batchId: next.batchId, amazonBatchId: next.amazonBatchId, status: "failed", failureReason: "Amazon feed history reports failure" });
-    if (ack?.ok && ack?.terminal) {
-      await reportAmazonFeedTaskTerminal(next, ack.status);
-      await removeAmazonFeedWatch(next.batchId);
-      if (next.createdDedicatedTab) await chrome.tabs.remove(tab.id).catch(() => {});
-    }
+    await finalizeTerminalAmazonFeedWatch({
+      watch: next,
+      event: { batchId: next.batchId, amazonBatchId: next.amazonBatchId, status: "failed", failureReason: "Amazon feed history reports failure" },
+      tabId: tab.id,
+    });
   } catch (error) {
     logUploadTrackingDiagnostic("[UPLOAD_TRACKING] Amazon feed watch poll failed", { batchId: watch.batchId, message: error?.message || String(error) }, "error");
   }
@@ -4151,17 +4194,6 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
       );
     }
 
-    await postLogSingle({
-      base,
-      token: (await getCfg()).ingestToken,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: "auto",
-      level: "info",
-      message: `Starting upload to Amazon: ${stableFileObj.name}`,
-    });
-
     dedicatedSellerCentralTab = await findOrOpenSellerCentralFeedsTab({ dedicated: true, active: true });
     logUploadTrackingDiagnostic("[UPLOAD_TRACKING] opened dedicated Seller Central feeds tab", {
       tabId: dedicatedSellerCentralTab?.id || null,
@@ -4363,17 +4395,6 @@ async function uploadToAmazon(fileObj, uploadParams = {}) {
         "Amazon upload completed successfully"
       );
     }
-
-    await postLogSingle({
-      base,
-      token: (await getCfg()).ingestToken,
-      shopId,
-      machineId: clientId,
-      label: clientLabel,
-      action: "auto",
-      level: "success",
-      message: `Amazon upload completed: ${stableFileObj.name}`,
-    });
 
     logUploadTrackingDiagnostic("[UPLOAD_TRACKING] PHASE 13 success", {
       status: response.status,
@@ -4698,7 +4719,6 @@ async function saveAdsHeadersIfAny(found) {
   lastAdsHeaderWriteAt = now;
 
   if (shouldLogCapture) {
-    log("[ADS] headers captured:", keys.join(", "));
     extensionLogger?.logInfo("[ADS-AUTH] Ads headers captured", {
       keys,
       changed,
@@ -5062,15 +5082,7 @@ async function reconnectSocketIfNeeded(source) {
 // }
 
 export async function connectSocketIO(force = false) {
-  console.log("[SOCKET-LOG] connectSocketIO entered", {
-    force,
-    connectBusy,
-    socketExists: !!socket,
-    socketConnected: !!socket?.connected
-  });
-
   if (connectBusy) {
-    console.log('[SOCKET-LOG] Connection already in progress, skipping...');
     safeLogConnectionStatus('busy', { force }, 'Socket connection already in progress');
     return { ok: false, reason: "busy" };
   }
@@ -5079,7 +5091,6 @@ export async function connectSocketIO(force = false) {
   try {
     const { base, shopId, clientId, clientLabel } = await getBaseShopAndIdentity();
 
-    console.log('[SOCKET-LOG] Starting socket connection...', { base, shopId, clientId, clientLabel, force });
     safeLogConnectionStatus('connecting', {
       base, shopId, clientId, clientLabel, force
     }, 'Initiating Socket.IO connection');
@@ -5098,14 +5109,12 @@ export async function connectSocketIO(force = false) {
 
     // Nếu đã connected và không force → bỏ qua
     if (!force && socket?.connected) {
-      console.log('[SOCKET-LOG] Already connected, skipping reconnection');
       safeLogConnectionStatus('already_connected', { socketId: socket?.id || null }, 'Socket already connected');
       return { ok: true, message: "already connected" };
     }
 
     // Ngắt socket cũ nếu có
     if (socket) {
-      console.log('[SOCKET-LOG] Disconnecting existing socket...');
       safeLogConnectionStatus('disconnecting_old', {
         oldSocketId: socket?.id || null,
         oldConnected: !!socket?.connected
@@ -5117,14 +5126,6 @@ export async function connectSocketIO(force = false) {
       // Dừng auto reconnect polling khi cleanup socket
       if (force) stopAutoReconnectPolling();
     }
-
-    console.log("[SOCKET-LOG] Creating new socket connection", {
-      url: base,
-      path: "/ws",
-      shopId,
-      machineId: clientId,
-      label: clientLabel
-    });
 
     socket = io(base, {
       path: "/ws",
@@ -5157,7 +5158,6 @@ export async function connectSocketIO(force = false) {
 
     // Khi kết nối thành công
     socket.on("connect", () => {
-      console.log("[SOCKET-LOG] Connected successfully", { socketId: socket?.id || null, timestamp: new Date().toISOString() });
       startHeartbeat();
       startAutoReconnectPolling();
       Promise.resolve(clearLegacyAutoConfigAlarms()).catch((error) => {
@@ -5166,6 +5166,9 @@ export async function connectSocketIO(force = false) {
       socket.emit("client:pull_pending_tasks", { shopId, machineId: clientId }, (result) => {
         debugLog(`[TASKS] Pending tasks pulled: ${result?.count || 0}`, "info");
       });
+      flushPendingAmazonFeedTerminalEvents().catch((error) => {
+        debugLog(`[UPLOAD_TRACKING] Could not deliver queued terminal status: ${error?.message || error}`, "error");
+      });
 
       safeLogConnectionStatus('connected', {
         socketId: socket?.id || null,
@@ -5173,11 +5176,6 @@ export async function connectSocketIO(force = false) {
         reconnectionAttempts: socket?.io?.reconnectionAttempts || 0
       }, 'Socket.IO connection established successfully');
 
-      safePostLogSingle({
-        base, shopId, machineId: clientId, label: clientLabel,
-        action: "auto", level: "success",
-        message: "✅ Extension connected to Socket.IO",
-      });
     });
 
     // Khi mất kết nối
@@ -5234,8 +5232,6 @@ export async function connectSocketIO(force = false) {
 
     // Reconnection events
     socket.on("reconnect", (attemptNumber) => {
-      console.log("[SOCKET-LOG] ✅ Reconnected after", attemptNumber, "attempts");
-
       if (extensionLogger) {
         safeLogConnectionStatus('reconnected', {
           attemptNumber,
@@ -5245,8 +5241,6 @@ export async function connectSocketIO(force = false) {
     });
 
     socket.on("reconnect_attempt", (attemptNumber) => {
-      console.log("[SOCKET-LOG] 🔄 Reconnection attempt", attemptNumber);
-
       if (extensionLogger) {
         safeLogConnectionStatus('reconnect_attempt', {
           attemptNumber,
@@ -5355,12 +5349,6 @@ async function handleServerTask(task) {
   let identity;
   try {
     identity = await getBaseShopAndIdentity();
-    console.log('🔑 [EXT-DEBUG] Extension identity:', {
-      base: identity.base,
-      shopId: identity.shopId,
-      clientId: identity.clientId,
-      clientLabel: identity.clientLabel
-    });
   } catch (identityError) {
     console.error('❌ [EXT-DEBUG] Failed to get identity:', identityError);
     return;
@@ -5380,9 +5368,7 @@ async function handleServerTask(task) {
       reportedAt: new Date().toISOString(),
       ...extra,
     }, (ack) => {
-      console.log(`[TASK_REPLY] BE acknowledged status=${status} taskId=${serverTaskId} ok=${!!ack?.ok}`);
     });
-    console.log(`[TASK_REPLY] sent status=${status} taskId=${serverTaskId}`);
   };
   reportServerTask("received");
   let taskResult;
@@ -5395,8 +5381,6 @@ async function handleServerTask(task) {
         break;
 
       case "IMPORT_FBM_ORDERS":
-        console.log('📋 [EXT-DEBUG] Handling IMPORT_FBM_ORDERS');
-
         // Initialize logger if not exists
         if (!extensionLogger) {
           await initializeLogger();
@@ -5458,8 +5442,6 @@ async function handleServerTask(task) {
         break;
 
       case "IMPORT_ORDERS":
-        console.log('📋 [EXT-DEBUG] Handling IMPORT_ORDERS');
-
         // Initialize logger if not exists
         if (!extensionLogger) {
           await initializeLogger();
@@ -5527,12 +5509,9 @@ async function handleServerTask(task) {
         break;
 
       case "IMPORT_ADS_SPEND":
-        console.log('📋 [EXT-DEBUG] Handling IMPORT_ADS_SPEND');
         const adsStartDate = payload?.startDate || payload?.date;
         const adsEndDate = payload?.endDate || payload?.date;
         if (!adsStartDate || !adsEndDate) throw new Error("Missing payload.startDate/endDate");
-        console.log('📅 [EXT-DEBUG] Ads spend range:', adsStartDate, adsEndDate);
-
         // Initialize logger if not exists
         if (!extensionLogger) {
           await initializeLogger();
@@ -5651,25 +5630,6 @@ async function handleServerTask(task) {
           }, `[UPLOAD_TRACKING] Starting upload tracking processing: ${payload?.reason}`);
         }
 
-        // Log to popup UI
-        debugLog('� [UPLOAD_TRACKING] ===== TASK RECEIVED =====', 'info');
-        debugLog(`🎯 [UPLOAD_TRACKING] Task Type: ${payload?.autoGenerated ? 'AUTO GENERATED' : 'MANUAL TRIGGER'}`, payload?.autoGenerated ? 'success' : 'info');
-        debugLog(`📝 [UPLOAD_TRACKING] Reason: ${payload?.reason}`, 'info');
-        debugLog(`🏷️ [UPLOAD_TRACKING] Batch ID: ${payload?.batchId}`, 'info');
-        debugLog(`👤 [UPLOAD_TRACKING] Requested By: ${payload?.requestedBy}`, 'info');
-        debugLog(`⏰ [UPLOAD_TRACKING] Timestamp: ${payload?.timestamp}`, 'info');
-
-        // Debug payload details
-        console.log('📦 [EXT-DEBUG] UPLOAD_TRACKING payload details:');
-        console.log('  - Batch ID:', payload?.batchId);
-        console.log('  - Machine ID:', payload?.machineId);
-        console.log('  - Shop ID:', payload?.shopId);
-        console.log('  - Label:', payload?.label);
-        console.log('  - Auto Generated:', payload?.autoGenerated);
-        console.log('  - Reason:', payload?.reason);
-        console.log('  - Requested By:', payload?.requestedBy);
-        console.log('  - Timestamp:', payload?.timestamp);
-
         // Check machine ID match
         if (payload?.machineId && payload.machineId !== clientId) {
           console.warn('⚠️ [EXT-DEBUG] Machine ID mismatch!');
@@ -5680,65 +5640,12 @@ async function handleServerTask(task) {
           debugLog(`   Task Machine ID: ${payload.machineId}`, 'error');
           debugLog(`   Extension Machine ID: ${clientId}`, 'error');
           break;
-        } else {
-          console.log('✅ [EXT-DEBUG] Machine ID match confirmed');
-          debugLog('✅ [UPLOAD_TRACKING] Machine ID match confirmed', 'success');
         }
 
         if (payload) {
-          console.log(`🎯 [EXT-DEBUG] Task received: ${payload.reason} (autoGenerated: ${payload.autoGenerated})`);
-
-          // Debug file info
-          if (payload.file) {
-            console.log('📄 [EXT-DEBUG] File details:');
-            console.log('  - Filename:', payload.file.filename);
-            console.log('  - Size:', payload.file.size, 'bytes');
-            console.log('  - Content Type:', payload.file.contentType);
-            console.log('  - Content length:', payload.file.content?.length);
-            console.log('  - Content preview:', payload.file.content?.substring(0, 200) + '...');
-          } else {
+          if (!payload.file) {
             console.error('❌ [EXT-DEBUG] No file in payload!');
             break;
-          }
-
-          // Debug upload params
-          if (payload.uploadParams) {
-            console.log('⚙️ [EXT-DEBUG] Upload params:');
-            console.log('  - Carrier Code:', payload.uploadParams.carrierCode);
-            console.log('  - Ship Method:', payload.uploadParams.shipMethod);
-            console.log('  - Ship Date:', payload.uploadParams.shipDate);
-          } else {
-            console.error('❌ [EXT-DEBUG] No upload params in payload!');
-          }
-
-          // Debug tracking data
-          if (payload.trackingData) {
-            console.log('📊 [EXT-DEBUG] Tracking data:');
-            console.log('  - Count:', payload.trackingData.length);
-            console.log('  - Sample orders:', payload.trackingData.slice(0, 3).map(t => ({
-              orderId: t.orderId,
-              tracking: t.tracking,
-              isFake: t.isFake,
-              source: t.source
-            })));
-          }
-
-          // Log task start
-          console.log('📝 [EXT-DEBUG] Logging task start...');
-          try {
-            await postLogSingle({
-              base,
-              token: (await getCfg()).ingestToken,
-              shopId,
-              machineId: clientId,
-              label: clientLabel,
-              action: "auto",
-              level: "info",
-              message: `🎯 Starting UPLOAD_TRACKING task: ${payload.reason}`
-            });
-            console.log('✅ [EXT-DEBUG] Task start logged successfully');
-          } catch (logError) {
-            console.error('❌ [EXT-DEBUG] Failed to log task start:', logError);
           }
 
           const { file, uploadParams, trackingData } = payload;
@@ -5761,37 +5668,8 @@ async function handleServerTask(task) {
             throw error;
           }
 
-          // 1. File TXT đã sẵn sàng, không cần tạo
-          console.log('📄 [EXT-DEBUG] Preparing file blob...');
           const blob = new Blob([file.content], { type: file.contentType });
           const fileObj = new File([blob], file.filename);
-          console.log('✅ [EXT-DEBUG] File blob created:', {
-            name: fileObj.name,
-            size: fileObj.size,
-            type: fileObj.type
-          });
-
-          // Log file preparation
-          console.log('📝 [EXT-DEBUG] Logging file preparation...');
-          try {
-            await postLogSingle({
-              base,
-              token: (await getCfg()).ingestToken,
-              shopId,
-              machineId: clientId,
-              label: clientLabel,
-              action: "auto",
-              level: "info",
-              message: `📄 Prepared file: ${file.filename} (${file.content.length} bytes)`
-            });
-            console.log('✅ [EXT-DEBUG] File preparation logged successfully');
-          } catch (logError) {
-            console.error('❌ [EXT-DEBUG] Failed to log file preparation:', logError);
-          }
-
-          // 2. Upload lên platform ngay lập tức
-          console.log('🚀 [EXT-DEBUG] Starting upload to Amazon...');
-          console.log('📤 [EXT-DEBUG] Upload params:', uploadParams);
 
           const trackingUploadParams = {
             ...(uploadParams || {}),
@@ -5803,8 +5681,6 @@ async function handleServerTask(task) {
           try {
             const result = await withUploadTrackingLock("UPLOAD_TRACKING_SOCKET", async () => {
               const uploadResult = await uploadToAmazon(fileObj, trackingUploadParams);
-              console.log(`[EXT-DEBUG] Successfully uploaded ${file.filename}`);
-              console.log("[EXT-DEBUG] Native upload submitted; waiting for Amazon Processing Report...");
               const watch = {
                 batchId: payload.batchId,
                 taskId: serverTaskId,
@@ -5842,7 +5718,6 @@ async function handleServerTask(task) {
               throw new Error("Upload skipped because another upload is running");
             }
 
-            console.log("[EXT-DEBUG] Upload completed");
             taskResult = {
               upload: {
                 ok: true,
@@ -5853,7 +5728,6 @@ async function handleServerTask(task) {
             break;
           } catch (error) {
             console.error(`[EXT-DEBUG] Failed to upload ${file.filename}:`, error);
-            console.log("[EXT-DEBUG] Reporting failure to server...");
 
             if (payload?.batchId) {
               await reportAmazonFeedStatus({ batchId: payload.batchId, status: "failed", failureReason: error.message });
@@ -5893,12 +5767,9 @@ async function handleServerTask(task) {
     reportServerTask("failed", { error: e?.message || String(e) });
     log(`[TASK] Lỗi ${type || "UNKNOWN"} · ${e?.message || "Unknown error"}`);
     console.error("❌ [EXT-DEBUG] Task processing error:", e?.message || e);
-    console.error("📋 [EXT-DEBUG] Error stack:", e?.stack);
-    console.error("📦 [EXT-DEBUG] Task that caused error:", { type, payload });
 
     // Report error for UPLOAD_TRACKING tasks
     if (type === "UPLOAD_TRACKING" && payload?.batchId && !e?._uploadTrackingReported) {
-      console.log('📝 [EXT-DEBUG] Reporting task error to server...');
       try {
         await reportAmazonFeedStatus({ batchId: payload.batchId, status: "failed", failureReason: e?.message || "Unknown error" });
       } catch (reportError) {
@@ -5908,7 +5779,6 @@ async function handleServerTask(task) {
     return { ok: false, error: e?.message || String(e) };
   }
 
-  console.log('📨 [EXT-DEBUG] ===== END TASK PROCESSING =====\n');
 }
 
 // ====== Tự động connect khi extension khởi động (nếu autoConnect=true) ======
@@ -5969,6 +5839,9 @@ chrome.storage.onChanged.addListener(async (changes) => {
 // Helper function để gửi log ra UI
 function debugLog(message, level = 'info') {
   console.log(message); // Vẫn log console để backup
+  const showInRuntimeLog = level === "error" || /^\[TASK\]/.test(message)
+    || /\[UPLOAD_TRACKING\] (Amazon feed watch finalized|queued Amazon terminal status delivered|Amazon feed watches stopped)/.test(message);
+  if (!showInRuntimeLog) return;
   persistRuntimeLog(message, level);
 
   // Gửi message tới popup để hiển thị
@@ -6553,6 +6426,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
       if (msg?.type === "CLEAR_UPLOADFEED_CSRF_CACHE") {
         return sendResponse(await clearUploadFeedCsrfCache("manual_debug"));
+      }
+
+      if (msg?.type === "STOP_AMAZON_FEED_WATCHES") {
+        return sendResponse(await clearAmazonFeedWatches("manual_debug"));
       }
 
       if (msg?.type === "SOCKET_RESET_BUSY") {

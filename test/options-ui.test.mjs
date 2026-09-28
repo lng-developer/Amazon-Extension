@@ -19,6 +19,11 @@ test("upload diagnostics stay available behind a collapsed advanced section", ()
   assert.match(popupHtml, /UploadFeed Debug/);
 });
 
+test("popup exposes an explicit control to stop stale feed refreshes", () => {
+  assert.match(popupHtml, /id="btnStopAmazonFeedWatch"/);
+  assert.match(popupScript, /STOP_AMAZON_FEED_WATCHES/);
+});
+
 test("popup script activates a selected tab without changing action IDs", () => {
   assert.match(popupScript, /function activatePopupTab\(/);
   assert.match(popupScript, /aria-selected/);
@@ -39,6 +44,12 @@ test("popup can open the same control surface in a full-page tab", () => {
 test("runtime log renders the newest entry at the top", () => {
   assert.match(popupScript, /runtimeEntries\.slice\(\)\.reverse\(\)\.map/);
   assert.match(popupScript, /box\.scrollTop = 0/);
+});
+
+test("logs prioritize Amazon feed results and keep technical output collapsed", () => {
+  assert.match(popupHtml, /Kết quả Amazon/);
+  assert.match(popupHtml, /<details class="technical-log"/);
+  assert.match(popupScript, /renderAmazonFeedResults/);
 });
 
 test("popup does not expose legacy Auto Config controls", () => {

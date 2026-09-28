@@ -8,6 +8,38 @@ const runtimeEntries = [];
 const RUNTIME_LOG_STORAGE_KEY = "runtimeLogEntries";
 const RUNTIME_LOG_LIMIT = 50;
 const ADS_LAST_RESULT_STORAGE_KEY = "adsLastResult";
+const AMAZON_FEED_RESULTS_STORAGE_KEY = "amazonFeedResults";
+
+function renderAmazonFeedResults(results = []) {
+  const box = $("#amazonFeedResults");
+  if (!box) return;
+  box.replaceChildren();
+  if (!results.length) {
+    const empty = document.createElement("p");
+    empty.className = "amazon-results-empty";
+    empty.textContent = "Chưa có Processing Report từ Amazon trên extension này.";
+    box.append(empty);
+    return;
+  }
+
+  const statusLabel = { done: "Thành công", failed: "Thất bại", needs_review: "Cần review", pending_sync: "Chờ đồng bộ" };
+  results.forEach((entry) => {
+    const card = document.createElement("article");
+    const status = entry.backendStatus || "pending_sync";
+    card.className = `amazon-result ${status}`;
+    const title = document.createElement("strong");
+    title.textContent = `Amazon batch ${entry.amazonBatchId || "đang xác định"}`;
+    const badge = document.createElement("span");
+    badge.className = "amazon-result-status";
+    badge.textContent = statusLabel[status] || "Cần review";
+    const meta = document.createElement("p");
+    meta.textContent = `${entry.recordsActivated || 0}/${entry.expectedRows || entry.recordsProcessed || 0} xác nhận · ${entry.errorCount || 0} lỗi · ${entry.warningCount || 0} cảnh báo`;
+    const detail = document.createElement("small");
+    detail.textContent = `${entry.batchId || "Không có batch"} · ${new Date(Number(entry.at || Date.now())).toLocaleString("vi-VN")}${entry.failureReason ? ` · ${entry.failureReason}` : ""}`;
+    card.append(title, badge, meta, detail);
+    box.append(card);
+  });
+}
 
 async function showAndPersistAdsResult(result, { kind, range }) {
   const record = { kind, range, result, completedAt: Date.now() };
@@ -177,6 +209,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       adsHeaderLastSeen,
       runtimeLogEntries = [],
       adsLastResult,
+      amazonFeedResults = [],
     } = await chrome.storage.local.get([
       "ingestUrl",
       "shopId",
@@ -184,6 +217,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       "adsHeaderLastSeen",
       RUNTIME_LOG_STORAGE_KEY,
       ADS_LAST_RESULT_STORAGE_KEY,
+      AMAZON_FEED_RESULTS_STORAGE_KEY,
     ]);
 
     runtimeEntries.splice(0, runtimeEntries.length, ...runtimeLogEntries.slice(-RUNTIME_LOG_LIMIT).map((entry) => ({
@@ -194,6 +228,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       count: Math.max(1, Number(entry?.count || 1)),
     })));
     renderRuntimeLog();
+    renderAmazonFeedResults(amazonFeedResults);
 
     if ($("#ingestUrl")) $("#ingestUrl").value = ingestUrl;
     if ($("#shopId")) $("#shopId").value = shopId;
@@ -435,6 +470,12 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "local" && changes[AMAZON_FEED_RESULTS_STORAGE_KEY]) {
+    renderAmazonFeedResults(changes[AMAZON_FEED_RESULTS_STORAGE_KEY].newValue || []);
+  }
+});
+
 on($("#btnPreviewAds"), "click", async () => {
   const output = $("#adsPreviewResult");
   let range;
@@ -535,6 +576,10 @@ on($("#btnCheckUploadFeedCache"), "click", () => {
 
 on($("#btnClearUploadFeedCache"), "click", () => {
   sendUploadFeedDebugCommand("CLEAR_UPLOADFEED_CSRF_CACHE", "Clear uploadFeed CSRF cache");
+});
+
+on($("#btnStopAmazonFeedWatch"), "click", () => {
+  sendUploadFeedDebugCommand("STOP_AMAZON_FEED_WATCHES", "Dừng tự refresh Amazon feed");
 });
 
 on($("#btnSocketResetBusy"), "click", () => {
