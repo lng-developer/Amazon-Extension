@@ -19,7 +19,7 @@ import { classifyAmazonAdsReportLink, createGmailAdsDownloadFingerprint } from '
 import { fetchTransactionsCsv as fetchAmazonTransactionsCsv, summarizeTransactionCsv } from './amazonTransaction.js';
 import { runListingImageBatch } from './amazonListingImage.js';
 import { submitNativeTrackingFeed, validateTrackingPayload } from './amazonTrackingUpload.js';
-import { snapshotFeedHistory } from './amazonFeedHistory.js';
+import { findNewFeedRow, snapshotFeedHistory, terminalFeedResult } from './amazonFeedHistory.js';
 import {
   SETTLEMENT_IMPORT_COOLDOWN_MS,
   canStartSettlementImport,
@@ -1776,6 +1776,9 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
   const body = { clientId: identity.clientId, label: identity.clientLabel, leaseToken };
   const payloadResponse = await fetch(`${root}/agent/commands/${command.id}/tracking-payload`, { method: 'POST', headers, body: JSON.stringify(body) });
   const payload = (await payloadResponse.json()).data; if (!payloadResponse.ok) throw new Error('Tracking payload lease rejected');
+  const watchKey = `trackingWatch:${payload.submissionId}`;
+  const existingWatch = (await chrome.storage.local.get(watchKey))[watchKey];
+  if (existingWatch) return reconcileTrackingWatch({ command, leaseToken, payload, watch: existingWatch, root, headers, body });
   await validateTrackingPayload(payload); await onProgress({ stage: 'READY_TO_SUBMIT' });
   const tabs = await chrome.tabs.query({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds*' });
   const tab = tabs[0] || await chrome.tabs.create({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds', active: true });
@@ -1785,8 +1788,23 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
     const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/${suffix}`, { method: 'POST', headers, body: JSON.stringify(body) });
     if (!response.ok) throw new Error(`Tracking ${suffix} state was rejected`);
   }
-  await chrome.storage.local.set({ [`trackingWatch:${payload.submissionId}`]: { submissionId: payload.submissionId, historyBeforeBatchIds, checksum: payload.checksum } });
+  await chrome.storage.local.set({ [watchKey]: { submissionId: payload.submissionId, historyBeforeBatchIds, checksum: payload.checksum } });
   return { deferred: true, submissionId: payload.submissionId };
+}
+async function reconcileTrackingWatch({ command, payload, watch, root, headers, body }) {
+  const tabs = await chrome.tabs.query({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds*' });
+  if (!tabs[0]?.id) return { deferred: true, submissionId: payload.submissionId };
+  const [rows] = await chrome.scripting.executeScript({ target: { tabId: tabs[0].id }, world: 'MAIN', func: () => [...document.querySelectorAll('tr')].map((row) => row.innerText || '') });
+  const row = findNewFeedRow(rows?.result || [], watch.historyBeforeBatchIds);
+  if (!row) return { deferred: true, submissionId: payload.submissionId };
+  const amazonBatchId = (row.match(/\b\d{6,}\b/) || [])[0];
+  if (amazonBatchId && !watch.amazonBatchId) await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/batch`, { method: 'POST', headers, body: JSON.stringify({ ...body, amazonBatchId }) });
+  const terminal = terminalFeedResult(row);
+  if (!terminal) return { deferred: true, submissionId: payload.submissionId };
+  const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/terminal`, { method: 'POST', headers, body: JSON.stringify({ ...body, ...terminal }) });
+  if (!response.ok) throw new Error('Tracking terminal state was rejected');
+  await chrome.storage.local.remove(`trackingWatch:${payload.submissionId}`);
+  return terminal.result;
 }
 async function pollExtensionCommands(config = null) {
   config ||= await getCfg();
@@ -1798,7 +1816,7 @@ async function pollExtensionCommands(config = null) {
     runTransactions: runImportTransactions,
     runSettlements: options => options.dateFrom && options.dateTo ? runSettlementRange(options) : runScheduledSettlementImport(options),
     runListingImages: options => runListingImageBatch({ ...options, base: identity.base, token: config.ingestToken, client }),
-    runTracking: runTrackingUpload,
+    ...(typeof runTrackingUpload === 'function' ? { runTracking: runTrackingUpload } : {}),
   });
 }
 async function getActivityCommands() {
