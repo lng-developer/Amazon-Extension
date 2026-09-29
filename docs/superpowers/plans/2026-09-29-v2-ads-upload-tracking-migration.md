@@ -4,7 +4,7 @@
 
 **Goal:** Migrate v1's stable Ads safeguards and Seller Central tracking submission into v2's leased extension-command architecture.
 
-**Architecture:** Ads becomes one range command (maximum 120 days) that iterates sequential days under one Ads lock; Preview avoids Finance while Dry-run/Import post one CSV per day with explicit Finance `dryRun`. Tracking becomes a V2 command with a backend-owned TSV snapshot and extension-owned native submission plus persisted Feed History watcher; `WAITING_AMAZON` permits recovery without re-upload and only a Processing Report terminal result completes V2 state.
+**Architecture:** Ads becomes one range command (maximum 120 days) that iterates sequential days under one Ads lock; Preview avoids Finance, the local extension Dry-run/Test button posts one CSV per day with `dryRun: true`, and every leased backend `IMPORT_ADS_SPEND` posts with `dryRun: false`. Tracking becomes a V2 command with a backend-owned TSV snapshot and extension-owned native submission plus persisted Feed History watcher; `WAITING_AMAZON` permits recovery without re-upload and only a Processing Report terminal result completes V2 state.
 
 **Tech Stack:** Chrome Extension Manifest V3, browser-native JavaScript, Node.js, Express, Mongoose, Joi, node:test, Jest.
 
@@ -42,7 +42,7 @@
 
 - [ ] **Step 1: Write failing extension tests**
 
-Add node tests that assert a range command posts both ISO dates to `/agent/import-ads-spend`, one range runs each day sequentially with explicit boolean `dryRun`, and `buildOneOffReportConfig(template, dateFrom, dateTo)` rejects an inverted range while retaining the two supplied boundaries. Add backend validator tests for a valid 120-day range and rejection of 121 days.
+Add node tests that assert a range command posts both ISO dates to `/agent/import-ads-spend`; the popup `DRY_RUN_ADS_SPEND` path uses `dryRun: true`; every leased `IMPORT_ADS_SPEND` path uses `dryRun: false`; and `buildOneOffReportConfig(template, dateFrom, dateTo)` rejects an inverted range while retaining the two supplied boundaries. Add backend validator tests for a valid 120-day range and rejection of 121 days.
 
 - [ ] **Step 2: Run the focused tests to verify they fail**
 
@@ -52,7 +52,7 @@ Expected: FAIL because the command accepts only `date` and the report builder ac
 
 - [ ] **Step 3: Implement the minimal range contract and UI**
 
-Change the backend `manualAdsImportSchema` and `queueCurrentAdsImport` to accept an inclusive range of at most 120 days; change `queueAdsSpendCommand` and `queueManualAdsSpend` to carry that range. Replace the single popup date input with labeled From/To date inputs plus Preview, Dry-run and Import buttons. Iterate sequentially by calendar day: Preview reads/report-validates only; Dry-run calls `postFileTo` with boolean `dryRun: true`; Import calls it with `dryRun: false`. Give each daily CSV a deterministic `sourceRef` and `Idempotency-Key`, then aggregate completed day/row counts.
+Change the backend `manualAdsImportSchema` and `queueCurrentAdsImport` to accept an inclusive range of at most 120 days; change `queueAdsSpendCommand` and `queueManualAdsSpend` to carry that range. Replace the single popup date input with labeled From/To date inputs plus Preview, Dry-run/Test and Import buttons. `PREVIEW_ADS_SPEND` and `DRY_RUN_ADS_SPEND` run locally from the popup; Preview reads/report-validates only and Dry-run/Test calls `postFileTo` with boolean `dryRun: true`. Import queues `IMPORT_ADS_SPEND`; its dispatcher is the only backend-command path and always calls `postFileTo` with `dryRun: false`. Give each daily CSV a deterministic `sourceRef` and `Idempotency-Key`, then aggregate completed day/row counts.
 
 - [ ] **Step 4: Run focused extension tests**
 

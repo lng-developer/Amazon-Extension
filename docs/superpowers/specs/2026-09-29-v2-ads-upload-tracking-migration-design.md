@@ -22,11 +22,11 @@ Keep V2's `IMPORT_ADS_SPEND` command, Reporting CSV creation and Finance upload 
 - one Ads lock shared by manual and leased runs;
 - refresh Ads CSRF/session headers in the dedicated Ads tab before reporting calls;
 - execute a range as one report/import per calendar day, preserving the original V2 CSV and Finance ingest semantics;
-- make Dry-run call the V2 Finance ingest endpoint with `dryRun: true`, while Preview never calls Finance ingest.
+- make only the extension's explicit Dry-run/Test action call the V2 Finance ingest endpoint with `dryRun: true`, while Preview never calls Finance ingest and every backend-issued `IMPORT_ADS_SPEND` uses `dryRun: false`.
 
 No Gmail redirect path or legacy Ads endpoints are migrated. The extension must report success only after V2 Finance ingest responds successfully.
 
-The V2 Finance contract accepts multipart `dryRun` as a boolean and defaults it to `true`; every import action must send an explicit value. The manual extension-command endpoint currently enforces one day, so it must accept an inclusive range of at most 120 calendar days. The extension executes the days sequentially under one Ads lock and one leased command, uploading one original CSV per day with a deterministic `sourceRef` and idempotency key.
+The V2 Finance contract accepts multipart `dryRun` as a boolean and defaults it to `true`; every import action must send an explicit value. `PREVIEW_ADS_SPEND` and `DRY_RUN_ADS_SPEND` are local popup actions, not backend commands. `DRY_RUN_ADS_SPEND` sends `true`; the leased `IMPORT_ADS_SPEND` dispatcher always sends `false`, including backend/scheduler-issued commands. The manual extension-command endpoint currently enforces one day, so it must accept an inclusive range of at most 120 calendar days. The extension executes the days sequentially under one Ads lock and one leased command, uploading one original CSV per day with a deterministic `sourceRef` and idempotency key.
 
 ### Upload tracking
 
