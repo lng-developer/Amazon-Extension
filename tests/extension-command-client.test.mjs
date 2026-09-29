@@ -145,10 +145,10 @@ test('queues the manual order import before claiming it', async () => {
   assert.deepEqual(JSON.parse(calls[0].options.body), { clientId: 'rdc-1', label: 'RDC 1', version: '0.3.0', numDays: 1 });
 });
 
-test('queues a one-day Ads import before claiming it', async () => {
+test('queues an Ads date range before claiming it', async () => {
   const calls = [];
   await queueAdsSpendCommand({
-    base: 'https://dev-api.lngmerch.co', token: 'lng_ext_token', client: { clientId: 'rdc-1', label: 'RDC 1', version: '0.3.0' }, date: '2026-08-23',
+    base: 'https://dev-api.lngmerch.co', token: 'lng_ext_token', client: { clientId: 'rdc-1', label: 'RDC 1', version: '0.3.0' }, dateFrom: '2026-08-20', dateTo: '2026-08-23',
     fetchImpl: async (url, options) => {
       calls.push({ url, options });
       return { ok: true, json: async () => ({ success: true, data: { id: 'command-ads', status: 'QUEUED' } }) };
@@ -156,7 +156,7 @@ test('queues a one-day Ads import before claiming it', async () => {
   });
 
   assert.match(calls[0].url, /agent\/import-ads-spend$/);
-  assert.deepEqual(JSON.parse(calls[0].options.body), { clientId: 'rdc-1', label: 'RDC 1', version: '0.3.0', dateFrom: '2026-08-23', dateTo: '2026-08-23' });
+  assert.deepEqual(JSON.parse(calls[0].options.body), { clientId: 'rdc-1', label: 'RDC 1', version: '0.3.0', dateFrom: '2026-08-20', dateTo: '2026-08-23' });
 });
 
 test('claims, runs, and completes an import command with the existing bearer token', async () => {
@@ -229,7 +229,7 @@ test('runs an Ads command with its queued date range', async () => {
     fetchImpl: async () => ({ ok: true, json: async () => responses.shift() }),
   });
 
-  assert.deepEqual(dates, { dateFrom: '2026-08-01', dateTo: '2026-08-22' });
+  assert.deepEqual(dates, { dateFrom: '2026-08-01', dateTo: '2026-08-22', dryRun: false });
 });
 
 test('reports the backend error detail when heartbeat fails', async () => {
