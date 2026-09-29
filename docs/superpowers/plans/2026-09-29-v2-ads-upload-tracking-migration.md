@@ -4,7 +4,7 @@
 
 **Goal:** Migrate v1's stable Ads safeguards and Seller Central tracking submission into v2's leased extension-command architecture.
 
-**Architecture:** Ads remains a v2 Finance import command; the extension adds range/preview controls while retaining the existing report-to-Finance pipeline. Tracking becomes a new V2 command and backend-owned batch lifecycle; only the extension interacts with Seller Central and the backend records the Amazon terminal result.
+**Architecture:** Ads remains a v2 Finance import command; each requested day uses V2's existing CSV-to-Finance pipeline, Preview avoids Finance and Dry-run calls Finance with `dryRun: true`. Tracking becomes a new V2 command with a backend-owned TSV snapshot and an extension-owned native submission plus persisted Feed History watcher; only a Processing Report terminal result completes V2 state.
 
 **Tech Stack:** Chrome Extension Manifest V3, browser-native JavaScript, Node.js, Express, Mongoose, Joi, node:test, Jest.
 
@@ -24,7 +24,7 @@
 - A date range with `dateFrom > dateTo` must be rejected before any Ads API request; covered in Task 1.
 - An expired Ads session must stop before reporting/import; covered in Task 2.
 - A lost command lease must prevent an upload submission; covered in Task 4.
-- A browser timeout after an upload acknowledgement must reconcile by feed id, not resubmit; covered in Task 5.
+- A browser timeout after an upload acknowledgement must reconcile from the saved Feed History snapshot, not resubmit; covered in Task 5.
 - A terminal Amazon row error must complete the V2 command as failed with bounded diagnostics; covered in Task 5.
 
 ---
@@ -51,7 +51,7 @@ Expected: FAIL because the command accepts only `date` and the report builder ac
 
 - [ ] **Step 3: Implement the minimal range contract and UI**
 
-Change `queueAdsSpendCommand` and `queueManualAdsSpend` to carry `dateFrom` and `dateTo`. Replace the single popup date input with labeled From/To date inputs plus Preview, Dry-run and Import buttons. Preview reads/report-validates only; Dry-run must not call `postFileTo`; Import retains the current Finance ingest call and returns its row count.
+Change `queueAdsSpendCommand` and `queueManualAdsSpend` to carry `dateFrom` and `dateTo`. Replace the single popup date input with labeled From/To date inputs plus Preview, Dry-run and Import buttons. Iterate inclusively by calendar day: Preview reads/report-validates only; Dry-run calls `postFileTo` with `dryRun: "true"`; Import calls it with `dryRun: "false"` and returns aggregate row counts.
 
 - [ ] **Step 4: Run focused extension tests**
 
@@ -114,12 +114,12 @@ git commit -m "fix(extension): guard v2 Ads report imports"
 - Test: `C:/lng_system/lng-web/lng-web-be/src/modules/integration/extensionCommand/__tests__/extensionCommand.validator.test.js`, new `amazonTrackingSubmission/__tests__/amazonTrackingSubmission.service.test.js`
 
 **Interfaces:**
-- Produces: `createSubmission({ shopId, agentId, rows, auth }) -> { command, submissionId }`, `getLeasedPayload({ commandId, leaseToken, auth }) -> { submissionId, filename, tsv, rowCount, checksum }`, `markSubmitted({ submissionId, feedId, auth })`, and `markTerminal({ submissionId, status, result, auth })`.
+- Produces: `createSubmission({ shopId, agentId, rows, auth }) -> { command, submissionId }`, `getLeasedPayload({ commandId, leaseToken, auth }) -> { submissionId, filename, tsv, rowCount, checksum }`, `markSubmitted({ submissionId, auth })`, `recordAmazonBatch({ submissionId, amazonBatchId, auth })`, and `markTerminal({ submissionId, status, result, auth })`.
 - Consumes: shop-scoped extension authentication and the existing command lease identity.
 
 - [ ] **Step 1: Write failing backend tests**
 
-Add tests that reject a non-extension/shop-mismatched payload request, accept `UPLOAD_TRACKING` as one active command per agent, and create an immutable checksum-bound TSV batch without storing its content in logs.
+Add tests that reject a non-extension/shop-mismatched payload request, accept `UPLOAD_TRACKING` as one active command per agent, create an immutable checksum-bound TSV batch without storing its content in logs, and reject terminal state before a recorded `SUBMITTED` state.
 
 - [ ] **Step 2: Run the focused backend tests to verify they fail**
 
@@ -129,7 +129,7 @@ Expected: FAIL because the command type, submission model and service do not exi
 
 - [ ] **Step 3: Implement the backend-owned submission lifecycle**
 
-Add `UPLOAD_TRACKING` to command constants/model/validator and include it in the existing per-agent active-command lock. The new module owns candidate-row snapshot, TSV generation, SHA-256 checksum, submission state (`QUEUED`, `SUBMITTED`, `SUCCEEDED`, `FAILED`) and bounded diagnostics. Wire thin command routes/controllers to create, lease-read, mark submitted and mark terminal; enforce the extension token's shop and the claimed command's lease at every state change.
+Add `UPLOAD_TRACKING` to command constants/model/validator and include it in the existing per-agent active-command lock. The new module owns candidate-row snapshot, TSV generation, SHA-256 checksum, pre-submission Feed History snapshot metadata, and submission state (`QUEUED`, `SUBMITTED`, `SUCCEEDED`, `FAILED`) with bounded diagnostics. Wire thin command routes/controllers to create, lease-read, mark submitted, persist a discovered Amazon batch id, and mark terminal; enforce the extension token's shop and the claimed command's lease at every state change.
 
 - [ ] **Step 4: Run focused backend tests**
 
@@ -152,12 +152,12 @@ git -C C:/lng_system/lng-web/lng-web-be commit -m "feat(integration): add tracki
 - Test: `tests/extension-command-client.test.mjs`, new `tests/amazon-tracking-upload.test.mjs`
 
 **Interfaces:**
-- Consumes: `UPLOAD_TRACKING` command payload and `getLeasedPayload`, `markSubmitted`, `markTerminal` backend endpoints from Task 3.
-- Produces: `runTrackingUpload({ command, leaseToken, onProgress }) -> { submissionId, feedId, importedCount, failedCount }`.
+- Consumes: `UPLOAD_TRACKING` command payload and `getLeasedPayload`, `markSubmitted`, `recordAmazonBatch`, `markTerminal` backend endpoints from Task 3.
+- Produces: `runTrackingUpload({ command, leaseToken, onProgress }) -> { submissionId, historyBeforeBatchIds, importedCount, failedCount }`.
 
 - [ ] **Step 1: Write failing extension tests**
 
-Add tests that `pollExtensionCommand` dispatches `UPLOAD_TRACKING`, renews before native submission, serializes concurrent uploads with `UPLOAD_TRACKING_ALREADY_RUNNING`, and sends the backend `markSubmitted` call exactly once with the feed id.
+Add tests that `pollExtensionCommand` dispatches `UPLOAD_TRACKING`, renews before native submission, serializes concurrent uploads with `UPLOAD_TRACKING_ALREADY_RUNNING`, snapshots Feed History before submission, and sends `markSubmitted` exactly once without an Amazon batch id.
 
 - [ ] **Step 2: Run focused extension tests to verify they fail**
 
@@ -167,7 +167,7 @@ Expected: FAIL because `UPLOAD_TRACKING` is unsupported and no upload module exi
 
 - [ ] **Step 3: Implement the smallest native-feed adapter**
 
-Move only v1's proven TSV validation, Seller Central page-context form submit and CSRF preflight into `amazonTrackingUpload.js`; expose pure TSV/status parsing in `amazonFeedHistory.js`. The dispatcher fetches the leased snapshot, validates checksum/row count, renews the lease before submission, persists the returned Amazon feed id through Task 3's endpoint, and never logs TSV/cookies/CSRF. Update Manifest permissions only after the adapter's API calls demonstrate a missing permission.
+Move only v1's proven TSV validation, Los-Angeles ship-date clamp, Seller Central native form submit and page preflight into `amazonTrackingUpload.js`; expose pure snapshot/new-row/status parsing in `amazonFeedHistory.js`. The dispatcher fetches the leased snapshot, validates checksum/row count, snapshots Feed History before submission, renews before submission, then records `SUBMITTED` and persists the snapshot without an Amazon batch id. Never log TSV/cookies/CSRF. Update Manifest permissions only after the adapter's API calls demonstrate a missing permission.
 
 - [ ] **Step 4: Run focused extension tests**
 
@@ -190,12 +190,12 @@ git commit -m "feat(extension): submit v2 Amazon tracking feeds"
 - Test: `tests/amazon-tracking-upload.test.mjs`, `C:/lng_system/lng-web/lng-web-be/src/modules/integration/amazonTrackingSubmission/__tests__/amazonTrackingSubmission.service.test.js`
 
 **Interfaces:**
-- Consumes: persisted `{ submissionId, feedId, checksum }` and Amazon Processing Report status.
+- Consumes: persisted `{ submissionId, historyBeforeBatchIds, checksum }`, observed Amazon Feed History row, and Processing Report status.
 - Produces: terminal `markTerminal({ submissionId, status: 'SUCCEEDED' | 'FAILED', result, auth })` before the command `complete` call.
 
 - [ ] **Step 1: Write failing reconciliation tests**
 
-Add tests for: submitted-but-unknown state continues polling; a timeout after feed id persistence resumes history lookup without calling submit; `DONE` completes successfully; and an Amazon row error completes failed with the first bounded diagnostics.
+Add tests for: submitted-but-unknown state continues polling; a timeout after `SUBMITTED` resumes history lookup without calling submit; the first row absent from the snapshot is persisted as `amazonBatchId`; `DONE` completes successfully; and an Amazon row error completes failed with the first bounded diagnostics.
 
 - [ ] **Step 2: Run focused reconciliation tests to verify they fail**
 
@@ -205,7 +205,7 @@ Expected: FAIL because the module has no terminal-state reconciliation.
 
 - [ ] **Step 3: Implement feed-history reconciliation**
 
-Poll only the persisted feed id from the dedicated Seller Central history page. Renew the command lease on progress, call `markTerminal` exactly once for a terminal status, then let `pollExtensionCommand` complete the leased command. On a non-terminal timeout, leave the submission `SUBMITTED` and surface a retryable reconciliation error; do not call native submission again.
+Persist one watch per `submissionId` in extension storage and poll the dedicated Seller Central history page every minute. Locate the first Feed History row absent from `historyBeforeBatchIds`, persist its `amazonBatchId` through Task 3, then poll its Processing Report. Renew the command lease on progress, call `markTerminal` exactly once for a terminal status, then let `pollExtensionCommand` complete the leased command. On a non-terminal timeout, leave the submission `SUBMITTED` and surface a retryable reconciliation error; do not call native submission again.
 
 - [ ] **Step 4: Run focused extension and backend tests**
 
@@ -247,7 +247,7 @@ Expected: PASS; report every pre-existing failure separately if present.
 
 - [ ] **Step 3: Perform staging-only readback**
 
-Using a non-production shop and explicitly approved safe batch, verify the created command, persisted submission id/checksum, Amazon feed id, terminal Processing Report, and final backend command status. Do not invoke this step against production without a new explicit approval.
+Using a non-production shop and explicitly approved safe batch, verify the created command, persisted submission id/checksum, pre-submission Feed History snapshot, observed Amazon feed id, terminal Processing Report, and final backend command status. Do not invoke this step against production without a new explicit approval.
 
 - [ ] **Step 4: Commit only any test fixes caused by the verification**
 
@@ -259,6 +259,6 @@ git commit -m "test(extension): cover v2 tracking migration"
 ## Self-review
 
 - Spec coverage: Tasks 1-2 cover Ads; Tasks 3-5 cover the V2 tracking command, native upload, persisted feed id and terminal reconciliation; Task 6 supplies the required staging proof.
-- Type consistency: `UPLOAD_TRACKING`, `submissionId`, `feedId`, and `markTerminal` use the same names across backend and extension tasks.
+- Type consistency: `UPLOAD_TRACKING`, `submissionId`, `historyBeforeBatchIds`, `amazonBatchId`, and `markTerminal` use the same names across backend and extension tasks.
 - Review focus: each listed failure mode has an explicit failing test in its owning task.
 - Scope: the plan excludes legacy route/socket migration, Gmail/OAuth work, broad historic resubmission, and production release.
