@@ -18,6 +18,8 @@ import {
 import { classifyAmazonAdsReportLink, createGmailAdsDownloadFingerprint } from './gmailReportDownload.js';
 import { fetchTransactionsCsv as fetchAmazonTransactionsCsv, summarizeTransactionCsv } from './amazonTransaction.js';
 import { runListingImageBatch } from './amazonListingImage.js';
+import { submitNativeTrackingFeed, validateTrackingPayload } from './amazonTrackingUpload.js';
+import { snapshotFeedHistory } from './amazonFeedHistory.js';
 import {
   SETTLEMENT_IMPORT_COOLDOWN_MS,
   canStartSettlementImport,
@@ -1768,6 +1770,24 @@ async function uploadGmailAdsDownload(url) {
   }
 }
 async function runFullFlowAndEmitLogs(numDays) { try { const importResult = await runImportNewOrders(undefined, numDays); return { ok: true, phases: [{ type: "import", status: "success", rows: importResult?.rows || 0 }], result: importResult }; } catch (error) { await setOrderImportProgress('FAILED', 'Order import failed', { error: error?.message || String(error) }); throw error; } }
+async function runTrackingUpload({ command, leaseToken, onProgress }) {
+  const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const root = `${identity.base.replace(/\/+$/, '')}/api/integration/extension-commands`;
+  const headers = { Authorization: `Bearer ${config.ingestToken}`, 'Content-Type': 'application/json' };
+  const body = { clientId: identity.clientId, label: identity.clientLabel, leaseToken };
+  const payloadResponse = await fetch(`${root}/agent/commands/${command.id}/tracking-payload`, { method: 'POST', headers, body: JSON.stringify(body) });
+  const payload = (await payloadResponse.json()).data; if (!payloadResponse.ok) throw new Error('Tracking payload lease rejected');
+  await validateTrackingPayload(payload); await onProgress({ stage: 'READY_TO_SUBMIT' });
+  const tabs = await chrome.tabs.query({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds*' });
+  const tab = tabs[0] || await chrome.tabs.create({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds', active: true });
+  const historyBeforeBatchIds = await snapshotFeedHistory(tab.id);
+  await submitNativeTrackingFeed({ tsv: payload.tsv, filename: payload.filename, tabId: tab.id });
+  for (const suffix of ['submitted', 'waiting']) {
+    const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/${suffix}`, { method: 'POST', headers, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(`Tracking ${suffix} state was rejected`);
+  }
+  await chrome.storage.local.set({ [`trackingWatch:${payload.submissionId}`]: { submissionId: payload.submissionId, historyBeforeBatchIds, checksum: payload.checksum } });
+  return { deferred: true, submissionId: payload.submissionId };
+}
 async function pollExtensionCommands(config = null) {
   config ||= await getCfg();
   const identity = await getBaseShopAndIdentity();
@@ -1778,6 +1798,7 @@ async function pollExtensionCommands(config = null) {
     runTransactions: runImportTransactions,
     runSettlements: options => options.dateFrom && options.dateTo ? runSettlementRange(options) : runScheduledSettlementImport(options),
     runListingImages: options => runListingImageBatch({ ...options, base: identity.base, token: config.ingestToken, client }),
+    runTracking: runTrackingUpload,
   });
 }
 async function getActivityCommands() {

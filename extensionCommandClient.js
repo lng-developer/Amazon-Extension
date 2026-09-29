@@ -35,7 +35,7 @@ export async function listAgentCommands({ base, token, client, fetchImpl = fetch
   return result?.items || [];
 }
 
-export async function pollExtensionCommand({ base, token, client, runImport, runAds, runTransactions, runSettlements, runListingImages, logger, fetchImpl = fetch }) {
+export async function pollExtensionCommand({ base, token, client, runImport, runAds, runTransactions, runSettlements, runListingImages, runTracking, logger, fetchImpl = fetch }) {
   if (!base || !token || !client?.clientId || !client?.label) return null;
   const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;
   await request(fetchImpl, `${root}/agent/heartbeat`, token, 'POST', client);
@@ -62,10 +62,12 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
     lastStage = stage;
   };
   try {
-    if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'SYNC_LISTING_IMAGES', 'TEST_CONNECTION'].includes(command.type)) {
+    if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'SYNC_LISTING_IMAGES', 'UPLOAD_TRACKING', 'TEST_CONNECTION'].includes(command.type)) {
       throw new Error(`Unsupported command: ${command.type}`);
     }
-    const outcome = command.type === 'SYNC_LISTING_IMAGES'
+    const outcome = command.type === 'UPLOAD_TRACKING'
+      ? await runTracking({ command, leaseToken: claim.leaseToken, onProgress, activity })
+      : command.type === 'SYNC_LISTING_IMAGES'
       ? await runListingImages({ command, leaseToken: claim.leaseToken, onProgress, activity })
       : command.type === 'IMPORT_NEW_ORDERS'
       ? await runImport(command.numDays || 1, activity)
@@ -76,6 +78,7 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
           : command.type === 'IMPORT_SETTLEMENTS'
             ? await runSettlements({ dateFrom: command.dateFrom, dateTo: command.dateTo, onProgress, activity })
         : null;
+    if (outcome?.deferred) return { id: command.id, status: 'WAITING_AMAZON' };
     const result = outcome?.data || outcome?.result || outcome;
     const importJobId = result?.id || result?.importBatchId || result?.jobId || result?.data?.jobId || result?.ingest?.data?.jobId || batchId;
     const importedCount = Number(result?.importedCount ?? result?.processedRows ?? result?.rows ?? 0);

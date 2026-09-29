@@ -232,6 +232,21 @@ test('runs an Ads command with its queued date range', async () => {
   assert.deepEqual(dates, { dateFrom: '2026-08-01', dateTo: '2026-08-22', dryRun: false });
 });
 
+test('defers an acknowledged tracking upload without completing its command', async () => {
+  const calls = [];
+  const result = await pollExtensionCommand({
+    base: 'https://dev-api.lngmerch.co', token: 'test', client: { clientId: 'rdc-1', label: 'RDC 1' },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url, body: options.body && JSON.parse(options.body) });
+      return { ok: true, json: async () => ({ data: url.endsWith('/claim') ? { command: { id: 'tracking-1', type: 'UPLOAD_TRACKING', submissionId: 'submission-1' }, leaseToken: 'lease-token-1234567890' } : {} }) };
+    },
+    runTracking: async ({ onProgress }) => { await onProgress({ stage: 'READY_TO_SUBMIT' }); return { deferred: true, submissionId: 'submission-1' }; },
+  });
+  assert.deepEqual(result, { id: 'tracking-1', status: 'WAITING_AMAZON' });
+  assert.ok(calls.some(({ url }) => url.endsWith('/renew')));
+  assert.ok(!calls.some(({ url }) => url.endsWith('/complete')));
+});
+
 test('reports the backend error detail when heartbeat fails', async () => {
   await assert.rejects(
     pollExtensionCommand({
