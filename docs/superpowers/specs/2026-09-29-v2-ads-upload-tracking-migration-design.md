@@ -26,6 +26,8 @@ Keep V2's `IMPORT_ADS_SPEND` command, Reporting CSV creation and Finance upload 
 
 No Gmail redirect path or legacy Ads endpoints are migrated. The extension must report success only after V2 Finance ingest responds successfully.
 
+The V2 Finance contract accepts multipart `dryRun` as a boolean and defaults it to `true`; every import action must send an explicit value. The manual extension-command endpoint currently enforces one day, so it must accept an inclusive range of at most 120 calendar days. The extension executes the days sequentially under one Ads lock and one leased command, uploading one original CSV per day with a deterministic `sourceRef` and idempotency key.
+
 ### Upload tracking
 
 Add a V2 leased command type, `UPLOAD_TRACKING`, with this lifecycle:
@@ -34,14 +36,16 @@ Add a V2 leased command type, `UPLOAD_TRACKING`, with this lifecycle:
 2. The extension acquires its upload lock, lease-reads that payload, validates exact TSV/checksum/row count, then snapshots current Seller Central Feed History before native-form submission in page context.
 3. On a successful browser acknowledgement, the extension records `SUBMITTED` against `submissionId` but does not invent an Amazon feed id. It opens a persisted one-minute watcher that identifies the new Feed History row by excluding the pre-submission ids.
 4. The watcher persists the discovered `amazonBatchId`, polls its Processing Report, and renews the command lease while work continues.
-5. Only a terminal Processing Report marks the submission and command `SUCCEEDED` or `FAILED`, with row counts and bounded diagnostics. A lost acknowledgement or timeout remains `SUBMITTED` and reconciles by `submissionId` plus Feed History before any retry.
+5. After the native acknowledgement, the command becomes `WAITING_AMAZON`: it keeps the per-agent active key but has no expiring browser lease. A restarted extension claims that waiting command and resumes the watcher only; it must not submit again.
+6. Only a terminal Processing Report marks the submission and command `SUCCEEDED` or `FAILED`, with row counts and bounded diagnostics. A lost acknowledgement or timeout remains `SUBMITTED` and reconciles by `submissionId` plus Feed History before any retry.
 
 The backend owns candidate selection, batch creation, deduplication and submission state. The extension owns Amazon browser/session interaction only. A single extension-agent lock serializes uploads; that is sufficient until measured throughput needs per-marketplace concurrency.
 
 ## Contracts and permissions
 
-- Add `UPLOAD_TRACKING` to V2 extension-command constants, validator, claim whitelist and extension dispatcher.
-- Add explicit V2 backend endpoints for requesting a tracking command, lease-reading the batch payload, recording `SUBMITTED`, persisting discovered `amazonBatchId`, and recording terminal feed state. Do not call `/api/shipping-batch*`, `/APO/*` or Socket.IO routes.
+- Add `UPLOAD_TRACKING` and `WAITING_AMAZON` to V2 extension-command constants, model, validator, claim/reclaim logic and extension dispatcher.
+- A submission starts only from an explicit list of `shipmentIds` supplied by an authorized management user. Each shipment must belong to the command shop, have a nonempty carrier/tracking number, have `SHIPPED` or `DELIVERED` status, and resolve through an Amazon order/item. Snapshot the resolved rows and reject any shipment already attached to a non-terminal submission. Automatic candidate discovery is out of scope until it has an approved independent policy.
+- Add explicit V2 backend endpoints for creating that submission, lease-reading the batch payload, recording `SUBMITTED`, transitioning the command to `WAITING_AMAZON`, persisting discovered `amazonBatchId`, and recording terminal feed state. A `WAITING_AMAZON` command may be reclaimed only by the same agent and resumes polling only. Do not call `/api/shipping-batch*`, `/APO/*` or Socket.IO routes.
 - Require the existing extension Bearer token and shop-scoped authorization. The command's agent and shop must match the authenticated extension agent.
 - Keep Amazon feed submission in the authenticated browser session. Do not store Amazon cookies, CSRF values or feed file contents in backend logs.
 - The manifest needs only permissions proven necessary by the native feed submission and diagnostic download; do not copy V1 permissions blindly.
@@ -51,7 +55,7 @@ The backend owns candidate selection, batch creation, deduplication and submissi
 - Missing or stale Amazon session/CSRF: fail the command with an actionable re-login message; do not retry in a loop.
 - Invalid TSV or mismatched batch metadata: fail before Amazon submission and preserve the backend batch for correction/retry.
 - Network interruption after submission: reconcile from the persisted submission and the Feed History snapshot before any retry; never submit a second feed solely because the UI acknowledgement was lost.
-- A feed-level terminal failure records row-level diagnostics where Amazon supplies them. Unknown/timeout remains non-terminal and continues polling within the command lease policy.
+- A feed-level terminal failure records row-level diagnostics where Amazon supplies them. Unknown/timeout remains non-terminal as `WAITING_AMAZON`; a recovered agent reclaims and polls it without re-uploading.
 
 ## Verification
 
