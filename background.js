@@ -19,6 +19,7 @@ import { classifyAmazonAdsReportLink, createGmailAdsDownloadFingerprint } from '
 import { fetchTransactionsCsv as fetchAmazonTransactionsCsv, summarizeTransactionCsv } from './amazonTransaction.js';
 import { runListingImageBatch } from './amazonListingImage.js';
 import { submitNativeTrackingFeed, validateTrackingPayload } from './amazonTrackingUpload.js';
+import { confirmTrackingPreview } from './amazonTrackingPreview.js';
 import { findNewFeedRow, snapshotFeedHistory, terminalFeedResult } from './amazonFeedHistory.js';
 import {
   SETTLEMENT_IMPORT_COOLDOWN_MS,
@@ -1782,6 +1783,8 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
   await validateTrackingPayload(payload); await onProgress({ stage: 'READY_TO_SUBMIT' });
   const tabs = await chrome.tabs.query({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds*' });
   const tab = tabs[0] || await chrome.tabs.create({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds', active: true });
+  const confirmation = await confirmTrackingPreview({ ...payload, tabId: tab.id });
+  if (!confirmation.approved) return { deferred: true, submissionId: payload.submissionId };
   const historyBeforeBatchIds = await snapshotFeedHistory(tab.id);
   await submitNativeTrackingFeed({ tsv: payload.tsv, filename: payload.filename, tabId: tab.id });
   for (const suffix of ['submitted', 'waiting']) {
