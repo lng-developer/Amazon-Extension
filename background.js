@@ -35,7 +35,7 @@ const EXTENSION_COMMAND_POLL_BACKOFF_MINUTES = [1, 2, 5, 10];
 const adsApiLock = { running: false, taskName: "", runId: "", startedAt: 0 };
 let transactionImportRunning = false;
 const extensionLogger = createExtensionLogger({ storage: chrome.storage.local });
-const ensureIdentity = createExtensionIdentity({ storage: chrome.storage.local, randomUUID: crypto.randomUUID });
+const ensureIdentity = createExtensionIdentity({ storage: chrome.storage.local, randomUUID: () => crypto.randomUUID() });
 async function setOrderImportProgress(state, message, details = {}) {
   await chrome.storage.local.set({ [ORDER_IMPORT_PROGRESS_KEY]: createOrderImportProgress(state, message, details) });
 }

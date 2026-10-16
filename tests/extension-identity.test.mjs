@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFile } from 'node:fs/promises';
 import { createExtensionIdentity } from '../extensionIdentity.js';
 
 test('shares one generated client identity across concurrent initialization', async () => {
@@ -17,4 +18,10 @@ test('shares one generated client identity across concurrent initialization', as
   assert.deepEqual(second, first);
   assert.equal(generated, 1);
   assert.deepEqual(values, first);
+});
+
+test('keeps the Crypto receiver when creating the extension identity', async () => {
+  const background = await readFile(new URL('../background.js', import.meta.url), 'utf8');
+
+  assert.match(background, /randomUUID: \(\) => crypto\.randomUUID\(\)/);
 });
