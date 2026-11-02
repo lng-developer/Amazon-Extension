@@ -1013,6 +1013,106 @@ async function fetchAdsJsonCS(payload, options = {}) {
   throw lastError || new Error("retrieveReport failed after auth retry");
 }
 
+function buildCampaignSpendPayload({
+  startDate,
+  endDate,
+  size,
+  offset,
+  timeUnit = "DAILY",
+  isCheckCampain = false,
+}) {
+  const valueFilter = isCheckCampain
+    ? ["ENABLED", "PAUSED"]
+    : ["ENABLED", "PAUSED", "ARCHIVED"];
+  return {
+    reportConfig: {
+      reportId: "CrossProgramCampaignReport",
+      currencyOfView: "USD",
+      endDate,
+      fields: ["campaignName", "spend", "state"],
+      filter: {
+        and: [
+          {
+            comparisonOperator: "IN",
+            field: "state",
+            not: false,
+            values: valueFilter,
+          },
+        ],
+      },
+      offsetPagination: { size, offset },
+      startDate,
+      timeUnits: [timeUnit],
+    },
+  };
+}
+
+async function fetchAllCampaignSpend(
+  startDate,
+  endDate,
+  pageSize = 300,
+  isCheckCampain = false,
+  options = {}
+) {
+  const firstJson = await fetchAdsJsonCS(
+    buildCampaignSpendPayload({
+      startDate,
+      endDate,
+      size: Math.max(1, Math.min(pageSize, 300)),
+      offset: 0,
+      isCheckCampain,
+    }),
+    { ...options, isCheckCampain, pageOffset: 0, pageSize: Math.max(1, Math.min(pageSize, 300)) }
+  );
+
+  const report0 = firstJson?.report || firstJson?.data?.report || {};
+  const count = report0?.numberOfRecords ?? 0;
+  const rows1 = Array.isArray(report0?.data) ? report0.data : [];
+
+  if (count === 0 || rows1.length === 0) return [];
+
+  const totalPages = Math.ceil(count / pageSize);
+  let all = rows1;
+
+  for (let page = 1; page < totalPages; page++) {
+    const js = await fetchAdsJsonCS(
+      buildCampaignSpendPayload({
+        startDate,
+        endDate,
+        size: pageSize,
+        offset: page * pageSize,
+        isCheckCampain,
+      }),
+      { ...options, isCheckCampain, pageOffset: page * pageSize, pageSize }
+    );
+    const report = js?.report || js?.data?.report || {};
+    const more = Array.isArray(report?.data) ? report.data : [];
+    if (!more.length) break;
+    all = all.concat(more);
+    await delayMs(200);
+  }
+
+  return all.map((r) => ({
+    campaignName: r.campaignName ?? "",
+    date: startDate,
+    spend: Number(r.spend ?? 0),
+    state: r.state ?? "",
+  }));
+}
+
+function formatCampaignSpendCsv(rows) {
+  const header = "Date,Campaign Name,Status,Spend";
+  const lines = rows.map((r) =>
+    [
+      r.date,
+      `"${String(r.campaignName || "").replace(/"/g, '""')}"`,
+      r.state || "ENABLED",
+      Number(r.spend || 0).toFixed(2),
+    ].join(",")
+  );
+  return [header, ...lines].join("\n");
+}
+
 async function adsReportingViaContentScript(operation, payload, options = {}) {
   const tabId = await ensureAdsReportingTab();
   await ensureAdsBridgeInjected(tabId);
@@ -1673,10 +1773,20 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, previ
     let rows = 0;
     let lastIngest;
     for (const date of dates) {
-      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Creating one-time Amazon Reporting CSV', { date, preview, dryRun });
-      const configurationId = await createAndRunAdsReport(date, date, lock);
-      await waitForAdsReport(configurationId, lock);
-      const csv = await downloadAdsReportCsv(configurationId, lock);
+      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Processing campaign spend for date', { date, preview, dryRun });
+      let csv = null;
+      let directRowCount = 0;
+      try {
+        const rows = await fetchAllCampaignSpend(date, date, 300, false, lock);
+        csv = formatCampaignSpendCsv(rows);
+        directRowCount = rows.length;
+        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Direct retrieveReport retrieved campaign rows', { date, count: directRowCount });
+      } catch (directError) {
+        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Direct retrieveReport fallback to reporting template', { date, error: directError?.message });
+        const configurationId = await createAndRunAdsReport(date, date, lock);
+        await waitForAdsReport(configurationId, lock);
+        csv = await downloadAdsReportCsv(configurationId, lock);
+      }
       const filename = `ads-report-${date}.csv`;
       if (preview) continue;
       lastIngest = await postFileTo(adsSpendUrl, {
@@ -1770,6 +1880,26 @@ async function uploadGmailAdsDownload(url) {
   }
 }
 async function runFullFlowAndEmitLogs(numDays) { try { const importResult = await runImportNewOrders(undefined, numDays); return { ok: true, phases: [{ type: "import", status: "success", rows: importResult?.rows || 0 }], result: importResult }; } catch (error) { await setOrderImportProgress('FAILED', 'Order import failed', { error: error?.message || String(error) }); throw error; } }
+async function waitForSellerCentralTabComplete(tabId, timeoutMs = 30000) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.status === 'complete') return;
+  } catch (_) { return; }
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }, timeoutMs);
+    const listener = (id, changeInfo) => {
+      if (id === tabId && changeInfo.status === 'complete') {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
 async function runTrackingUpload({ command, leaseToken, onProgress }) {
   const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const root = `${identity.base.replace(/\/+$/, '')}/api/integration/extension-commands`;
   const headers = { Authorization: `Bearer ${config.ingestToken}`, 'Content-Type': 'application/json' };
@@ -1782,6 +1912,7 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
   await validateTrackingPayload(payload); await onProgress({ stage: 'READY_TO_SUBMIT' });
   const tabs = await chrome.tabs.query({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds*' });
   const tab = tabs[0] || await chrome.tabs.create({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds', active: true });
+  await waitForSellerCentralTabComplete(tab.id);
   const historyBeforeBatchIds = await snapshotFeedHistory(tab.id);
   await submitNativeTrackingFeed({ tsv: payload.tsv, filename: payload.filename, tabId: tab.id });
   for (const suffix of ['submitted', 'waiting']) {
@@ -1794,6 +1925,8 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
 async function reconcileTrackingWatch({ command, payload, watch, root, headers, body }) {
   const tabs = await chrome.tabs.query({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds*' });
   if (!tabs[0]?.id) return { deferred: true, submissionId: payload.submissionId };
+  await chrome.tabs.reload(tabs[0].id).catch(() => {});
+  await waitForSellerCentralTabComplete(tabs[0].id);
   const [rows] = await chrome.scripting.executeScript({ target: { tabId: tabs[0].id }, world: 'MAIN', func: () => [...document.querySelectorAll('tr')].map((row) => row.innerText || '') });
   const row = findNewFeedRow(rows?.result || [], watch.historyBeforeBatchIds);
   if (!row) return { deferred: true, submissionId: payload.submissionId };

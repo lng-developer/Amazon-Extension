@@ -17,14 +17,17 @@ export async function submitNativeTrackingFeed({ tsv, filename, tabId }) {
   const [result] = await chrome.scripting.executeScript({
     target: { tabId }, world: 'MAIN', args: [tsv, filename],
     func: async (content, name) => {
-      const input = document.querySelector('#fileToUpload');
-      const submit = document.querySelector('input[name="upload"][type="submit"]');
-      if (!(input instanceof HTMLInputElement) || !(submit instanceof HTMLInputElement)) throw new Error('Seller Central upload controls are unavailable');
+      if (document.querySelector('form[action*="signin"], input[name="password"], #ap_email, #auth-captcha-image')) {
+        throw new Error('Seller Central login or CAPTCHA required');
+      }
+      const input = document.querySelector('#fileToUpload, input[type="file"]');
+      const submit = document.querySelector('input[name="upload"][type="submit"], input[type="submit"], button[type="submit"]');
+      if (!(input instanceof HTMLInputElement) || !(submit instanceof HTMLElement)) throw new Error('Seller Central upload controls are unavailable');
       const transfer = new DataTransfer();
       transfer.items.add(new File([content], name, { type: 'text/tab-separated-values' }));
       input.files = transfer.files;
       input.dispatchEvent(new Event('change', { bubbles: true }));
-      if (submit.disabled) throw new Error('Seller Central did not enable upload');
+      if (submit instanceof HTMLInputElement && submit.disabled) throw new Error('Seller Central did not enable upload');
       submit.click();
       return { acknowledged: true };
     },
