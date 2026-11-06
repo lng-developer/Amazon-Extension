@@ -1722,6 +1722,7 @@ async function runScheduledSettlementImport(options = {}) {
 
 async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, preview = false }, lock = {}) {
   const startTime = Date.now();
+  const activityContext = { taskId: `ads_export_${startTime}`, runId: lock.runId || `ads_export_${startTime}`, taskType: 'IMPORT_ADS_SPEND', dateFrom, dateTo };
 
   // Initialize logger if not exists
   if (!extensionLogger) {
@@ -1731,8 +1732,7 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, previ
   // Log task processing start
   if (extensionLogger) {
     await extensionLogger.logTaskProcessing({
-      taskId: `ads_export_${Date.now()}`,
-      taskType: 'IMPORT_ADS_SPEND',
+      ...activityContext,
       batchId: `ads_${dateFrom}_${dateTo}`,
       ordersCount: 0,
       filename: `ads-spend-${dateFrom}-${dateTo}.csv`
@@ -1744,8 +1744,7 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, previ
     const error = new Error("Missing ingestUrl (Options)");
     if (extensionLogger) {
       await extensionLogger.logTaskFailed({
-        taskId: `ads_export_${startTime}`,
-        taskType: 'IMPORT_ADS_SPEND',
+        ...activityContext,
         batchId: `ads_${dateFrom}_${dateTo}`
       }, error, '[IMPORT_ADS_SPEND] Ads export failed: Missing ingestUrl');
     }
@@ -1760,8 +1759,7 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, previ
   } catch (error) {
     if (extensionLogger) {
       await extensionLogger.logTaskFailed({
-        taskId: `ads_export_${startTime}`,
-        taskType: 'IMPORT_ADS_SPEND',
+        ...activityContext,
         batchId: `ads_${dateFrom}_${dateTo}`
       }, error, '[IMPORT_ADS_SPEND] Ads export failed: Missing date parameter');
     }
@@ -1773,16 +1771,16 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, previ
     let rows = 0;
     let lastIngest;
     for (const date of dates) {
-      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Processing campaign spend for date', { date, preview, dryRun });
+      await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Processing campaign spend for date', { ...activityContext, date, preview, dryRun });
       let csv = null;
       let directRowCount = 0;
       try {
         const rows = await fetchAllCampaignSpend(date, date, 300, false, lock);
         csv = formatCampaignSpendCsv(rows);
         directRowCount = rows.length;
-        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Direct retrieveReport retrieved campaign rows', { date, count: directRowCount });
+        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Direct retrieveReport retrieved campaign rows', { ...activityContext, date, count: directRowCount });
       } catch (directError) {
-        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Direct retrieveReport fallback to reporting template', { date, error: directError?.message });
+        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Direct retrieveReport fallback to reporting template', { ...activityContext, date, error: directError?.message });
         const configurationId = await createAndRunAdsReport(date, date, lock);
         await waitForAdsReport(configurationId, lock);
         csv = await downloadAdsReportCsv(configurationId, lock);
@@ -1805,8 +1803,7 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, previ
     // Log task completed
     if (extensionLogger) {
       await extensionLogger.logTaskCompleted({
-        taskId: `ads_export_${startTime}`,
-        taskType: 'IMPORT_ADS_SPEND',
+        ...activityContext,
         batchId: `ads_${dateFrom}_${dateTo}`,
         ordersCount: 0,
         filename: `ads-report-${dateTo}.csv`
@@ -1823,8 +1820,7 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, previ
     // Log task failed
     if (extensionLogger) {
       await extensionLogger.logTaskFailed({
-        taskId: `ads_export_${startTime}`,
-        taskType: 'IMPORT_ADS_SPEND',
+        ...activityContext,
         batchId: `ads_${dateFrom}_${dateTo}`,
         ordersCount: 0,
         filename: `ads-spend-${dateFrom}-${dateTo}.csv`

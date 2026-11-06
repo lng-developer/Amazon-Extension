@@ -165,6 +165,17 @@ test('activity timeline marks a completed Gmail Ads upload as succeeded', () => 
   assert.equal(runs[0].status, 'SUCCEEDED');
 });
 
+test('groups Ads day batches into one run with total day progress', () => {
+  const runs = buildActivityRuns([
+    { timestamp: '2026-09-01T08:00:00Z', level: 'info', message: 'Ads task started', context: { runId: 'ads-week', taskType: 'IMPORT_ADS_SPEND', dateFrom: '2026-09-01', dateTo: '2026-09-03' } },
+    { timestamp: '2026-09-01T08:01:00Z', level: 'info', message: 'Processing campaign spend for date', context: { runId: 'ads-week', taskType: 'IMPORT_ADS_SPEND', date: '2026-09-01' } },
+    { timestamp: '2026-09-01T08:02:00Z', level: 'info', message: 'Processing campaign spend for date', context: { runId: 'ads-week', taskType: 'IMPORT_ADS_SPEND', date: '2026-09-02' } },
+  ]);
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0].processedDays, 2);
+  assert.equal(runs[0].totalDays, 3);
+});
+
 test('activity timeline marks a completed transaction import as succeeded', () => {
   const runs = buildActivityRuns([
     { timestamp: '2026-09-07T11:43:01.491Z', level: 'info', message: 'Transaction task started', context: { taskId: 'transactions-1' } },

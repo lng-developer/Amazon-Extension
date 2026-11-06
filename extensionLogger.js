@@ -63,9 +63,12 @@ export function buildActivityRuns(events = [], { now = Date.now(), commands = []
     // Legacy task IDs were date ranges, not attempt IDs. A new start is a new attempt.
     if (key && !strongKey && startsRun) run = null;
     if (!run) {
-      run = { id: `${key || type}-${event.timestamp}-${runs.length}`, key, commandId: context.commandId, type, label: ACTIVITY_TYPES[type], status: 'RUNNING', startedAt: event.timestamp, error: null, events: [] };
+      run = { id: `${key || type}-${event.timestamp}-${runs.length}`, key, commandId: context.commandId, type, label: ACTIVITY_TYPES[type], status: 'RUNNING', startedAt: event.timestamp, dateFrom: context.dateFrom || null, dateTo: context.dateTo || null, dates: [], error: null, events: [] };
       runs.push(run);
     }
+    if (context.date && !run.dates.includes(context.date)) run.dates.push(context.date);
+    if (context.dateFrom) run.dateFrom = context.dateFrom;
+    if (context.dateTo) run.dateTo = context.dateTo;
     run.events.push(event);
     if (context.backendConfirmed && ['SUCCEEDED', 'FAILED'].includes(context.activityStatus)) run.confirmedStatus = context.activityStatus;
     if (context.activityStatus === 'FAILED' || event.level === 'error') {
@@ -80,6 +83,10 @@ export function buildActivityRuns(events = [], { now = Date.now(), commands = []
   }, []);
   const byId = new Map(commands.map(command => [command.id, command]));
   return runs.map(run => {
+    run.processedDays = run.dates?.length || 0;
+    run.totalDays = run.dateFrom && run.dateTo
+      ? Math.floor((Date.parse(`${run.dateTo}T00:00:00Z`) - Date.parse(`${run.dateFrom}T00:00:00Z`)) / 86400000) + 1
+      : null;
     const command = byId.get(run.commandId);
     if (run.confirmedStatus && !['SUCCEEDED', 'FAILED'].includes(command?.status)) {
       run.status = run.confirmedStatus;

@@ -68,7 +68,8 @@ async function renderLogs() {
     header.append(title, status);
     const meta = document.createElement('p');
     const batchId = run.events[0]?.context?.batchId;
-    meta.textContent = `${formatVietnamTime(run.startedAt)}${batchId ? ` · ${batchId}` : ''}`;
+    const progress = run.totalDays ? ` · ${run.processedDays}/${run.totalDays} days` : '';
+    meta.textContent = `${formatVietnamTime(run.startedAt)}${batchId ? ` · ${batchId}` : ''}${progress}`;
     card.append(header, meta);
     if (run.error) {
       const error = document.createElement('p');
