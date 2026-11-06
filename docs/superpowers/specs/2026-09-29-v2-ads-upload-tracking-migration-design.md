@@ -41,11 +41,16 @@ Add a V2 leased command type, `UPLOAD_TRACKING`, with this lifecycle:
 
 The backend owns candidate selection, batch creation, deduplication and submission state. The extension owns Amazon browser/session interaction only. A single extension-agent lock serializes uploads; that is sufficient until measured throughput needs per-marketplace concurrency.
 
+### Shipment Workbench UI
+
+Extend the existing `lng-web-fe` Shipment Workbench; do not add a separate tracking application or automatic candidate discovery. A user with shipment write permission selects explicit eligible Amazon shipments already shown in the table and invokes “Submit Amazon tracking”. The UI creates one submission for the selected extension agent, then renders its submission status, row count and bounded diagnostic. It may refresh the command/submission state, but never exposes TSV content, Amazon cookies or CSRF values. The submit action is disabled unless one eligible row and one online extension agent are selected.
+
 ## Contracts and permissions
 
 - Add `UPLOAD_TRACKING` and `WAITING_AMAZON` to V2 extension-command constants, model, validator, claim/reclaim logic and extension dispatcher.
 - A submission starts only from an explicit list of `shipmentIds` supplied by an authorized management user. Each shipment must belong to the command shop, have a nonempty carrier/tracking number, have `SHIPPED` or `DELIVERED` status, and resolve through an Amazon order/item. Snapshot the resolved rows and reject any shipment already attached to a non-terminal submission. Automatic candidate discovery is out of scope until it has an approved independent policy.
 - Add explicit V2 backend endpoints for creating that submission, lease-reading the batch payload, recording `SUBMITTED`, transitioning the command to `WAITING_AMAZON`, persisting discovered `amazonBatchId`, and recording terminal feed state. A `WAITING_AMAZON` command may be reclaimed only by the same agent and resumes polling only. Do not call `/api/shipping-batch*`, `/APO/*` or Socket.IO routes.
+- The Shipment Workbench uses management-only create/list submission endpoints; the extension-only payload and state-transition endpoints remain unavailable to browser users.
 - Require the existing extension Bearer token and shop-scoped authorization. The command's agent and shop must match the authenticated extension agent.
 - Keep Amazon feed submission in the authenticated browser session. Do not store Amazon cookies, CSRF values or feed file contents in backend logs.
 - The manifest needs only permissions proven necessary by the native feed submission and diagnostic download; do not copy V1 permissions blindly.
@@ -60,6 +65,7 @@ The backend owns candidate selection, batch creation, deduplication and submissi
 ## Verification
 
 - Unit tests first for Ads range/lock/header policy, command type validation/dispatch, TSV validation, and feed-terminal state handling.
+- Frontend tests cover explicit selection, disabled unsafe submit state, create payload, and the distinction between `WAITING_AMAZON` and terminal Amazon status.
 - Focused extension and backend test suites must pass after each migration slice.
 - Manual staging proof uses a non-production shop and a deliberately safe tracking batch: inspect the submission snapshot, observed Feed History id, Processing Report, and final V2 command/batch status.
 - Production release requires a separate explicit approval and post-release command/feed readback; this migration does not authorize a live Seller Central submission.

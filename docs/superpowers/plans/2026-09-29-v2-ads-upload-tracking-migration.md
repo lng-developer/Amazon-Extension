@@ -4,7 +4,7 @@
 
 **Goal:** Migrate v1's stable Ads safeguards and Seller Central tracking submission into v2's leased extension-command architecture.
 
-**Architecture:** Ads becomes one range command (maximum 120 days) that iterates sequential days under one Ads lock; Preview avoids Finance, the local extension Dry-run/Test button posts one CSV per day with `dryRun: true`, and every leased backend `IMPORT_ADS_SPEND` posts with `dryRun: false`. Tracking becomes a V2 command with a backend-owned TSV snapshot and extension-owned native submission plus persisted Feed History watcher; `WAITING_AMAZON` permits recovery without re-upload and only a Processing Report terminal result completes V2 state.
+**Architecture:** Ads becomes one range command (maximum 120 days) that iterates sequential days under one Ads lock; Preview avoids Finance, the local extension Dry-run/Test button posts one CSV per day with `dryRun: true`, and every leased backend `IMPORT_ADS_SPEND` posts with `dryRun: false`. Tracking becomes a V2 command with a backend-owned TSV snapshot and extension-owned native submission plus persisted Feed History watcher; `WAITING_AMAZON` permits recovery without re-upload and only a Processing Report terminal result completes V2 state. The existing Shipment Workbench selects explicit eligible shipment rows and shows submission status; it never handles TSV or Amazon credentials.
 
 **Tech Stack:** Chrome Extension Manifest V3, browser-native JavaScript, Node.js, Express, Mongoose, Joi, node:test, Jest.
 
@@ -256,6 +256,24 @@ Using a non-production shop and explicitly approved safe batch, verify the creat
 git add tests
 git commit -m "test(extension): cover v2 tracking migration"
 ```
+
+### Task 7: Shipment Workbench tracking submission controls
+
+**Files:**
+- Modify: `C:/lng_system/lng-web/lng-web-fe/src/features/portal/shipments/pages/ShipmentWorkbenchPage.tsx`, `api/shipmentApi.ts`, `hooks/useShipmentQueries.ts`
+- Modify: matching Shipment Workbench API/page tests and locales only if existing copy cannot be reused.
+
+- [ ] **Step 1: Write failing frontend tests**
+
+Cover explicit eligible-row selection, disabled submit without a selected online extension agent, create payload `{ shipmentIds, agentId }`, and status rendering that leaves `WAITING_AMAZON` non-terminal.
+
+- [ ] **Step 2: Implement the existing-screen control**
+
+Reuse the Shipment Workbench selection/table/action pattern. Add no new route, state machine, or upload UI. Query the management submission endpoint after creation and during normal workbench refresh. Keep raw TSV and Amazon session data out of the browser response.
+
+- [ ] **Step 3: Run focused frontend tests and commit**
+
+Run the existing Shipment Workbench test target, then commit the smallest FE diff on an isolated `EC/v2-ads-tracking` worktree.
 
 ## Self-review
 

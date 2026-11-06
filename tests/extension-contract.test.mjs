@@ -132,9 +132,40 @@ test('development-only build has the minimum Ads surface', () => {
   assert.ok(adsScripts.some((script) => script.js?.includes('ads_bridge.js') && script.run_at === 'document_start'));
   assert.ok(adsScripts.some((script) => script.js?.includes('ads_main_sniffer.js') && script.run_at === 'document_start' && script.world === 'MAIN'));
   assert.match(html, /data-tab="ads"/);
+  assert.match(html, /adsDateFrom/);
+  assert.match(html, /adsDateTo/);
+  assert.match(html, /btnPreviewAds/);
+  assert.match(html, /btnDryRunAds/);
   assert.match(html, /btnExportAds/);
   assert.match(config, /development: \{ ingestUrl: "https:\/\/dev-api\.lngmerch\.co"/);
   assert.doesNotMatch(config, /production:/);
+});
+
+test('Ads popup dry-run is local while leased imports are live Finance imports', () => {
+  const options = read('options.js');
+  const background = read('background.js');
+  const commandClient = read('extensionCommandClient.js');
+
+  assert.match(options, /PREVIEW_ADS_SPEND/);
+  assert.match(options, /DRY_RUN_ADS_SPEND/);
+  assert.match(options, /RUN_ADS_SPEND/);
+  assert.match(background, /msg\?\.type === "DRY_RUN_ADS_SPEND"/);
+  assert.match(background, /dryRun: true/);
+  assert.match(background, /msg\?\.type === "RUN_ADS_SPEND"/);
+  assert.match(commandClient, /dryRun: false/);
+});
+
+test('Ads serializes concurrent work and verifies headers before Amazon reporting or Finance upload', () => {
+  const background = read('background.js');
+  const locked = background.slice(background.indexOf('async function runExportAdsSpendLocked'), background.indexOf('async function getBaseShopAndIdentity'));
+
+  assert.match(background, /reason: "ADS_TASK_ALREADY_RUNNING"/);
+  assert.match(background, /withAdsApiLock\("IMPORT_ADS_SPEND"/);
+  assert.match(locked, /listAdsReportDates\(dateFrom, dateTo\)/);
+  assert.match(locked, /await ensureFreshAdsReportingHeaders\(\)/);
+  assert.ok(locked.indexOf('listAdsReportDates(dateFrom, dateTo)') < locked.indexOf('await ensureFreshAdsReportingHeaders()'));
+  assert.ok(locked.indexOf('await ensureFreshAdsReportingHeaders()') < locked.indexOf('createAndRunAdsReport'));
+  assert.ok(locked.indexOf('await ensureFreshAdsReportingHeaders()') < locked.indexOf('postFileTo(adsSpendUrl'));
 });
 
 test("extension only persists the development backend configuration", () => {

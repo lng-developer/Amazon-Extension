@@ -149,12 +149,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   const environment = 'development';
   $('#environment').value = environment;
   fill(readConfig(all));
-  $('#adsDate').value = today();
+  $('#adsDateFrom').value = today();
+  $('#adsDateTo').value = today();
   tabs.forEach((tab) => tab.addEventListener('click', () => activateTab(tab.dataset.tab)));
   $('#btnSave').addEventListener('click', () => void save());
   $('#btnCheckNow').addEventListener('click', async () => { await chrome.runtime.sendMessage({ type: 'HEARTBEAT_NOW' }); await renderConnectionStatus(); });
   $('#btnImportNew').addEventListener('click', () => void send('AUTO_RUN_NOW'));
-  $('#btnExportAds').addEventListener('click', () => void send('RUN_ADS_SPEND', { date: $('#adsDate').value }));
+  const adsRange = () => ({ dateFrom: $('#adsDateFrom').value, dateTo: $('#adsDateTo').value });
+  $('#btnPreviewAds').addEventListener('click', () => void send('PREVIEW_ADS_SPEND', adsRange()));
+  $('#btnDryRunAds').addEventListener('click', () => void send('DRY_RUN_ADS_SPEND', adsRange()));
+  $('#btnExportAds').addEventListener('click', () => void send('RUN_ADS_SPEND', adsRange()));
   $('#btnImportTransactions').addEventListener('click', () => void send('RUN_TRANSACTIONS_IMPORT', { dateFrom: $('#transactionsDateFrom').value, dateTo: $('#transactionsDateTo').value }));
   $('#btnImportSettlements').addEventListener('click', () => void send('RUN_SETTLEMENTS_IMPORT', { dateFrom: $('#settlementsDateFrom').value, dateTo: $('#settlementsDateTo').value }));
   $('#btnCopyLogs').addEventListener('click', async () => {

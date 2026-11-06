@@ -22,10 +22,10 @@ export async function queueOrderImportCommand({ base, token, client, fetchImpl =
   return request(fetchImpl, `${root}/agent/import-new-orders`, token, 'POST', { ...client, numDays: 1 });
 }
 
-export async function queueAdsSpendCommand({ base, token, client, date, fetchImpl = fetch }) {
-  if (!base || !token || !client?.clientId || !client?.label || !date) throw new Error('Development Ads import is not configured');
+export async function queueAdsSpendCommand({ base, token, client, dateFrom, dateTo, fetchImpl = fetch }) {
+  if (!base || !token || !client?.clientId || !client?.label || !dateFrom || !dateTo) throw new Error('Development Ads import is not configured');
   const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;
-  return request(fetchImpl, `${root}/agent/import-ads-spend`, token, 'POST', { ...client, dateFrom: date, dateTo: date });
+  return request(fetchImpl, `${root}/agent/import-ads-spend`, token, 'POST', { ...client, dateFrom, dateTo });
 }
 
 export async function listAgentCommands({ base, token, client, fetchImpl = fetch }) {
@@ -35,7 +35,7 @@ export async function listAgentCommands({ base, token, client, fetchImpl = fetch
   return result?.items || [];
 }
 
-export async function pollExtensionCommand({ base, token, client, runImport, runAds, runTransactions, runSettlements, runListingImages, logger, fetchImpl = fetch }) {
+export async function pollExtensionCommand({ base, token, client, runImport, runAds, runTransactions, runSettlements, runListingImages, runTracking, logger, fetchImpl = fetch }) {
   if (!base || !token || !client?.clientId || !client?.label) return null;
   const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;
   await request(fetchImpl, `${root}/agent/heartbeat`, token, 'POST', client);
@@ -62,20 +62,23 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
     lastStage = stage;
   };
   try {
-    if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'SYNC_LISTING_IMAGES', 'TEST_CONNECTION'].includes(command.type)) {
+    if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'SYNC_LISTING_IMAGES', 'UPLOAD_TRACKING', 'TEST_CONNECTION'].includes(command.type)) {
       throw new Error(`Unsupported command: ${command.type}`);
     }
-    const outcome = command.type === 'SYNC_LISTING_IMAGES'
+    const outcome = command.type === 'UPLOAD_TRACKING'
+      ? await runTracking({ command, leaseToken: claim.leaseToken, onProgress, activity })
+      : command.type === 'SYNC_LISTING_IMAGES'
       ? await runListingImages({ command, leaseToken: claim.leaseToken, onProgress, activity })
       : command.type === 'IMPORT_NEW_ORDERS'
       ? await runImport(command.numDays || 1, activity)
       : command.type === 'IMPORT_ADS_SPEND'
-        ? await runAds({ dateFrom: command.dateFrom, dateTo: command.dateTo })
+        ? await runAds({ dateFrom: command.dateFrom, dateTo: command.dateTo, dryRun: false })
         : command.type === 'IMPORT_TRANSACTIONS'
           ? await runTransactions({ dateFrom: command.dateFrom, dateTo: command.dateTo, onProgress, activity })
           : command.type === 'IMPORT_SETTLEMENTS'
             ? await runSettlements({ dateFrom: command.dateFrom, dateTo: command.dateTo, onProgress, activity })
         : null;
+    if (outcome?.deferred) return { id: command.id, status: 'WAITING_AMAZON' };
     const result = outcome?.data || outcome?.result || outcome;
     const importJobId = result?.id || result?.importBatchId || result?.jobId || result?.data?.jobId || result?.ingest?.data?.jobId || batchId;
     const importedCount = Number(result?.importedCount ?? result?.processedRows ?? result?.rows ?? 0);
