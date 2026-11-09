@@ -28,7 +28,7 @@ test('allows the Amazon Ads email redirect host before downloading the report', 
 test('allows the local development backend used by the Gmail report flow', () => {
   const manifest = JSON.parse(fs.readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
 
-  assert.equal(manifest.host_permissions.includes('http://localhost:3001/*'), true);
+  assert.equal(manifest.host_permissions.includes('http://localhost:3000/*'), true);
 });
 
 test('does not treat an upload to another backend as a duplicate', () => {
@@ -36,6 +36,6 @@ test('does not treat an upload to another backend as a duplicate', () => {
 
   assert.notEqual(
     createGmailAdsDownloadFingerprint('https://dev-api.lngmerch.co', reportUrl),
-    createGmailAdsDownloadFingerprint('http://localhost:3001', reportUrl),
+    createGmailAdsDownloadFingerprint('http://localhost:3000', reportUrl),
   );
 });

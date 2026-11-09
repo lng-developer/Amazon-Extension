@@ -10,6 +10,13 @@ const tabs = [...document.querySelectorAll('[data-tab]')];
 const panels = [...document.querySelectorAll('[data-panel]')];
 const extensionLogger = createExtensionLogger({ storage: chrome.storage.local });
 const connectionStatusKey = 'extensionConnectionStatus';
+const MESSAGE_TIMEOUT_MS = 10000;
+function sendMessageWithTimeout(message) {
+  return Promise.race([
+    chrome.runtime.sendMessage(message),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Extension background service did not respond within 10 seconds')), MESSAGE_TIMEOUT_MS)),
+  ]);
+}
 let activityCommands = [];
 let activityRefreshPending = false;
 async function refreshActivityCommands() {
@@ -114,7 +121,7 @@ async function save() {
   const requestedUrl = normalizeBaseUrl($('#ingestUrl').value);
   const ingestUrl = resolveDevelopmentApiUrl(requestedUrl);
   if (requestedUrl && requestedUrl !== ingestUrl) {
-    log('API Base URL must be https://ecomatrix.lngmerch.co, https://dev-api.lngmerch.co or http://localhost:3001.');
+    log('API Base URL must be https://ecomatrix.lngmerch.co, https://dev-api.lngmerch.co, http://localhost:3000 or http://127.0.0.1:3000.');
     return;
   }
   const config = { ingestUrl, ingestToken: $('#ingestToken').value.trim(), marketplaceCode: $('#marketplaceCode').value.trim().toUpperCase() || 'US' };
@@ -122,7 +129,7 @@ async function save() {
   await chrome.storage.local.set({ ...config, activeEnvironment: environment, ingestEnvironments: { [environment]: config } });
   log('Checking connection…');
   try {
-    const result = await chrome.runtime.sendMessage({ type: 'HEARTBEAT_NOW' });
+    const result = await sendMessageWithTimeout({ type: 'HEARTBEAT_NOW' });
     log(result?.ok ? 'Connected. Heartbeat received.' : `Heartbeat failed: ${result?.error || 'Unknown error'}`);
   } catch (error) {
     log(`Heartbeat failed: ${error?.message || String(error)}`);
@@ -154,7 +161,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('#adsDateTo').value = today();
   tabs.forEach((tab) => tab.addEventListener('click', () => activateTab(tab.dataset.tab)));
   $('#btnSave').addEventListener('click', () => void save());
-  $('#btnCheckNow').addEventListener('click', async () => { await chrome.runtime.sendMessage({ type: 'HEARTBEAT_NOW' }); await renderConnectionStatus(); });
+  $('#btnCheckNow').addEventListener('click', async () => { try { await sendMessageWithTimeout({ type: 'HEARTBEAT_NOW' }); } catch (error) { log(`Heartbeat failed: ${error?.message || String(error)}`); } await renderConnectionStatus(); });
   $('#btnImportNew').addEventListener('click', () => void send('AUTO_RUN_NOW'));
   const adsRange = () => ({ dateFrom: $('#adsDateFrom').value, dateTo: $('#adsDateTo').value });
   $('#btnPreviewAds').addEventListener('click', () => void send('PREVIEW_ADS_SPEND', adsRange()));

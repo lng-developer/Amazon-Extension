@@ -5,7 +5,8 @@ export const DEFAULT_ENVIRONMENTS = {
 export const DEVELOPMENT_API_URLS = [
   "https://ecomatrix.lngmerch.co",
   "https://dev-api.lngmerch.co",
-  "http://localhost:3001",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
 ];
 
 export function normalizeBaseUrl(u) {
