@@ -10,11 +10,11 @@ const tabs = [...document.querySelectorAll('[data-tab]')];
 const panels = [...document.querySelectorAll('[data-panel]')];
 const extensionLogger = createExtensionLogger({ storage: chrome.storage.local });
 const connectionStatusKey = 'extensionConnectionStatus';
-const MESSAGE_TIMEOUT_MS = 10000;
+const MESSAGE_TIMEOUT_MS = 30000;
 function sendMessageWithTimeout(message) {
   return Promise.race([
     chrome.runtime.sendMessage(message),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('Extension background service did not respond within 10 seconds')), MESSAGE_TIMEOUT_MS)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Extension background service did not respond within 30 seconds')), MESSAGE_TIMEOUT_MS)),
   ]);
 }
 let activityCommands = [];

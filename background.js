@@ -1424,28 +1424,30 @@ async function ensureSettlementStatementsTab() {
 async function findSettlementDownload({ dateFrom, dateTo, autoDiscover = false } = {}) {
   const tab = await ensureSettlementStatementsTab();
   try {
-    const execution = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: extractSettlementDownloadCandidates,
-      args: [autoDiscover ? { dateFrom, dateTo, autoDiscover } : { dateFrom, dateTo }],
-    });
-  } catch (error) {
-    throw new Error(`Cannot inspect Amazon All Statements: ${error?.message || String(error)}`);
-  }
-  const inspected = execution?.[0]?.result || {};
-  const candidates = Array.isArray(inspected) ? inspected : inspected.candidates || [];
-  if (!candidates.length) {
-    const diagnostics = Array.isArray(inspected) ? {} : inspected.diagnostics || {};
-    throw new Error(`No settlement download link found${dateFrom && dateTo ? ` for ${dateFrom} to ${dateTo}` : ''}. DOM elements=${diagnostics.elementCount || 0}, download nodes=${diagnostics.downloadElementCount || 0}, row=${diagnostics.rowFound ? 'yes' : 'no'}, controls=${diagnostics.controlCount || 0}, toggle=${diagnostics.toggleFound ? 'yes' : 'no'}, referenceId=${diagnostics.referenceIdFound ? 'yes' : 'no'}`);
-  }
-  const selected = autoDiscover ? candidates[0] : selectSettlementDownload(candidates, { dateFrom, dateTo });
-  const period = settlementPeriodDates(selected.periodText || '');
-  if (autoDiscover && !period) throw new Error('Settlement period could not be read from Amazon All Statements');
-  const url = new URL(selected.href);
-  if (url.origin !== SC_BASE || url.pathname !== '/payments/reports/download') {
-    throw new Error('Amazon settlement download link is not trusted');
-  }
-  return { ...selected, href: url.href, referenceId: getSettlementReferenceId(url.href), ...(period || {}) };
+    let execution;
+    try {
+      execution = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: extractSettlementDownloadCandidates,
+        args: [autoDiscover ? { dateFrom, dateTo, autoDiscover } : { dateFrom, dateTo }],
+      });
+    } catch (error) {
+      throw new Error(`Cannot inspect Amazon All Statements: ${error?.message || String(error)}`);
+    }
+    const inspected = execution?.[0]?.result || {};
+    const candidates = Array.isArray(inspected) ? inspected : inspected.candidates || [];
+    if (!candidates.length) {
+      const diagnostics = Array.isArray(inspected) ? {} : inspected.diagnostics || {};
+      throw new Error(`No settlement download link found${dateFrom && dateTo ? ` for ${dateFrom} to ${dateTo}` : ''}. DOM elements=${diagnostics.elementCount || 0}, download nodes=${diagnostics.downloadElementCount || 0}, row=${diagnostics.rowFound ? 'yes' : 'no'}, controls=${diagnostics.controlCount || 0}, toggle=${diagnostics.toggleFound ? 'yes' : 'no'}, referenceId=${diagnostics.referenceIdFound ? 'yes' : 'no'}`);
+    }
+    const selected = autoDiscover ? candidates[0] : selectSettlementDownload(candidates, { dateFrom, dateTo });
+    const period = settlementPeriodDates(selected.periodText || '');
+    if (autoDiscover && !period) throw new Error('Settlement period could not be read from Amazon All Statements');
+    const url = new URL(selected.href);
+    if (url.origin !== SC_BASE || url.pathname !== '/payments/reports/download') {
+      throw new Error('Amazon settlement download link is not trusted');
+    }
+    return { ...selected, href: url.href, referenceId: getSettlementReferenceId(url.href), ...(period || {}) };
   } finally {
     await chrome.tabs.remove(tab.id).catch(() => {});
   }

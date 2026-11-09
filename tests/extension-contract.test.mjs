@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import test from "node:test";
 import { DEFAULT_ENVIRONMENTS } from "../config.js";
@@ -424,4 +425,14 @@ test("legacy realtime, FBM, tracking, and legacy-token APIs are absent", () => {
   assert.equal(config.includes("shipping-batch"), false);
   assert.equal(manifest.permissions.includes("webRequestBlocking"), false);
   assert.equal(manifest.permissions.includes("downloads"), false);
+});
+
+test("all extension JavaScript files have valid syntax", () => {
+  const files = fs.readdirSync(root).filter((f) => f.endsWith(".js"));
+  for (const f of files) {
+    const fullPath = new URL(f, root);
+    assert.doesNotThrow(() => {
+      execFileSync(process.execPath, ["--check", fullPath.pathname]);
+    }, `Syntax check failed for ${f}`);
+  }
 });
