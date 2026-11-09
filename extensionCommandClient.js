@@ -35,6 +35,12 @@ export async function listAgentCommands({ base, token, client, fetchImpl = fetch
   return result?.items || [];
 }
 
+export async function heartbeatExtension({ base, token, client, fetchImpl = fetch }) {
+  if (!base || !token || !client?.clientId || !client?.label) throw new Error('Extension connection is not configured');
+  const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;
+  return request(fetchImpl, `${root}/agent/heartbeat`, token, 'POST', client);
+}
+
 export async function pollExtensionCommand({ base, token, client, runImport, runAds, runTransactions, runSettlements, runListingImages, runTracking, logger, fetchImpl = fetch }) {
   if (!base || !token || !client?.clientId || !client?.label) return null;
   const root = `${base.replace(/\/+$/, '')}${COMMAND_PATH}`;

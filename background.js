@@ -1,6 +1,6 @@
 /* Amazon order, ads, transaction, settlement imports and LNG command polling. */
 import { DEFAULT_ENVIRONMENTS, deriveApiUrls, resolveDevelopmentApiUrl } from "./config.js";
-import { listAgentCommands, pollExtensionCommand, queueAdsSpendCommand, queueOrderImportCommand } from "./extensionCommandClient.js";
+import { heartbeatExtension, listAgentCommands, pollExtensionCommand, queueAdsSpendCommand, queueOrderImportCommand } from "./extensionCommandClient.js";
 import { getJson, postFileTo, postOrderImport } from "./backendApi.js";
 import { createExtensionLogger } from "./extensionLogger.js";
 import { ORDER_IMPORT_PROGRESS_KEY, createOrderImportProgress } from './orderImportProgress.js';
@@ -2014,9 +2014,18 @@ async function pollExtensionCommandsWithBackoff({ force = false } = {}) {
     throw error;
   }
 }
+async function heartbeatOnly() {
+  const config = await getCfg();
+  const identity = await getBaseShopAndIdentity();
+  const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base };
+  await heartbeatExtension({ base: identity.base, token: config.ingestToken, client });
+  const now = Date.now();
+  await chrome.storage.local.set({ [EXTENSION_CONNECTION_STATUS_KEY]: { state: 'CONNECTED', lastHeartbeatAt: now, nextPollAt: now + 60_000 } });
+  return { ok: true, message: 'Heartbeat completed.' };
+}
 async function startExtensionCommandPolling() { await chrome.alarms.create(EXTENSION_COMMAND_POLL_ALARM, { periodInMinutes: 1 }); await pollExtensionCommandsWithBackoff().catch(() => undefined); }
 chrome.runtime.onInstalled.addListener(() => startExtensionCommandPolling());
 chrome.runtime.onStartup.addListener(() => startExtensionCommandPolling());
 chrome.storage.onChanged.addListener((changes) => { if (changes.ingestUrl || changes.ingestToken) startExtensionCommandPolling(); });
 chrome.alarms.onAlarm.addListener((alarm) => { if (alarm?.name === EXTENSION_COMMAND_POLL_ALARM) pollExtensionCommandsWithBackoff().catch(() => undefined); });
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => { (async () => { if (msg?.type === "PING") return sendResponse({ ok: true }); if (msg?.type === 'GET_ACTIVITY_COMMANDS') return sendResponse({ ok: true, commands: await getActivityCommands() }); if (msg?.type === "HEARTBEAT_NOW") { await pollExtensionCommandsWithBackoff({ force: true }); return sendResponse({ ok: true, message: "Heartbeat completed." }); } if (msg?.type === "AUTO_RUN_NOW") return sendResponse(await queueManualOrderImport()); if (msg?.type === "PREVIEW_ADS_SPEND") return sendResponse(await runExportAdsSpend({ ...msg.payload, preview: true })); if (msg?.type === "DRY_RUN_ADS_SPEND") return sendResponse(await runExportAdsSpend({ ...msg.payload, dryRun: true })); if (msg?.type === "RUN_ADS_SPEND") return sendResponse(await queueManualAdsSpend(msg.payload?.dateFrom, msg.payload?.dateTo)); if (msg?.type === "RUN_TRANSACTIONS_IMPORT") return sendResponse(await runImportTransactions(msg.payload || {})); if (msg?.type === "RUN_SETTLEMENTS_IMPORT") return sendResponse(await runImportSettlements(msg.payload || {})); if (msg?.type === "GMAIL_AMAZON_ADS_DOWNLOAD") return sendResponse(await uploadGmailAdsDownload(msg.url)); return sendResponse({ ok: false, error: "Unsupported action" }); })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) })); return true; });
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => { (async () => { if (msg?.type === "PING") return sendResponse({ ok: true }); if (msg?.type === 'GET_ACTIVITY_COMMANDS') return sendResponse({ ok: true, commands: await getActivityCommands() }); if (msg?.type === "HEARTBEAT_NOW") return sendResponse(await heartbeatOnly()); if (msg?.type === "AUTO_RUN_NOW") return sendResponse(await queueManualOrderImport()); if (msg?.type === "PREVIEW_ADS_SPEND") return sendResponse(await runExportAdsSpend({ ...msg.payload, preview: true })); if (msg?.type === "DRY_RUN_ADS_SPEND") return sendResponse(await runExportAdsSpend({ ...msg.payload, dryRun: true })); if (msg?.type === "RUN_ADS_SPEND") return sendResponse(await queueManualAdsSpend(msg.payload?.dateFrom, msg.payload?.dateTo)); if (msg?.type === "RUN_TRANSACTIONS_IMPORT") return sendResponse(await runImportTransactions(msg.payload || {})); if (msg?.type === "RUN_SETTLEMENTS_IMPORT") return sendResponse(await runImportSettlements(msg.payload || {})); if (msg?.type === "GMAIL_AMAZON_ADS_DOWNLOAD") return sendResponse(await uploadGmailAdsDownload(msg.url)); return sendResponse({ ok: false, error: "Unsupported action" }); })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) })); return true; });
