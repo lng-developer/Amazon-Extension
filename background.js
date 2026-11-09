@@ -115,8 +115,9 @@ async function reloadAdsTabForHeaderCapture(tabId) {
   await injected;
 }
 
-async function forceRefreshAdsHeaders({ reporting = false } = {}) {
-  const tabId = await (reporting ? ensureAdsReportingTab() : ensureAdsTab());
+async function forceRefreshAdsHeaders({ reporting = false, taskTabId = null } = {}) {
+  const tabOptions = taskTabId ? { taskTabId } : {};
+  const tabId = await (reporting ? ensureAdsReportingTab(tabOptions) : ensureAdsTab(tabOptions));
   await reloadAdsTabForHeaderCapture(tabId);
   let headers;
   if (reporting) {
@@ -143,10 +144,10 @@ async function ensureFreshAdsHeaders() {
   await forceRefreshAdsHeaders();
 }
 
-async function ensureFreshAdsReportingHeaders() {
+async function ensureFreshAdsReportingHeaders(options = {}) {
   const state = await readAdsHeaderState();
   if (hasAdsReportingHeaders(state)) return;
-  await forceRefreshAdsHeaders({ reporting: true });
+  await forceRefreshAdsHeaders({ reporting: true, taskTabId: options.taskTabId });
 }
 
 function hasAdsReportingHeaders(st = {}) {
@@ -244,12 +245,27 @@ async function withAdsApiLock(taskName, fn, options = {}) {
   adsApiLock.startedAt = Date.now();
   await persistAdsLockState();
 
+  let taskTabId = null;
+  if (options.createTaskTab) {
+    try {
+      const tab = await chrome.tabs.create({ url: `${ADS_BASE}/cm/campaigns`, active: true });
+      taskTabId = tab.id;
+    } catch (error) {
+      adsApiLock.running = false;
+      adsApiLock.taskName = '';
+      adsApiLock.runId = '';
+      adsApiLock.startedAt = 0;
+      await persistAdsLockState();
+      throw error;
+    }
+  }
+
   debugLog(`[ADS-LOCK] Acquired ${taskName} runId=${runId}`, "success");
   log(`[ADS-LOCK] Acquired ${taskName} runId=${runId}`);
   extensionLogger?.logInfo(`[ADS-LOCK] Acquired ${taskName}`, { runId, taskName, startedAt: adsApiLock.startedAt });
 
   try {
-    const result = await fn({ runId, taskName, lockOwner: true });
+    const result = await fn({ runId, taskName, lockOwner: true, taskTabId });
     debugLog(`[ADS-LOCK] Released success ${taskName} runId=${runId}`, "success");
     extensionLogger?.logInfo(`[ADS-LOCK] Released success ${taskName}`, { runId, taskName });
     return result;
@@ -258,6 +274,12 @@ async function withAdsApiLock(taskName, fn, options = {}) {
     extensionLogger?.logError(error, { runId, taskName }, `[ADS-LOCK] Released error ${taskName}`);
     throw error;
   } finally {
+    if (adsApiLock.runId === runId && options.closeTaskTab !== false) {
+      const tabId = taskTabId;
+      if (tabId) {
+        try { await chrome.tabs.remove(tabId); } catch (_) { /* tab already closed */ }
+      }
+    }
     if (adsApiLock.runId === runId) {
       adsApiLock.running = false;
       adsApiLock.taskName = "";
@@ -689,7 +711,13 @@ async function runImportNewOrders(referenceOverride, numDays) {
 /* ===============================
    ADS via content-script
    =============================== */
-async function ensureAdsTab() {
+async function ensureAdsTab(options = {}) {
+  if (options.taskTabId) {
+    const tab = await chrome.tabs.get(options.taskTabId);
+    if (!tab.url?.includes('/cm/')) await chrome.tabs.update(options.taskTabId, { url: `${ADS_BASE}/cm/campaigns` });
+    await waitForAdsTabComplete(options.taskTabId);
+    return options.taskTabId;
+  }
   const tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
   let tab = tabs.find((t) => t.url?.includes("/cm/")) || tabs[0];
 
@@ -709,7 +737,13 @@ async function ensureAdsTab() {
   return tab.id;
 }
 
-async function ensureAdsReportingTab() {
+async function ensureAdsReportingTab(options = {}) {
+  if (options.taskTabId) {
+    const tab = await chrome.tabs.get(options.taskTabId);
+    if (!tab.url?.includes('/reporting')) await chrome.tabs.update(options.taskTabId, { url: `${ADS_BASE}/reporting` });
+    await waitForAdsTabComplete(options.taskTabId);
+    return options.taskTabId;
+  }
   const tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
   let tab = tabs.find((candidate) => candidate.url?.includes("/reporting"));
 
@@ -860,7 +894,7 @@ async function ensureAdsBridgeInjected(tabId) {
 }
 
 async function adsRetrieveViaContentScript(payload, options = {}) {
-  const tabId = await ensureAdsTab();
+  const tabId = await ensureAdsTab(options);
   await ensureAdsBridgeInjected(tabId);
 
   const sendOnce = () =>
@@ -1114,7 +1148,7 @@ function formatCampaignSpendCsv(rows) {
 }
 
 async function adsReportingViaContentScript(operation, payload, options = {}) {
-  const tabId = await ensureAdsReportingTab();
+  const tabId = await ensureAdsReportingTab(options);
   await ensureAdsBridgeInjected(tabId);
   const response = await chrome.tabs.sendMessage(tabId, {
     type: 'ADS_REPORTING_REQUEST',
@@ -1169,7 +1203,7 @@ async function waitForAdsReport(configurationId, lock) {
 }
 
 async function downloadAdsReportCsv(configurationId, lock) {
-  const tabId = await ensureAdsReportingTab();
+  const tabId = await ensureAdsReportingTab({ taskTabId: lock?.taskTabId });
   await ensureAdsBridgeInjected(tabId);
   const response = await chrome.tabs.sendMessage(tabId, { type: 'ADS_DOWNLOAD_LATEST_REPORT', configurationId, options: lock });
   if (!response?.downloadUrl) throw new Error(response?.message || 'Amazon Ads Download latest is unavailable. Open the Amazon Reporting tab and try again.');
@@ -1184,7 +1218,7 @@ async function downloadAdsReportCsv(configurationId, lock) {
 
 async function runExportAdsSpend({ dateFrom, dateTo, dryRun = false, preview = false }) {
   if ((await getCfg()).ingestUrl !== DEFAULT_ENVIRONMENTS.development.ingestUrl) throw new Error("Ads import is restricted to Development");
-  return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked({ dateFrom, dateTo, dryRun, preview }, lock));
+  return withAdsApiLock("IMPORT_ADS_SPEND", (lock) => runExportAdsSpendLocked({ dateFrom, dateTo, dryRun, preview }, lock), { createTaskTab: true });
 }
 
 async function fetchTransactionsCsvFromAmazon({ dateFrom, dateTo, onPage }) {
@@ -1376,13 +1410,7 @@ function settlementPeriodDates(periodText) {
 }
 
 async function ensureSettlementStatementsTab() {
-  const tabs = await chrome.tabs.query({ url: `${SC_BASE}/payments/*` });
-  const statementTabs = tabs.filter((candidate) => candidate.url?.includes('/payments/past-settlements'));
-  const [focusedTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  let tab = (focusedTab?.url?.includes('/payments/past-settlements') ? focusedTab : null)
-    || statementTabs.find((candidate) => candidate.active)
-    || statementTabs[0];
-  if (!tab) tab = await chrome.tabs.create({ url: ALL_STATEMENTS_URL, active: false });
+  const tab = await chrome.tabs.create({ url: ALL_STATEMENTS_URL, active: false });
   if (!tab?.id) throw new Error('SELLER_CENTRAL_AUTH_REQUIRED: Amazon All Statements could not be opened');
   await waitForTabComplete(tab.id, 'Amazon All Statements did not finish loading');
   const loaded = await chrome.tabs.get(tab.id);
@@ -1395,10 +1423,8 @@ async function ensureSettlementStatementsTab() {
 
 async function findSettlementDownload({ dateFrom, dateTo, autoDiscover = false } = {}) {
   const tab = await ensureSettlementStatementsTab();
-
-  let execution;
   try {
-    execution = await chrome.scripting.executeScript({
+    const execution = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractSettlementDownloadCandidates,
       args: [autoDiscover ? { dateFrom, dateTo, autoDiscover } : { dateFrom, dateTo }],
@@ -1419,7 +1445,10 @@ async function findSettlementDownload({ dateFrom, dateTo, autoDiscover = false }
   if (url.origin !== SC_BASE || url.pathname !== '/payments/reports/download') {
     throw new Error('Amazon settlement download link is not trusted');
   }
-  return { ...selected, href: url.href, referenceId: getSettlementReferenceId(url.href), tabId: tab.id, ...(period || {}) };
+  return { ...selected, href: url.href, referenceId: getSettlementReferenceId(url.href), ...(period || {}) };
+  } finally {
+    await chrome.tabs.remove(tab.id).catch(() => {});
+  }
 }
 
 // Runs inside Seller Central; keep this function self-contained for executeScript.
@@ -1766,7 +1795,7 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, previ
     throw error;
   }
   // Đảm bảo Ads headers còn hạn trước khi gọi Ads API
-  await ensureFreshAdsReportingHeaders();
+  await ensureFreshAdsReportingHeaders(lock);
   try {
     let rows = 0;
     let lastIngest;
@@ -1906,34 +1935,39 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
   const existingWatch = (await chrome.storage.local.get(watchKey))[watchKey];
   if (existingWatch) return reconcileTrackingWatch({ command, leaseToken, payload, watch: existingWatch, root, headers, body });
   await validateTrackingPayload(payload); await onProgress({ stage: 'READY_TO_SUBMIT' });
-  const tabs = await chrome.tabs.query({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds*' });
-  const tab = tabs[0] || await chrome.tabs.create({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds', active: true });
-  await waitForSellerCentralTabComplete(tab.id);
-  const historyBeforeBatchIds = await snapshotFeedHistory(tab.id);
-  await submitNativeTrackingFeed({ tsv: payload.tsv, filename: payload.filename, tabId: tab.id });
-  for (const suffix of ['submitted', 'waiting']) {
-    const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/${suffix}`, { method: 'POST', headers, body: JSON.stringify(body) });
-    if (!response.ok) throw new Error(`Tracking ${suffix} state was rejected`);
+  const tab = await chrome.tabs.create({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds', active: true });
+  try {
+    await waitForSellerCentralTabComplete(tab.id);
+    const historyBeforeBatchIds = await snapshotFeedHistory(tab.id);
+    await submitNativeTrackingFeed({ tsv: payload.tsv, filename: payload.filename, tabId: tab.id });
+    for (const suffix of ['submitted', 'waiting']) {
+      const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/${suffix}`, { method: 'POST', headers, body: JSON.stringify(body) });
+      if (!response.ok) throw new Error(`Tracking ${suffix} state was rejected`);
+    }
+    await chrome.storage.local.set({ [watchKey]: { submissionId: payload.submissionId, historyBeforeBatchIds, checksum: payload.checksum } });
+    return { deferred: true, submissionId: payload.submissionId };
+  } finally {
+    await chrome.tabs.remove(tab.id).catch(() => {});
   }
-  await chrome.storage.local.set({ [watchKey]: { submissionId: payload.submissionId, historyBeforeBatchIds, checksum: payload.checksum } });
-  return { deferred: true, submissionId: payload.submissionId };
 }
 async function reconcileTrackingWatch({ command, payload, watch, root, headers, body }) {
-  const tabs = await chrome.tabs.query({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds*' });
-  if (!tabs[0]?.id) return { deferred: true, submissionId: payload.submissionId };
-  await chrome.tabs.reload(tabs[0].id).catch(() => {});
-  await waitForSellerCentralTabComplete(tabs[0].id);
-  const [rows] = await chrome.scripting.executeScript({ target: { tabId: tabs[0].id }, world: 'MAIN', func: () => [...document.querySelectorAll('tr')].map((row) => row.innerText || '') });
-  const row = findNewFeedRow(rows?.result || [], watch.historyBeforeBatchIds);
-  if (!row) return { deferred: true, submissionId: payload.submissionId };
-  const amazonBatchId = (row.match(/\b\d{6,}\b/) || [])[0];
-  if (amazonBatchId && !watch.amazonBatchId) await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/batch`, { method: 'POST', headers, body: JSON.stringify({ ...body, amazonBatchId }) });
-  const terminal = terminalFeedResult(row);
-  if (!terminal) return { deferred: true, submissionId: payload.submissionId };
-  const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/terminal`, { method: 'POST', headers, body: JSON.stringify({ ...body, ...terminal }) });
-  if (!response.ok) throw new Error('Tracking terminal state was rejected');
-  await chrome.storage.local.remove(`trackingWatch:${payload.submissionId}`);
-  return terminal.result;
+  const tab = await chrome.tabs.create({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds', active: true });
+  try {
+    await waitForSellerCentralTabComplete(tab.id);
+    const [rows] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'MAIN', func: () => [...document.querySelectorAll('tr')].map((row) => row.innerText || '') });
+    const row = findNewFeedRow(rows?.result || [], watch.historyBeforeBatchIds);
+    if (!row) return { deferred: true, submissionId: payload.submissionId };
+    const amazonBatchId = (row.match(/\b\d{6,}\b/) || [])[0];
+    if (amazonBatchId && !watch.amazonBatchId) await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/batch`, { method: 'POST', headers, body: JSON.stringify({ ...body, amazonBatchId }) });
+    const terminal = terminalFeedResult(row);
+    if (!terminal) return { deferred: true, submissionId: payload.submissionId };
+    const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/terminal`, { method: 'POST', headers, body: JSON.stringify({ ...body, ...terminal }) });
+    if (!response.ok) throw new Error('Tracking terminal state was rejected');
+    await chrome.storage.local.remove(`trackingWatch:${payload.submissionId}`);
+    return terminal.result;
+  } finally {
+    await chrome.tabs.remove(tab.id).catch(() => {});
+  }
 }
 async function pollExtensionCommands(config = null) {
   config ||= await getCfg();

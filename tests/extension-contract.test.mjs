@@ -63,8 +63,8 @@ test('Ads Reporting preflight does not require legacy Campaign API headers', () 
   const background = read('background.js');
 
   assert.match(background, /function hasAdsReportingHeaders\(st = \{\}\) \{\s*return !!st\.adsReportingCsrfToken;/);
-  assert.match(background, /async function ensureFreshAdsReportingHeaders\(\)/);
-  assert.match(background, /await ensureFreshAdsReportingHeaders\(\);/);
+  assert.match(background, /async function ensureFreshAdsReportingHeaders\(options = \{\}\)/);
+  assert.match(background, /await ensureFreshAdsReportingHeaders\(lock\);/);
 });
 
 test('Ads Reporting waits for its CSRF token instead of whole-page completion', () => {
@@ -94,11 +94,11 @@ test('Ads Reporting uses the Reporting tab for token, report, and download opera
   const reporting = background.slice(background.indexOf('async function adsReportingViaContentScript'), background.indexOf('async function downloadAdsReportCsv'));
   const download = background.slice(background.indexOf('async function downloadAdsReportCsv'), background.indexOf('async function runExportAdsSpendLocked'));
 
-  assert.match(background, /async function ensureAdsReportingTab\(\)/);
+  assert.match(background, /async function ensureAdsReportingTab\(options = \{\}\)/);
   assert.match(background, /url: `\$\{ADS_BASE\}\/reporting`/);
-  assert.match(refresh, /reporting \? ensureAdsReportingTab\(\) : ensureAdsTab\(\)/);
-  assert.match(reporting, /await ensureAdsReportingTab\(\)/);
-  assert.match(download, /await ensureAdsReportingTab\(\)/);
+  assert.match(refresh, /reporting \? ensureAdsReportingTab\(tabOptions\) : ensureAdsTab\(tabOptions\)/);
+  assert.match(reporting, /await ensureAdsReportingTab\(options\)/);
+  assert.match(download, /await ensureAdsReportingTab\(\{ taskTabId: lock\?\.taskTabId \}\)/);
 });
 
 test('Ads import uses Amazon Reporting CSV instead of synthesizing campaign rows', () => {
@@ -162,10 +162,12 @@ test('Ads serializes concurrent work and verifies headers before Amazon reportin
   assert.match(background, /reason: "ADS_TASK_ALREADY_RUNNING"/);
   assert.match(background, /withAdsApiLock\("IMPORT_ADS_SPEND"/);
   assert.match(locked, /listAdsReportDates\(dateFrom, dateTo\)/);
-  assert.match(locked, /await ensureFreshAdsReportingHeaders\(\)/);
-  assert.ok(locked.indexOf('listAdsReportDates(dateFrom, dateTo)') < locked.indexOf('await ensureFreshAdsReportingHeaders()'));
-  assert.ok(locked.indexOf('await ensureFreshAdsReportingHeaders()') < locked.indexOf('createAndRunAdsReport'));
-  assert.ok(locked.indexOf('await ensureFreshAdsReportingHeaders()') < locked.indexOf('postFileTo(adsSpendUrl'));
+  assert.match(locked, /await ensureFreshAdsReportingHeaders\(lock\);/);
+  assert.ok(locked.indexOf('listAdsReportDates(dateFrom, dateTo)') < locked.indexOf('await ensureFreshAdsReportingHeaders(lock);'));
+  assert.ok(locked.indexOf('await ensureFreshAdsReportingHeaders(lock);') < locked.indexOf('createAndRunAdsReport'));
+  assert.ok(locked.indexOf('await ensureFreshAdsReportingHeaders(lock);') < locked.indexOf('postFileTo(adsSpendUrl'));
+  assert.match(background, /withAdsApiLock\("IMPORT_ADS_SPEND"[\s\S]*createTaskTab: true/);
+  assert.match(background, /chrome\.tabs\.remove\(tabId\)/);
 });
 
 test("extension only persists the development backend configuration", () => {
@@ -392,12 +394,12 @@ test('extension command polling supports finance imports', () => {
   assert.match(client, /runSettlements/);
 });
 
-test('settlement automation opens All Statements only when no tab exists', () => {
+test('settlement automation uses and closes a dedicated All Statements tab', () => {
   const background = read('background.js');
 
   assert.match(background, /async function ensureSettlementStatementsTab\(\)/);
   assert.match(background, /chrome\.tabs\.create\(\{ url: ALL_STATEMENTS_URL, active: false \}\)/);
-  assert.match(background, /candidate\.url\?\.includes\('\/payments\/past-settlements'\)/);
+  assert.match(background, /chrome\.tabs\.remove\(tab\.id\)/);
   assert.match(background, /autoDiscover/);
   assert.match(background, /Present/);
 });
