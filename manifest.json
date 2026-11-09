@@ -26,6 +26,7 @@
     "https://decorated-reports-prod-iad.s3.amazonaws.com/*",
     "https://api.lngmerch.co/*",
     "https://dev-api.lngmerch.co/*",
+    "https://ecomatrix.lngmerch.co/*",
     "http://localhost:3001/*"
   ],
   "background": {

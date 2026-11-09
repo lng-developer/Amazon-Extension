@@ -1,8 +1,9 @@
 export const DEFAULT_ENVIRONMENTS = {
-  development: { ingestUrl: "https://dev-api.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
+  development: { ingestUrl: "https://ecomatrix.lngmerch.co", shopId: "", ingestToken: "", marketplaceCode: "US" },
 };
 
 export const DEVELOPMENT_API_URLS = [
+  "https://ecomatrix.lngmerch.co",
   "https://dev-api.lngmerch.co",
   "http://localhost:3001",
 ];

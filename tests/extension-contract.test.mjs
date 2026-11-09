@@ -137,7 +137,7 @@ test('development-only build has the minimum Ads surface', () => {
   assert.match(html, /btnPreviewAds/);
   assert.match(html, /btnDryRunAds/);
   assert.match(html, /btnExportAds/);
-  assert.match(config, /development: \{ ingestUrl: "https:\/\/dev-api\.lngmerch\.co"/);
+  assert.match(config, /development: \{ ingestUrl: "https:\/\/ecomatrix\.lngmerch\.co"/);
   assert.doesNotMatch(config, /production:/);
 });
 
@@ -177,7 +177,7 @@ test("extension only persists the development backend configuration", () => {
   assert.match(html, /id="marketplaceCode"/);
   assert.match(html, /id="ingestToken"/);
   assert.match(options, /from [\x27"]\.\/config\.js[\x27"]/);
-  assert.match(config, /development: \{ ingestUrl: "https:\/\/dev-api\.lngmerch\.co"/);
+  assert.match(config, /development: \{ ingestUrl: "https:\/\/ecomatrix\.lngmerch\.co"/);
   assert.match(options, /ingestEnvironments/);
   assert.match(options, /marketplaceCode/);
   assert.match(options, /activeEnvironment/);

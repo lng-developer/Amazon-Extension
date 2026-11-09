@@ -114,7 +114,7 @@ async function save() {
   const requestedUrl = normalizeBaseUrl($('#ingestUrl').value);
   const ingestUrl = resolveDevelopmentApiUrl(requestedUrl);
   if (requestedUrl && requestedUrl !== ingestUrl) {
-    log('API Base URL must be https://dev-api.lngmerch.co or http://localhost:3001.');
+    log('API Base URL must be https://ecomatrix.lngmerch.co, https://dev-api.lngmerch.co or http://localhost:3001.');
     return;
   }
   const config = { ingestUrl, ingestToken: $('#ingestToken').value.trim(), marketplaceCode: $('#marketplaceCode').value.trim().toUpperCase() || 'US' };
