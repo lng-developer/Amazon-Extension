@@ -49,6 +49,8 @@ async function initializeLogger() { return extensionLogger; }
 const SC_BASE = "https://sellercentral.amazon.com";
 const ALL_STATEMENTS_URL = `${SC_BASE}/payments/past-settlements?ref_=xx_settle_ttab_trans`;
 const ADS_BASE = "https://advertising.amazon.com";
+const isAdsCampaignUrl = (url) => !!(url && (url.includes("/cm/") || url.includes("campaign")));
+
 const ADS_RETRIEVE_URL = "https://advertising.amazon.com/a9g-api-gateway/cm/dds/retrieveReport";
 /* ---------- Amazon Ads Auth Hardening ---------- */
 const ADS_HEADER_STORAGE_KEYS = [
@@ -300,8 +302,9 @@ async function withAdsApiLock(taskName, fn, options = {}) {
   let ownsTaskTab = false;
   if (options.createTaskTab) {
     try {
-      const existingTabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
-      const existingCampaignTab = existingTabs.find((t) => t.url?.includes('/cm/'));
+      const allTabs = await chrome.tabs.query({});
+      const adsTabs = allTabs.filter((t) => (t.url && t.url.includes("advertising.amazon.com")) || (t.title && t.title.includes("Amazon Ads")));
+      const existingCampaignTab = adsTabs.find((t) => isAdsCampaignUrl(t.url) || (t.title && t.title.includes("Campaigns"))) || adsTabs[0];
       if (existingCampaignTab) {
         taskTabId = existingCampaignTab.id;
         ownsTaskTab = false;
@@ -777,14 +780,15 @@ async function runImportNewOrders(referenceOverride, numDays) {
 async function ensureAdsTab(options = {}) {
   if (options.taskTabId) {
     const tab = await chrome.tabs.get(options.taskTabId);
-    if (!tab.url?.includes('/cm/')) {
+    if (!isAdsCampaignUrl(tab.url)) {
       await chrome.tabs.update(options.taskTabId, { url: `${ADS_BASE}/cm/campaigns` });
       await waitForAdsTabComplete(options.taskTabId);
     }
     return options.taskTabId;
   }
-  const tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
-  let tab = tabs.find((t) => t.url?.includes("/cm/")) || tabs[0];
+  const allTabs = await chrome.tabs.query({});
+  const adsTabs = allTabs.filter((t) => (t.url && t.url.includes("advertising.amazon.com")) || (t.title && t.title.includes("Amazon Ads")));
+  let tab = adsTabs.find((t) => isAdsCampaignUrl(t.url) || (t.title && t.title.includes("Campaigns"))) || adsTabs[0];
 
   if (!tab) {
     debugLog("🌐 [ADS-TAB] Opening Amazon Ads campaigns page...", "info");
@@ -1175,12 +1179,14 @@ async function fetchAllCampaignSpend(
     await delayMs(200);
   }
 
-  return all.map((r) => ({
-    campaignName: r.campaignName ?? "",
-    date: startDate,
-    spend: Number(r.spend ?? 0),
-    state: r.state ?? "",
-  }));
+  return all
+    .filter((r) => Number(r.spend ?? 0) > 0)
+    .map((r) => ({
+      campaignName: r.campaignName ?? "",
+      date: startDate,
+      spend: Number(r.spend ?? 0),
+      state: r.state ?? "",
+    }));
 }
 
 function formatCampaignSpendCsv(rows) {

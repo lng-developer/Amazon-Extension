@@ -67,6 +67,12 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
     lastRenewedAt = Date.now();
     lastStage = stage;
   };
+  const renewTimer = setInterval(() => {
+    request(fetchImpl, `${root}/agent/commands/${command.id}/renew`, token, 'POST', {
+      ...lease, ...(batchId ? { importJobId: batchId } : {}),
+    }).catch(() => {});
+  }, 45000);
+
   try {
     if (!['IMPORT_NEW_ORDERS', 'IMPORT_ADS_SPEND', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'SYNC_LISTING_IMAGES', 'UPLOAD_TRACKING', 'TEST_CONNECTION'].includes(command.type)) {
       throw new Error(`Unsupported command: ${command.type}`);
@@ -101,5 +107,7 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
     }).then(() => { backendConfirmed = true; }).catch(() => undefined); // A rejected completion must not hide the original failure.
     await activityLogger?.logTaskFailed({ ...activity, backendConfirmed }, error, 'Command task failed');
     throw error;
+  } finally {
+    clearInterval(renewTimer);
   }
 }
