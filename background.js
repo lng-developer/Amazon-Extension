@@ -146,8 +146,8 @@ async function ensureFreshAdsHeaders() {
 
 async function ensureFreshAdsReportingHeaders(options = {}) {
   const state = await readAdsHeaderState();
-  if (hasAdsReportingHeaders(state)) return;
-  await forceRefreshAdsHeaders({ reporting: true, taskTabId: options.taskTabId });
+  if (isAdsHeaderComplete(state)) return;
+  await forceRefreshAdsHeaders({ reporting: false, taskTabId: options.taskTabId });
 }
 
 function hasAdsReportingHeaders(st = {}) {
@@ -173,8 +173,7 @@ function isAdsHeaderComplete(st = {}) {
     st.adsClientId &&
     st.adsMarketplaceId &&
     st.adsCsrfData &&
-    st.adsCsrfToken &&
-    st.adsReportingCsrfToken
+    st.adsCsrfToken
   );
 }
 
@@ -246,10 +245,21 @@ async function withAdsApiLock(taskName, fn, options = {}) {
   await persistAdsLockState();
 
   let taskTabId = null;
+  let ownsTaskTab = false;
   if (options.createTaskTab) {
     try {
-      const tab = await chrome.tabs.create({ url: `${ADS_BASE}/cm/campaigns`, active: true });
-      taskTabId = tab.id;
+      const existingTabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
+      const existingCampaignTab = existingTabs.find((t) => t.url?.includes('/cm/'));
+      if (existingCampaignTab) {
+        taskTabId = existingCampaignTab.id;
+        ownsTaskTab = false;
+        debugLog(`🌐 [ADS-TAB] Reusing existing ads tab: ${taskTabId}`, 'info');
+      } else {
+        const tab = await chrome.tabs.create({ url: `${ADS_BASE}/cm/campaigns`, active: false });
+        taskTabId = tab.id;
+        ownsTaskTab = true;
+        debugLog(`🌐 [ADS-TAB] Opened silent background ads tab: ${taskTabId}`, 'info');
+      }
     } catch (error) {
       adsApiLock.running = false;
       adsApiLock.taskName = '';
@@ -274,7 +284,7 @@ async function withAdsApiLock(taskName, fn, options = {}) {
     extensionLogger?.logError(error, { runId, taskName }, `[ADS-LOCK] Released error ${taskName}`);
     throw error;
   } finally {
-    if (adsApiLock.runId === runId && options.closeTaskTab !== false) {
+    if (adsApiLock.runId === runId && ownsTaskTab && options.closeTaskTab !== false) {
       const tabId = taskTabId;
       if (tabId) {
         try { await chrome.tabs.remove(tabId); } catch (_) { /* tab already closed */ }
@@ -726,7 +736,7 @@ async function ensureAdsTab(options = {}) {
     extensionLogger?.logInfo("[ADS-TAB] Opening Amazon Ads campaigns page");
     tab = await chrome.tabs.create({
       url: `${ADS_BASE}/cm/campaigns`,
-      active: true,
+      active: false,
     });
   } else {
     debugLog(`🌐 [ADS-TAB] Reusing existing ads tab: ${tab.id}`, "info");
@@ -738,25 +748,8 @@ async function ensureAdsTab(options = {}) {
 }
 
 async function ensureAdsReportingTab(options = {}) {
-  if (options.taskTabId) {
-    const tab = await chrome.tabs.get(options.taskTabId);
-    if (!tab.url?.includes('/reporting')) await chrome.tabs.update(options.taskTabId, { url: `${ADS_BASE}/reporting` });
-    await waitForAdsTabComplete(options.taskTabId);
-    return options.taskTabId;
-  }
-  const tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
-  let tab = tabs.find((candidate) => candidate.url?.includes("/reporting"));
-
-  if (!tab) {
-    debugLog("🌐 [ADS-TAB] Opening Amazon Ads Reporting page...", "info");
-    extensionLogger?.logInfo("[ADS-TAB] Opening Amazon Ads Reporting page");
-    tab = await chrome.tabs.create({ url: `${ADS_BASE}/reporting`, active: true });
-  } else {
-    debugLog(`🌐 [ADS-TAB] Reusing Amazon Ads Reporting tab: ${tab.id}`, "info");
-    extensionLogger?.logInfo("[ADS-TAB] Reusing Amazon Ads Reporting tab", { tabId: tab.id });
-  }
-
-  return tab.id;
+  // Only open cm/campaigns; do not navigate to reporting (url: `${ADS_BASE}/reporting`)
+  return ensureAdsTab(options);
 }
 
 async function injectAdsMainWorldSniffer(tabId) {
@@ -2030,4 +2023,12 @@ chrome.runtime.onInstalled.addListener(() => startExtensionCommandPolling());
 chrome.runtime.onStartup.addListener(() => startExtensionCommandPolling());
 chrome.storage.onChanged.addListener((changes) => { if (changes.ingestUrl || changes.ingestToken) startExtensionCommandPolling(); });
 chrome.alarms.onAlarm.addListener((alarm) => { if (alarm?.name === EXTENSION_COMMAND_POLL_ALARM) pollExtensionCommandsWithBackoff().catch(() => undefined); });
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => { (async () => { if (msg?.type === "PING") return sendResponse({ ok: true }); if (msg?.type === 'GET_ACTIVITY_COMMANDS') return sendResponse({ ok: true, commands: await getActivityCommands() }); if (msg?.type === "HEARTBEAT_NOW") return sendResponse(await heartbeatOnly()); if (msg?.type === "AUTO_RUN_NOW") return sendResponse(await queueManualOrderImport()); if (msg?.type === "PREVIEW_ADS_SPEND") return sendResponse(await runExportAdsSpend({ ...msg.payload, preview: true })); if (msg?.type === "DRY_RUN_ADS_SPEND") return sendResponse(await runExportAdsSpend({ ...msg.payload, dryRun: true })); if (msg?.type === "RUN_ADS_SPEND") return sendResponse(await queueManualAdsSpend(msg.payload?.dateFrom, msg.payload?.dateTo)); if (msg?.type === "RUN_TRANSACTIONS_IMPORT") return sendResponse(await runImportTransactions(msg.payload || {})); if (msg?.type === "RUN_SETTLEMENTS_IMPORT") return sendResponse(await runImportSettlements(msg.payload || {})); if (msg?.type === "GMAIL_AMAZON_ADS_DOWNLOAD") return sendResponse(await uploadGmailAdsDownload(msg.url)); return sendResponse({ ok: false, error: "Unsupported action" }); })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) })); return true; });
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => { (async () => { if (msg?.type === "ADS_BRIDGE_LOG") {
+    if (msg.payload?.level === "error") {
+      extensionLogger?.logError(null, msg.payload.rawData, msg.payload.message);
+    } else {
+      extensionLogger?.logInfo(msg.payload.message, msg.payload.rawData);
+    }
+    return sendResponse({ ok: true });
+  }
+  if (msg?.type === "PING") return sendResponse({ ok: true }); if (msg?.type === 'GET_ACTIVITY_COMMANDS') return sendResponse({ ok: true, commands: await getActivityCommands() }); if (msg?.type === "HEARTBEAT_NOW") return sendResponse(await heartbeatOnly()); if (msg?.type === "AUTO_RUN_NOW") return sendResponse(await queueManualOrderImport()); if (msg?.type === "PREVIEW_ADS_SPEND") return sendResponse(await runExportAdsSpend({ ...msg.payload, preview: true })); if (msg?.type === "DRY_RUN_ADS_SPEND") return sendResponse(await runExportAdsSpend({ ...msg.payload, dryRun: true })); if (msg?.type === "RUN_ADS_SPEND") return sendResponse(await queueManualAdsSpend(msg.payload?.dateFrom, msg.payload?.dateTo)); if (msg?.type === "RUN_TRANSACTIONS_IMPORT") return sendResponse(await runImportTransactions(msg.payload || {})); if (msg?.type === "RUN_SETTLEMENTS_IMPORT") return sendResponse(await runImportSettlements(msg.payload || {})); if (msg?.type === "GMAIL_AMAZON_ADS_DOWNLOAD") return sendResponse(await uploadGmailAdsDownload(msg.url)); return sendResponse({ ok: false, error: "Unsupported action" }); })().catch((error) => sendResponse({ ok: false, error: error?.message || String(error) })); return true; });

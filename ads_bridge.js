@@ -75,10 +75,11 @@
     if (!Object.keys(clean).length) return false;
 
     const now = Date.now();
-    const { adsApiLockState } = await getCfg(["adsApiLockState"]);
+    const { adsApiLockState, adsCandidateHeaders: prevCandidate } = await getCfg(["adsApiLockState", "adsCandidateHeaders"]);
     if (isAdsApiLockedState(adsApiLockState)) {
       await setCfg({
         adsCandidateHeaders: {
+          ...(prevCandidate || {}),
           ...clean,
           adsHeaderLastSeen: now,
           source,
