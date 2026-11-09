@@ -76,10 +76,43 @@ const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function createAdsError(message, status = 0, responseText = "") { const error = new Error(message); error.status = status; error.responseText = responseText; return error; }
 function isAdsAuthError(error) { return [401, 403].includes(Number(error?.status)) || /sign.?in|login|unauthor/i.test(String(error?.responseText || error?.message || "")); }
 async function waitForTabComplete(tabId, timeoutMessage = "Amazon page did not finish loading") {
-  if ((await chrome.tabs.get(tabId)).status === "complete") return;
-  await new Promise((resolve, reject) => {
-    const onUpdated = (updatedTabId, changeInfo) => { if (updatedTabId === tabId && changeInfo.status === "complete") { clearTimeout(timeout); chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); } };
-    const timeout = setTimeout(() => { chrome.tabs.onUpdated.removeListener(onUpdated); reject(new Error(timeoutMessage)); }, ADS_TAB_LOAD_TIMEOUT_MS);
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === "complete") return;
+  } catch (_) {
+    return;
+  }
+  await new Promise((resolve) => {
+    let resolved = false;
+    const cleanup = () => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeout);
+      clearInterval(interval);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+    };
+    const onUpdated = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === "complete") {
+        cleanup();
+        resolve();
+      }
+    };
+    const interval = setInterval(async () => {
+      try {
+        const t = await chrome.tabs.get(tabId);
+        if (t.status === "complete") {
+          cleanup();
+          resolve();
+        }
+      } catch (_) {
+        cleanup();
+        resolve();
+      }
+    }, 500);
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, 10000);
     chrome.tabs.onUpdated.addListener(onUpdated);
   });
 }
@@ -123,11 +156,15 @@ async function forceRefreshAdsHeaders({ reporting = false, taskTabId = null } = 
   if (reporting) {
     headers = await waitForAdsReportingHeaders();
   } else {
-    await waitForAdsTabComplete(tabId);
-    await delayMs(ADS_PAGE_SETTLE_MS);
-    const state = await chrome.storage.local.get([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
-    headers = { ...(state.adsCandidateHeaders || {}), ...state };
+    const expiresAt = Date.now() + ADS_HEADER_REFRESH_TIMEOUT_MS;
+    do {
+      const state = await chrome.storage.local.get([...ADS_HEADER_STORAGE_KEYS, "adsCandidateHeaders"]);
+      headers = { ...(state.adsCandidateHeaders || {}), ...state };
+      if (isAdsHeaderComplete(headers)) break;
+      await delayMs(500);
+    } while (Date.now() < expiresAt);
   }
+
   if (!(reporting ? hasAdsReportingHeaders(headers) : isAdsHeaderComplete(headers))) {
     throw createAdsError(
       reporting
@@ -136,7 +173,14 @@ async function forceRefreshAdsHeaders({ reporting = false, taskTabId = null } = 
       401,
     );
   }
-  await chrome.storage.local.set(Object.fromEntries(ADS_HEADER_STORAGE_KEYS.map((key) => [key, headers[key]])));
+  const toSave = {};
+  for (const key of ADS_HEADER_STORAGE_KEYS) {
+    if (headers[key]) toSave[key] = headers[key];
+  }
+  if (!toSave.adsCsrfToken && headers.adsReportingCsrfToken) {
+    toSave.adsCsrfToken = headers.adsReportingCsrfToken;
+  }
+  await chrome.storage.local.set(toSave);
 }
 async function ensureFreshAdsHeaders() {
   const state = await readAdsHeaderState();
@@ -167,13 +211,21 @@ async function waitForAdsReportingHeaders() {
 }
 
 function isAdsHeaderComplete(st = {}) {
+  const candidate = st.adsCandidateHeaders || {};
+  const accountId = st.adsAccountId || candidate.adsAccountId;
+  const advertiserId = st.adsAdvertiserId || candidate.adsAdvertiserId;
+  const clientId = st.adsClientId || candidate.adsClientId;
+  const marketplaceId = st.adsMarketplaceId || candidate.adsMarketplaceId;
+  const csrfData = st.adsCsrfData || candidate.adsCsrfData;
+  const csrfToken = st.adsCsrfToken || candidate.adsCsrfToken || st.adsReportingCsrfToken || candidate.adsReportingCsrfToken;
+
   return !!(
-    st.adsAccountId &&
-    st.adsAdvertiserId &&
-    st.adsClientId &&
-    st.adsMarketplaceId &&
-    st.adsCsrfData &&
-    st.adsCsrfToken
+    accountId &&
+    advertiserId &&
+    clientId &&
+    marketplaceId &&
+    csrfData &&
+    csrfToken
   );
 }
 
@@ -253,12 +305,13 @@ async function withAdsApiLock(taskName, fn, options = {}) {
       if (existingCampaignTab) {
         taskTabId = existingCampaignTab.id;
         ownsTaskTab = false;
-        debugLog(`🌐 [ADS-TAB] Reusing existing ads tab: ${taskTabId}`, 'info');
+        await chrome.tabs.update(taskTabId, { active: true }).catch(() => {});
+        debugLog(`🌐 [ADS-TAB] Reusing and focusing existing ads tab: ${taskTabId}`, 'info');
       } else {
-        const tab = await chrome.tabs.create({ url: `${ADS_BASE}/cm/campaigns`, active: false });
+        const tab = await chrome.tabs.create({ url: `${ADS_BASE}/cm/campaigns`, active: true });
         taskTabId = tab.id;
         ownsTaskTab = true;
-        debugLog(`🌐 [ADS-TAB] Opened silent background ads tab: ${taskTabId}`, 'info');
+        debugLog(`🌐 [ADS-TAB] Opened active ads tab: ${taskTabId}`, 'info');
       }
     } catch (error) {
       adsApiLock.running = false;
@@ -724,8 +777,10 @@ async function runImportNewOrders(referenceOverride, numDays) {
 async function ensureAdsTab(options = {}) {
   if (options.taskTabId) {
     const tab = await chrome.tabs.get(options.taskTabId);
-    if (!tab.url?.includes('/cm/')) await chrome.tabs.update(options.taskTabId, { url: `${ADS_BASE}/cm/campaigns` });
-    await waitForAdsTabComplete(options.taskTabId);
+    if (!tab.url?.includes('/cm/')) {
+      await chrome.tabs.update(options.taskTabId, { url: `${ADS_BASE}/cm/campaigns` });
+      await waitForAdsTabComplete(options.taskTabId);
+    }
     return options.taskTabId;
   }
   const tabs = await chrome.tabs.query({ url: `${ADS_BASE}/*` });
@@ -736,14 +791,15 @@ async function ensureAdsTab(options = {}) {
     extensionLogger?.logInfo("[ADS-TAB] Opening Amazon Ads campaigns page");
     tab = await chrome.tabs.create({
       url: `${ADS_BASE}/cm/campaigns`,
-      active: false,
+      active: true,
     });
+    await waitForAdsTabComplete(tab.id);
   } else {
+    await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
     debugLog(`🌐 [ADS-TAB] Reusing existing ads tab: ${tab.id}`, "info");
     extensionLogger?.logInfo("[ADS-TAB] Reusing existing ads tab", { tabId: tab.id, url: tab.url });
   }
 
-  await waitForAdsTabComplete(tab.id);
   return tab.id;
 }
 
@@ -1804,10 +1860,9 @@ async function runExportAdsSpendLocked({ dateFrom, dateTo, dryRun = false, previ
         directRowCount = rows.length;
         await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Direct retrieveReport retrieved campaign rows', { ...activityContext, date, count: directRowCount });
       } catch (directError) {
-        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Direct retrieveReport fallback to reporting template', { ...activityContext, date, error: directError?.message });
-        const configurationId = await createAndRunAdsReport(date, date, lock);
-        await waitForAdsReport(configurationId, lock);
-        csv = await downloadAdsReportCsv(configurationId, lock);
+        await extensionLogger.logInfo('[IMPORT_ADS_SPEND] Direct retrieveReport failed', { ...activityContext, date, error: directError?.message });
+        // createAndRunAdsReport fallback disabled: campaigns page only
+        throw directError;
       }
       const filename = `ads-report-${date}.csv`;
       if (preview) continue;

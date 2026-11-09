@@ -102,15 +102,17 @@
 
   // ---------- Build headers cho retrieveReport ----------
   async function buildAdsHeaders() {
-    const {
-      adsAccountId,
-      adsAdvertiserId,
-      adsClientId,
-      adsMarketplaceId,
-      adsCsrfData,
-      adsCsrfToken,
-      adsReportingCsrfToken,
-    } = await getCfg();
+    const cfg = await getCfg();
+    const candidate = cfg.adsCandidateHeaders || {};
+    const adsAccountId = cfg.adsAccountId || candidate.adsAccountId;
+    const adsAdvertiserId = cfg.adsAdvertiserId || candidate.adsAdvertiserId;
+    const adsClientId = cfg.adsClientId || candidate.adsClientId;
+    const adsMarketplaceId = cfg.adsMarketplaceId || candidate.adsMarketplaceId;
+    const adsCsrfData = cfg.adsCsrfData || candidate.adsCsrfData;
+    const rawCsrfToken = cfg.adsCsrfToken || candidate.adsCsrfToken;
+    const rawReportingCsrfToken = cfg.adsReportingCsrfToken || candidate.adsReportingCsrfToken;
+    const adsCsrfToken = rawCsrfToken || rawReportingCsrfToken;
+    const adsReportingCsrfToken = rawReportingCsrfToken || rawCsrfToken;
 
     const h = {
       accept: "application/json, text/javascript, */*; q=0.01",
