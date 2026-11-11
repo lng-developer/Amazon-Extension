@@ -63,6 +63,7 @@ export function buildActivityRuns(events = [], { now = Date.now(), commands = []
     // Legacy task IDs were date ranges, not attempt IDs. A new start is a new attempt.
     if (key && !strongKey && startsRun) run = null;
     if (!run) {
+      if (!key && !startsRun && !context.taskType) return runs;
       run = { id: `${key || type}-${event.timestamp}-${runs.length}`, key, commandId: context.commandId, type, label: ACTIVITY_TYPES[type], status: 'RUNNING', startedAt: event.timestamp, dateFrom: context.dateFrom || null, dateTo: context.dateTo || null, dates: [], error: null, events: [] };
       runs.push(run);
     }
