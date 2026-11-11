@@ -1,16 +1,241 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>LNG Amazon Extension</title><link rel="stylesheet" href="options.css" /></head><body>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LNG Amazon Extension</title>
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
 <main class="app-shell" aria-labelledby="pageTitle">
-  <header class="app-header"><div><p class="eyebrow">LNG Operations</p><h1 id="pageTitle">Amazon Extension</h1></div><span class="connection-state">Command polling enabled</span></header>
-  <section class="be-status" aria-label="Backend connection"><span id="beConnection">BE: Checking…</span><span id="bePoll">Next poll: -</span><button id="btnCheckNow" class="btn" type="button">Check now</button></section>
+  <header class="app-header">
+    <div class="brand-group">
+      <div class="brand-badge">LNG</div>
+      <div>
+        <p class="eyebrow">Enterprise Fulfillment</p>
+        <h1 id="pageTitle">Amazon Operations Hub</h1>
+      </div>
+    </div>
+    <div class="header-right">
+      <span class="version-badge">v0.3.8</span>
+      <span class="connection-state">
+        <span class="status-dot"></span>
+        Command polling enabled
+      </span>
+    </div>
+  </header>
+
+  <section class="be-status" aria-label="Backend connection">
+    <div class="status-info">
+      <span class="status-icon">⚡</span>
+      <span id="beConnection">BE: Checking…</span>
+      <span class="separator">·</span>
+      <span id="bePoll">Next poll: -</span>
+    </div>
+    <button id="btnCheckNow" class="btn btn-secondary btn-sm" type="button">
+      <span class="btn-icon">↻</span> Check now
+    </button>
+  </section>
+
   <nav class="tabs" role="tablist" aria-label="Extension workflows">
-    <button class="tab is-active" type="button" role="tab" aria-selected="true" aria-controls="panel-orders" data-tab="orders">Orders</button><button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-ads" data-tab="ads">Ads Spend</button><button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-transactions" data-tab="transactions">Transactions</button><button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-settlements" data-tab="settlements">Settlements</button><button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-settings" data-tab="settings">Settings</button><button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-logs" data-tab="logs">Logs</button>
+    <button class="tab is-active" type="button" role="tab" aria-selected="true" aria-controls="panel-orders" data-tab="orders">
+      <span class="tab-icon">📦</span> Orders
+    </button>
+    <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-ads" data-tab="ads">
+      <span class="tab-icon">📊</span> Ads Spend
+    </button>
+    <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-transactions" data-tab="transactions">
+      <span class="tab-icon">💳</span> Transactions
+    </button>
+    <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-settlements" data-tab="settlements">
+      <span class="tab-icon">📑</span> Settlements
+    </button>
+    <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-settings" data-tab="settings">
+      <span class="tab-icon">⚙️</span> Settings
+    </button>
+    <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="panel-logs" data-tab="logs">
+      <span class="tab-icon">📜</span> Logs
+    </button>
   </nav>
-  <section id="panel-orders" class="tab-panel is-active" role="tabpanel" data-panel="orders"><p class="section-kicker">Order import</p><h2>Pull new Amazon orders</h2><p>Request a fresh report and send it to the selected LNG environment.</p><div id="orderProgress" class="order-progress" role="status" aria-live="polite">No import in progress.</div><button id="btnImportNew" class="btn btn-primary" type="button">Import new orders</button></section>
-  <section id="panel-ads" class="tab-panel" role="tabpanel" data-panel="ads" hidden><p class="section-kicker">Development only</p><h2>Pull Amazon Ads spend</h2><p>Preview reads Amazon only. Test uploads with dry-run. Import queues a live backend command.</p><div class="field-grid"><div><label for="adsDateFrom">From</label><input id="adsDateFrom" type="date" /></div><div><label for="adsDateTo">To</label><input id="adsDateTo" type="date" /></div></div><button id="btnPreviewAds" class="btn" type="button">Preview</button><button id="btnDryRunAds" class="btn" type="button">Dry-run / Test</button><button id="btnExportAds" class="btn btn-primary" type="button">Import Ads spend</button></section>
-  <section id="panel-transactions" class="tab-panel" role="tabpanel" data-panel="transactions" hidden><p class="section-kicker">Finance</p><h2>Import transactions</h2><div class="field-grid"><div><label for="transactionsDateFrom">From</label><input id="transactionsDateFrom" type="date" /></div><div><label for="transactionsDateTo">To</label><input id="transactionsDateTo" type="date" /></div></div><button id="btnImportTransactions" class="btn btn-primary" type="button">Import transactions</button></section>
-  <section id="panel-settlements" class="tab-panel" role="tabpanel" data-panel="settlements" hidden><p class="section-kicker">Finance</p><h2>Import settlements</h2><p>Keep Amazon All Statements open for the exact period; the extension opens the Flat File V2 menu and reads the download link automatically.</p><div class="field-grid"><div><label for="settlementsDateFrom">From</label><input id="settlementsDateFrom" type="date" /></div><div><label for="settlementsDateTo">To</label><input id="settlementsDateTo" type="date" /></div></div><button id="btnImportSettlements" class="btn btn-primary" type="button">Import settlements</button></section>
-  <section id="panel-settings" class="tab-panel" role="tabpanel" data-panel="settings" hidden><p class="section-kicker">Connection</p><h2>Backend credentials</h2><div class="field-grid"><div><label for="environment">Environment</label><select id="environment" disabled><option value="development">Development</option></select></div><div><label for="marketplaceCode">Marketplace</label><input id="marketplaceCode" value="US" /></div></div><label for="ingestUrl">API Base URL</label><input id="ingestUrl" type="url" value="https://ecomatrix.lngmerch.co" /><label for="ingestToken">API Access Token</label><input id="ingestToken" type="password" autocomplete="off" /><button id="btnSave" class="btn btn-primary" type="button">Save configuration</button></section>
-  <section id="panel-logs" class="tab-panel" role="tabpanel" data-panel="logs" hidden><p class="section-kicker">Diagnostics</p><h2>Recent activity</h2><p>Times are shown in ICT. Stored locally; credentials and customer data are redacted.</p><div class="log-actions"><button id="btnCopyLogs" class="btn" type="button">Copy raw logs</button><button id="btnClearLogs" class="btn" type="button">Clear logs</button></div><div id="logEntries" class="log-entries" aria-live="polite">No activity yet.</div></section>
-  <section class="activity" aria-label="Activity status"><span>Activity</span><output id="log" aria-live="polite">Ready.</output></section>
-</main><script type="module" src="options.js"></script></body></html>
+
+  <!-- Panel: Orders -->
+  <section id="panel-orders" class="tab-panel is-active" role="tabpanel" data-panel="orders">
+    <div class="panel-header">
+      <p class="section-kicker">Order Import</p>
+      <h2>Pull new Amazon orders</h2>
+      <p>Request a fresh FBM order report from Seller Central and ingest it into the LNG backend.</p>
+    </div>
+    
+    <div class="card card-action">
+      <div class="card-header">
+        <span class="card-title">Import Status</span>
+      </div>
+      <div id="orderProgress" class="order-progress" role="status" aria-live="polite">No import in progress.</div>
+      <div class="card-actions">
+        <button id="btnImportNew" class="btn btn-primary" type="button">
+          <span>⚡</span> Import new orders
+        </button>
+      </div>
+    </div>
+
+    <div class="info-tip">
+      <span class="tip-icon">💡</span>
+      <p>Background polling automatically ingests new orders every 10 minutes. Use this button to trigger an immediate on-demand sync.</p>
+    </div>
+  </section>
+
+  <!-- Panel: Ads Spend -->
+  <section id="panel-ads" class="tab-panel" role="tabpanel" data-panel="ads" hidden>
+    <div class="panel-header">
+      <p class="section-kicker">Marketing & Analytics</p>
+      <h2>Pull Amazon Ads spend</h2>
+      <p>Download sponsored product metrics and campaign spend reports directly from Amazon Advertising.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Select Date Range</span>
+      </div>
+      <div class="field-grid">
+        <div class="form-group">
+          <label for="adsDateFrom">From Date</label>
+          <input id="adsDateFrom" type="date" />
+        </div>
+        <div class="form-group">
+          <label for="adsDateTo">To Date</label>
+          <input id="adsDateTo" type="date" />
+        </div>
+      </div>
+      <div class="btn-group">
+        <button id="btnPreviewAds" class="btn btn-secondary" type="button">Preview Data</button>
+        <button id="btnDryRunAds" class="btn btn-secondary" type="button">Dry-run / Test</button>
+        <button id="btnExportAds" class="btn btn-primary" type="button">Import Ads spend</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Panel: Transactions -->
+  <section id="panel-transactions" class="tab-panel" role="tabpanel" data-panel="transactions" hidden>
+    <div class="panel-header">
+      <p class="section-kicker">Finance & Reconciliation</p>
+      <h2>Import transactions</h2>
+      <p>Sync detailed transaction ledger from Amazon Payments for revenue and fee reconciliation.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Date Filter</span>
+      </div>
+      <div class="field-grid">
+        <div class="form-group">
+          <label for="transactionsDateFrom">From Date</label>
+          <input id="transactionsDateFrom" type="date" />
+        </div>
+        <div class="form-group">
+          <label for="transactionsDateTo">To Date</label>
+          <input id="transactionsDateTo" type="date" />
+        </div>
+      </div>
+      <div class="card-actions">
+        <button id="btnImportTransactions" class="btn btn-primary" type="button">Import transactions</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Panel: Settlements -->
+  <section id="panel-settlements" class="tab-panel" role="tabpanel" data-panel="settlements" hidden>
+    <div class="panel-header">
+      <p class="section-kicker">Finance & Accounting</p>
+      <h2>Import settlements</h2>
+      <p>Keep Amazon All Statements open for the exact period; the extension opens the Flat File V2 menu and reads the download link automatically.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Statement Period</span>
+      </div>
+      <div class="field-grid">
+        <div class="form-group">
+          <label for="settlementsDateFrom">From Date</label>
+          <input id="settlementsDateFrom" type="date" />
+        </div>
+        <div class="form-group">
+          <label for="settlementsDateTo">To Date</label>
+          <input id="settlementsDateTo" type="date" />
+        </div>
+      </div>
+      <div class="card-actions">
+        <button id="btnImportSettlements" class="btn btn-primary" type="button">Import settlements</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Panel: Settings -->
+  <section id="panel-settings" class="tab-panel" role="tabpanel" data-panel="settings" hidden>
+    <div class="panel-header">
+      <p class="section-kicker">Connection & Auth</p>
+      <h2>Backend credentials</h2>
+      <p>Configure the LNG API server endpoint and authorization token.</p>
+    </div>
+
+    <div class="card">
+      <div class="field-grid">
+        <div class="form-group">
+          <label for="environment">Environment</label>
+          <select id="environment" disabled>
+            <option value="development">Production / Live</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="marketplaceCode">Marketplace Code</label>
+          <input id="marketplaceCode" value="US" />
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="ingestUrl">API Base URL</label>
+        <input id="ingestUrl" type="url" value="https://ecomatrix.lngmerch.co" placeholder="https://ecomatrix.lngmerch.co" />
+      </div>
+
+      <div class="form-group">
+        <label for="ingestToken">API Access Token</label>
+        <div class="input-with-button">
+          <input id="ingestToken" type="password" autocomplete="off" placeholder="Paste your Bearer token here" />
+        </div>
+      </div>
+
+      <div class="card-actions">
+        <button id="btnSave" class="btn btn-primary" type="button">Save configuration</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Panel: Logs -->
+  <section id="panel-logs" class="tab-panel" role="tabpanel" data-panel="logs" hidden>
+    <div class="panel-header panel-header-row">
+      <div>
+        <p class="section-kicker">Diagnostics</p>
+        <h2>Recent activity</h2>
+        <p>Times shown in Vietnam Time (ICT). Redacted for security.</p>
+      </div>
+      <div class="log-actions">
+        <button id="btnCopyLogs" class="btn btn-secondary btn-sm" type="button">Copy raw logs</button>
+        <button id="btnClearLogs" class="btn btn-secondary btn-sm" type="button">Clear logs</button>
+      </div>
+    </div>
+
+    <div id="logEntries" class="log-entries" aria-live="polite">No activity yet.</div>
+  </section>
+
+  <!-- Activity Bar -->
+  <section class="activity" aria-label="Activity status">
+    <div class="activity-label">
+      <span class="activity-pulse"></span>
+      <span>Activity</span>
+    </div>
+    <output id="log" aria-live="polite">Ready.</output>
+  </section>
+</main>
+<script type="module" src="options.js"></script>
+</body>
+</html>
