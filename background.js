@@ -1996,16 +1996,55 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
   const existingWatch = (await chrome.storage.local.get(watchKey))[watchKey];
   if (existingWatch) return reconcileTrackingWatch({ command, leaseToken, payload, watch: existingWatch, root, headers, body });
   await validateTrackingPayload(payload); await onProgress({ stage: 'READY_TO_SUBMIT' });
+
+  await extensionLogger?.logTaskStarted?.(
+    { taskType: command.type, commandId: command.id, activityStatus: 'RUNNING' },
+    `Starting tracking upload (${payload.rowCount || 1} orders)`
+  );
+
   const tab = await chrome.tabs.create({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds', active: true });
   try {
     await waitForSellerCentralTabComplete(tab.id);
     const historyBeforeBatchIds = await snapshotFeedHistory(tab.id);
     await submitNativeTrackingFeed({ tsv: payload.tsv, filename: payload.filename, tabId: tab.id });
+
+    // Wait for Amazon to accept the file upload and record the new feed entry
+    let amazonBatchId = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try {
+        const [rows] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: 'MAIN',
+          func: () => [...document.querySelectorAll('tr')].map((row) => row.innerText || ''),
+        });
+        const row = findNewFeedRow(rows?.result || [], historyBeforeBatchIds);
+        if (row) {
+          amazonBatchId = (row.match(/\b\d{6,}\b/) || [])[0];
+          break;
+        }
+      } catch {}
+    }
+
     for (const suffix of ['submitted', 'waiting']) {
       const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/${suffix}`, { method: 'POST', headers, body: JSON.stringify(body) });
       if (!response.ok) throw new Error(`Tracking ${suffix} state was rejected`);
     }
-    await chrome.storage.local.set({ [watchKey]: { submissionId: payload.submissionId, historyBeforeBatchIds, checksum: payload.checksum } });
+
+    if (amazonBatchId) {
+      await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/batch`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ...body, amazonBatchId }),
+      }).catch(() => {});
+    }
+
+    await extensionLogger?.logInfo?.(
+      `Tracking feed submitted to Amazon${amazonBatchId ? ` (Batch ID: ${amazonBatchId})` : ''}`,
+      { taskType: command.type, commandId: command.id, submissionId: payload.submissionId, amazonBatchId, rowCount: payload.rowCount }
+    );
+
+    await chrome.storage.local.set({ [watchKey]: { submissionId: payload.submissionId, historyBeforeBatchIds, amazonBatchId, checksum: payload.checksum } });
     return { deferred: true, submissionId: payload.submissionId };
   } finally {
     await chrome.tabs.remove(tab.id).catch(() => {});
@@ -2025,6 +2064,21 @@ async function reconcileTrackingWatch({ command, payload, watch, root, headers, 
     const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/terminal`, { method: 'POST', headers, body: JSON.stringify({ ...body, ...terminal }) });
     if (!response.ok) throw new Error('Tracking terminal state was rejected');
     await chrome.storage.local.remove(`trackingWatch:${payload.submissionId}`);
+
+    if (terminal.status === 'SUCCEEDED') {
+      await extensionLogger?.logTaskCompleted?.(
+        { taskType: command.type, commandId: command.id },
+        terminal.result,
+        `Tracking upload confirmed by Amazon (Batch: ${amazonBatchId || 'Done'})`
+      );
+    } else {
+      await extensionLogger?.logTaskFailed?.(
+        { taskType: command.type, commandId: command.id },
+        new Error(terminal.result?.diagnostics?.[0] || 'Upload tracking failed'),
+        `Tracking upload rejected by Amazon`
+      );
+    }
+
     return terminal.result;
   } finally {
     await chrome.tabs.remove(tab.id).catch(() => {});

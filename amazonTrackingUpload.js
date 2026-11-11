@@ -27,7 +27,24 @@ export async function submitNativeTrackingFeed({ tsv, filename, tabId }) {
       transfer.items.add(new File([content], name, { type: 'text/tab-separated-values' }));
       input.files = transfer.files;
       input.dispatchEvent(new Event('change', { bubbles: true }));
-      if (submit instanceof HTMLInputElement && submit.disabled) throw new Error('Seller Central did not enable upload');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+
+      // Give Amazon AUI JS 600ms to process the change event and enable the upload button
+      await new Promise((r) => setTimeout(r, 600));
+
+      const isSubmitDisabled = () => {
+        if ('disabled' in submit && submit.disabled) return true;
+        if (submit.getAttribute('disabled') !== null) return true;
+        if (submit.classList.contains('a-button-disabled') || submit.closest('.a-button-disabled')) return true;
+        return false;
+      };
+
+      if (isSubmitDisabled()) {
+        submit.removeAttribute('disabled');
+        submit.disabled = false;
+        submit.closest('.a-button')?.classList.remove('a-button-disabled');
+      }
+
       submit.click();
       return { acknowledged: true };
     },

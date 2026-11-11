@@ -27,12 +27,14 @@ const ACTIVITY_TYPES = {
   IMPORT_NEW_ORDERS: 'Orders',
   IMPORT_SETTLEMENTS: 'Settlements',
   IMPORT_TRANSACTIONS: 'Transactions',
+  UPLOAD_TRACKING: 'Upload Tracking',
 };
 
 function activityType(event) {
   const taskType = event?.context?.taskType;
   if (ACTIVITY_TYPES[taskType]) return taskType;
   const text = `${event?.message || ''} ${event?.context?.function || ''}`.toUpperCase();
+  if (text.includes('TRACKING') || text.includes('UPLOAD_TRACKING')) return 'UPLOAD_TRACKING';
   if (text.includes('ADS') || text.includes('CAMPAIGN')) return 'IMPORT_ADS_SPEND';
   if (text.includes('SETTLEMENT')) return 'IMPORT_SETTLEMENTS';
   if (text.includes('TRANSACTION')) return 'IMPORT_TRANSACTIONS';

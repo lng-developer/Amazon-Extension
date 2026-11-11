@@ -52,7 +52,7 @@ export async function pollExtensionCommand({ base, token, client, runImport, run
   const lease = { ...client, leaseToken: claim.leaseToken };
   await request(fetchImpl, `${root}/agent/commands/${command.id}/start`, token, 'POST', lease);
   const activity = { commandId: command.id, taskType: command.type };
-  const activityLogger = ['IMPORT_NEW_ORDERS', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'SYNC_LISTING_IMAGES'].includes(command.type) ? logger : null;
+  const activityLogger = ['IMPORT_NEW_ORDERS', 'IMPORT_TRANSACTIONS', 'IMPORT_SETTLEMENTS', 'SYNC_LISTING_IMAGES', 'UPLOAD_TRACKING'].includes(command.type) ? logger : null;
   await activityLogger?.logTaskProcessing(activity, 'Command task started');
   let batchId = null;
   let lastRenewedAt = 0;
