@@ -2016,8 +2016,14 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
   const historyBeforeBatchIds = await snapshotFeedHistory(tabId);
   const uploadResult = await submitNativeTrackingFeed({ tsv: payload.tsv, filename: payload.filename, tabId });
 
-  // Wait for Amazon to accept the file upload and record the new feed entry
+  // Give Amazon 3.5s to accept the POST body, then reload tab to exit the blank POST state
+  await new Promise((r) => setTimeout(r, 3500));
+  await chrome.tabs.reload(tabId).catch(() => {});
+  await waitForSellerCentralTabComplete(tabId);
+
+  // Poll for Amazon feed history row with Batch ID
   let amazonBatchId = null;
+  let terminal = null;
   for (let attempt = 0; attempt < 12; attempt++) {
     await new Promise((r) => setTimeout(r, 2000));
     try {
@@ -2044,7 +2050,8 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
       const row = findNewFeedRow(rows?.result || [], historyBeforeBatchIds);
       if (row) {
         amazonBatchId = (row.match(/\b\d{6,}\b/) || [])[0];
-        break;
+        terminal = terminalFeedResult(row);
+        if (terminal) break;
       }
     } catch {}
   }
@@ -2074,6 +2081,24 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
       files: uploadResult?.filesCount || 1,
     }
   );
+
+  if (terminal) {
+    const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/terminal`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...body, ...terminal }),
+    }).catch(() => null);
+    if (response?.ok) {
+      if (terminal.status === 'SUCCEEDED') {
+        await extensionLogger?.logTaskCompleted?.(
+          { taskType: command.type, commandId: command.id },
+          terminal.result,
+          `Tracking upload confirmed by Amazon (Batch: ${amazonBatchId || 'Done'})`
+        );
+        return { ok: true, importedCount: payload.rowCount, failedCount: 0, amazonBatchId };
+      }
+    }
+  }
 
   await chrome.storage.local.set({ [watchKey]: { submissionId: payload.submissionId, historyBeforeBatchIds, amazonBatchId, checksum: payload.checksum } });
   return { deferred: true, submissionId: payload.submissionId };
