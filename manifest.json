@@ -17,6 +17,8 @@
     "cookies"
   ],
   "host_permissions": [
+    "https://*.amazon.com/*",
+    "https://*.sellercentral.amazon.com/*",
     "https://www.amazon.com/*",
     "https://m.media-amazon.com/*",
     "https://sellercentral.amazon.com/*",

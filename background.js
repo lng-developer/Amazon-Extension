@@ -1966,35 +1966,71 @@ async function uploadGmailAdsDownload(url) {
   }
 }
 async function runFullFlowAndEmitLogs(numDays) { try { const importResult = await runImportNewOrders(undefined, numDays); return { ok: true, phases: [{ type: "import", status: "success", rows: importResult?.rows || 0 }], result: importResult }; } catch (error) { await setOrderImportProgress('FAILED', 'Order import failed', { error: error?.message || String(error) }); throw error; } }
-async function waitForSellerCentralTabComplete(tabId, timeoutMs = 30000) {
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab?.status === 'complete') return;
-  } catch (_) { return; }
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
-    }, timeoutMs);
-    const listener = (id, changeInfo) => {
-      if (id === tabId && changeInfo.status === 'complete') {
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
+async function waitForSellerCentralFeedsUIRendered(tabId, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tab) throw new Error('Seller Central tab was closed');
+
+      // Wait if still on about:blank or chrome navigation
+      if (!tab.url || tab.url.startsWith('about:') || tab.url.startsWith('chrome:') || tab.url.startsWith('edge:')) {
+        await new Promise((r) => setTimeout(r, 600));
+        continue;
       }
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-  });
+
+      if (!tab.url.includes('sellercentral.amazon.com')) {
+        throw new Error(`Seller Central redirected to: ${tab.url}`);
+      }
+
+      if (tab.status === 'complete') {
+        const [evalRes] = await chrome.scripting.executeScript({
+          target: { tabId },
+          world: 'MAIN',
+          func: () => {
+            if (document.querySelector('form[action*="signin"], input[name="password"], #ap_email, #auth-captcha-image')) {
+              return { ready: false, authRequired: true };
+            }
+            const hasFileInput = Boolean(document.querySelector('input[type="file"], #fileToUpload'));
+            const hasUploadBtn = [...document.querySelectorAll('button, input')].some((el) => {
+              const t = (el.value || el.innerText || '').trim().toLowerCase();
+              return t === 'upload now' || t === 'upload';
+            });
+            const hasTable = Boolean(document.querySelector('table, tr'));
+            return {
+              ready: (hasFileInput && hasUploadBtn) || hasTable,
+              authRequired: false,
+            };
+          },
+        }).catch(() => [null]);
+
+        if (evalRes?.result?.authRequired) {
+          throw new Error('Seller Central login or verification required');
+        }
+
+        if (evalRes?.result?.ready) {
+          await new Promise((r) => setTimeout(r, 800));
+          return true;
+        }
+      }
+    } catch (err) {
+      if (err.message && (err.message.includes('login or verification required') || err.message.includes('tab was closed') || err.message.includes('redirected to'))) {
+        throw err;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 700));
+  }
+  throw new Error('Timed out waiting for Seller Central Feeds UI to render');
 }
+
 async function ensureSellerCentralFeedsTab() {
   const tabs = await chrome.tabs.query({ url: '*://sellercentral.amazon.com/order-reports-and-feeds/feeds*' });
   if (tabs.length > 0 && tabs[0]?.id) {
     await chrome.tabs.update(tabs[0].id, { active: true }).catch(() => {});
-    return tabs[0].id;
+    return { tabId: tabs[0].id, ownsTab: false };
   }
   const tab = await chrome.tabs.create({ url: 'https://sellercentral.amazon.com/order-reports-and-feeds/feeds', active: true });
-  await waitForSellerCentralTabComplete(tab.id);
-  return tab.id;
+  return { tabId: tab.id, ownsTab: true };
 }
 async function runTrackingUpload({ command, leaseToken, onProgress }) {
   const config = await getCfg(); const identity = await getBaseShopAndIdentity(); const root = `${identity.base.replace(/\/+$/, '')}/api/integration/extension-commands`;
@@ -2012,100 +2048,109 @@ async function runTrackingUpload({ command, leaseToken, onProgress }) {
     `Starting tracking upload (${payload.rowCount || 1} orders)`
   );
 
-  const tabId = await ensureSellerCentralFeedsTab();
-  const historyBeforeBatchIds = await snapshotFeedHistory(tabId);
-  const uploadResult = await submitNativeTrackingFeed({ tsv: payload.tsv, filename: payload.filename, tabId });
+  const { tabId, ownsTab } = await ensureSellerCentralFeedsTab();
+  try {
+    await waitForSellerCentralFeedsUIRendered(tabId);
+    const historyBeforeBatchIds = await snapshotFeedHistory(tabId);
+    const uploadResult = await submitNativeTrackingFeed({ tsv: payload.tsv, filename: payload.filename, tabId });
 
-  // Give Amazon 3.5s to accept the POST body, then reload tab to exit the blank POST state
-  await new Promise((r) => setTimeout(r, 3500));
-  await chrome.tabs.reload(tabId).catch(() => {});
-  await waitForSellerCentralTabComplete(tabId);
+    // Give Amazon 3.5s to accept the POST body, then reload tab to exit the blank POST state
+    await new Promise((r) => setTimeout(r, 3500));
+    await chrome.tabs.reload(tabId).catch(() => {});
+    await waitForSellerCentralFeedsUIRendered(tabId).catch(() => {});
 
-  // Poll for Amazon feed history row with Batch ID
-  let amazonBatchId = null;
-  let terminal = null;
-  for (let attempt = 0; attempt < 12; attempt++) {
-    await new Promise((r) => setTimeout(r, 2000));
-    try {
-      if (attempt > 0) {
-        await chrome.scripting.executeScript({
+    // Poll for Amazon feed history row with Batch ID
+    let amazonBatchId = null;
+    let terminal = null;
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        if (attempt > 0) {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            world: 'MAIN',
+            func: () => {
+              const refreshBtn = [...document.querySelectorAll('button, a, input, span')].find((el) => {
+                const text = (el.innerText || el.value || '').trim().toLowerCase();
+                return text === 'refresh' || el.id === 'refreshHistory' || el.name === 'refresh';
+              });
+              if (refreshBtn) refreshBtn.click();
+            },
+          }).catch(() => {});
+          await new Promise((r) => setTimeout(r, 600));
+        }
+
+        const [rows] = await chrome.scripting.executeScript({
           target: { tabId },
           world: 'MAIN',
-          func: () => {
-            const refreshBtn = [...document.querySelectorAll('button, a, input, span')].find((el) => {
-              const text = (el.innerText || el.value || '').trim().toLowerCase();
-              return text === 'refresh' || el.id === 'refreshHistory' || el.name === 'refresh';
-            });
-            if (refreshBtn) refreshBtn.click();
-          },
-        }).catch(() => {});
-        await new Promise((r) => setTimeout(r, 600));
-      }
-
-      const [rows] = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: 'MAIN',
-        func: () => [...document.querySelectorAll('tr')].map((row) => row.innerText || ''),
-      });
-      const row = findNewFeedRow(rows?.result || [], historyBeforeBatchIds);
-      if (row) {
-        amazonBatchId = (row.match(/\b\d{6,}\b/) || [])[0];
-        terminal = terminalFeedResult(row);
-        if (terminal) break;
-      }
-    } catch {}
-  }
-
-  for (const suffix of ['submitted', 'waiting']) {
-    const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/${suffix}`, { method: 'POST', headers, body: JSON.stringify(body) });
-    if (!response.ok) throw new Error(`Tracking ${suffix} state was rejected`);
-  }
-
-  if (amazonBatchId) {
-    await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/batch`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ ...body, amazonBatchId }),
-    }).catch(() => {});
-  }
-
-  await extensionLogger?.logInfo?.(
-    `Tracking feed submitted to Amazon${amazonBatchId ? ` (Batch ID: ${amazonBatchId})` : ''}`,
-    {
-      taskType: command.type,
-      commandId: command.id,
-      submissionId: payload.submissionId,
-      amazonBatchId,
-      rowCount: payload.rowCount,
-      button: uploadResult?.buttonText || 'Upload now',
-      files: uploadResult?.filesCount || 1,
+          func: () => [...document.querySelectorAll('tr')].map((row) => row.innerText || ''),
+        });
+        const row = findNewFeedRow(rows?.result || [], historyBeforeBatchIds);
+        if (row) {
+          amazonBatchId = (row.match(/\b\d{6,}\b/) || [])[0];
+          terminal = terminalFeedResult(row);
+          if (terminal) break;
+        }
+      } catch {}
     }
-  );
 
-  if (terminal) {
-    const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/terminal`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ ...body, ...terminal }),
-    }).catch(() => null);
-    if (response?.ok) {
-      if (terminal.status === 'SUCCEEDED') {
-        await extensionLogger?.logTaskCompleted?.(
-          { taskType: command.type, commandId: command.id },
-          terminal.result,
-          `Tracking upload confirmed by Amazon (Batch: ${amazonBatchId || 'Done'})`
-        );
-        return { ok: true, importedCount: payload.rowCount, failedCount: 0, amazonBatchId };
+    for (const suffix of ['submitted', 'waiting']) {
+      const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/${suffix}`, { method: 'POST', headers, body: JSON.stringify(body) });
+      if (!response.ok) throw new Error(`Tracking ${suffix} state was rejected`);
+    }
+
+    if (amazonBatchId) {
+      await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/batch`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ...body, amazonBatchId }),
+      }).catch(() => {});
+    }
+
+    await extensionLogger?.logInfo?.(
+      `Tracking feed submitted to Amazon${amazonBatchId ? ` (Batch ID: ${amazonBatchId})` : ''}`,
+      {
+        taskType: command.type,
+        commandId: command.id,
+        submissionId: payload.submissionId,
+        amazonBatchId,
+        rowCount: payload.rowCount,
+        button: uploadResult?.buttonText || 'Upload now',
+        files: uploadResult?.filesCount || 1,
+      }
+    );
+
+    if (terminal) {
+      const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/terminal`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ ...body, ...terminal }),
+      }).catch(() => null);
+      if (response?.ok) {
+        if (terminal.status === 'SUCCEEDED') {
+          await extensionLogger?.logTaskCompleted?.(
+            { taskType: command.type, commandId: command.id },
+            terminal.result,
+            `Tracking upload confirmed by Amazon (Batch: ${amazonBatchId || 'Done'})`
+          );
+          if (ownsTab) await chrome.tabs.remove(tabId).catch(() => {});
+          return { ok: true, importedCount: payload.rowCount, failedCount: 0, amazonBatchId };
+        }
       }
     }
-  }
 
-  await chrome.storage.local.set({ [watchKey]: { submissionId: payload.submissionId, historyBeforeBatchIds, amazonBatchId, checksum: payload.checksum } });
-  return { deferred: true, submissionId: payload.submissionId };
+    await chrome.storage.local.set({ [watchKey]: { submissionId: payload.submissionId, historyBeforeBatchIds, amazonBatchId, checksum: payload.checksum } });
+    if (ownsTab) await chrome.tabs.remove(tabId).catch(() => {});
+    return { deferred: true, submissionId: payload.submissionId };
+  } catch (error) {
+    if (ownsTab) await chrome.tabs.remove(tabId).catch(() => {});
+    throw error;
+  }
 }
 async function reconcileTrackingWatch({ command, payload, watch, root, headers, body }) {
-  const tabId = await ensureSellerCentralFeedsTab();
+  const { tabId, ownsTab } = await ensureSellerCentralFeedsTab();
   try {
+    await waitForSellerCentralFeedsUIRendered(tabId);
     await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
@@ -2120,11 +2165,17 @@ async function reconcileTrackingWatch({ command, payload, watch, root, headers, 
     await new Promise((r) => setTimeout(r, 600));
     const [rows] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: () => [...document.querySelectorAll('tr')].map((row) => row.innerText || '') });
     const row = findNewFeedRow(rows?.result || [], watch.historyBeforeBatchIds);
-    if (!row) return { deferred: true, submissionId: payload.submissionId };
+    if (!row) {
+      if (ownsTab) await chrome.tabs.remove(tabId).catch(() => {});
+      return { deferred: true, submissionId: payload.submissionId };
+    }
     const amazonBatchId = (row.match(/\b\d{6,}\b/) || [])[0];
     if (amazonBatchId && !watch.amazonBatchId) await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/batch`, { method: 'POST', headers, body: JSON.stringify({ ...body, amazonBatchId }) });
     const terminal = terminalFeedResult(row);
-    if (!terminal) return { deferred: true, submissionId: payload.submissionId };
+    if (!terminal) {
+      if (ownsTab) await chrome.tabs.remove(tabId).catch(() => {});
+      return { deferred: true, submissionId: payload.submissionId };
+    }
     const response = await fetch(`${root}/agent/commands/${command.id}/tracking-submissions/${payload.submissionId}/terminal`, { method: 'POST', headers, body: JSON.stringify({ ...body, ...terminal }) });
     if (!response.ok) throw new Error('Tracking terminal state was rejected');
     await chrome.storage.local.remove(`trackingWatch:${payload.submissionId}`);
@@ -2142,10 +2193,11 @@ async function reconcileTrackingWatch({ command, payload, watch, root, headers, 
         `Tracking upload rejected by Amazon`
       );
     }
-
+    if (ownsTab) await chrome.tabs.remove(tabId).catch(() => {});
     return terminal.result;
-  } finally {
-    await chrome.tabs.remove(tab.id).catch(() => {});
+  } catch (error) {
+    if (ownsTab) await chrome.tabs.remove(tabId).catch(() => {});
+    throw error;
   }
 }
 async function pollExtensionCommands(config = null) {
