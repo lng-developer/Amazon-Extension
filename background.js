@@ -779,12 +779,16 @@ async function runImportNewOrders(referenceOverride, numDays) {
    =============================== */
 async function ensureAdsTab(options = {}) {
   if (options.taskTabId) {
-    const tab = await chrome.tabs.get(options.taskTabId);
-    if (!isAdsCampaignUrl(tab.url)) {
-      await chrome.tabs.update(options.taskTabId, { url: `${ADS_BASE}/cm/campaigns` });
-      await waitForAdsTabComplete(options.taskTabId);
+    try {
+      const tab = await chrome.tabs.get(options.taskTabId);
+      if (tab && !isAdsCampaignUrl(tab.url)) {
+        await chrome.tabs.update(options.taskTabId, { url: `${ADS_BASE}/cm/campaigns` });
+        await waitForAdsTabComplete(options.taskTabId);
+      }
+      return options.taskTabId;
+    } catch (_) {
+      options.taskTabId = null;
     }
-    return options.taskTabId;
   }
   const allTabs = await chrome.tabs.query({});
   const adsTabs = allTabs.filter((t) => (t.url && t.url.includes("advertising.amazon.com")) || (t.title && t.title.includes("Amazon Ads")));
@@ -947,11 +951,11 @@ async function ensureAdsBridgeInjected(tabId) {
 }
 
 async function adsRetrieveViaContentScript(payload, options = {}) {
-  const tabId = await ensureAdsTab(options);
+  let tabId = await ensureAdsTab(options);
   await ensureAdsBridgeInjected(tabId);
 
-  const sendOnce = () =>
-    chrome.tabs.sendMessage(tabId, {
+  const sendOnce = (targetTabId) =>
+    chrome.tabs.sendMessage(targetTabId, {
       type: "ADS_FETCH_REPORT",
       url: ADS_RETRIEVE_URL,
       payload,
@@ -961,11 +965,12 @@ async function adsRetrieveViaContentScript(payload, options = {}) {
   let lastError = null;
   for (let i = 0; i < 4; i++) {
     try {
-      const r = await sendOnce();
+      const r = await sendOnce(tabId);
       if (r) return r;
     } catch (e) {
       lastError = e;
-      if (i === 1) await ensureAdsBridgeInjected(tabId);
+      tabId = await ensureAdsTab(options);
+      await ensureAdsBridgeInjected(tabId);
       await delayMs(400 + i * 300);
     }
   }
