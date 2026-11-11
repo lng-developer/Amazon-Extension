@@ -20,33 +20,71 @@ export async function submitNativeTrackingFeed({ tsv, filename, tabId }) {
       if (document.querySelector('form[action*="signin"], input[name="password"], #ap_email, #auth-captcha-image')) {
         throw new Error('Seller Central login or CAPTCHA required');
       }
-      const input = document.querySelector('#fileToUpload, input[type="file"]');
-      const submit = document.querySelector('input[name="upload"][type="submit"], input[type="submit"], button[type="submit"]');
-      if (!(input instanceof HTMLInputElement) || !(submit instanceof HTMLElement)) throw new Error('Seller Central upload controls are unavailable');
+
+      // Find the file input in the active section
+      const fileInputs = [...document.querySelectorAll('input[type="file"]')];
+      const input = fileInputs.find((el) => el.offsetParent !== null) || document.querySelector('#fileToUpload') || fileInputs[0];
+      if (!(input instanceof HTMLInputElement)) throw new Error('Seller Central upload controls are unavailable');
+
+      // Populate file via DataTransfer
       const transfer = new DataTransfer();
       transfer.items.add(new File([content], name, { type: 'text/tab-separated-values' }));
       input.files = transfer.files;
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-      input.dispatchEvent(new Event('input', { bubbles: true }));
 
-      // Give Amazon AUI JS 600ms to process the change event and enable the upload button
-      await new Promise((r) => setTimeout(r, 600));
+      // Trigger standard and jQuery events
+      input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+      input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
 
-      const isSubmitDisabled = () => {
-        if ('disabled' in submit && submit.disabled) return true;
-        if (submit.getAttribute('disabled') !== null) return true;
-        if (submit.classList.contains('a-button-disabled') || submit.closest('.a-button-disabled')) return true;
-        return false;
-      };
+      // Give browser UI and Amazon AUI JS 1200ms to reflect the selected file and enable Upload now
+      await new Promise((r) => setTimeout(r, 1200));
 
-      if (isSubmitDisabled()) {
-        submit.removeAttribute('disabled');
-        submit.disabled = false;
-        submit.closest('.a-button')?.classList.remove('a-button-disabled');
+      const form = input.form || input.closest('form');
+      const searchScope = form || document;
+      const candidates = [
+        ...searchScope.querySelectorAll('input[type="submit"], button[type="submit"], .a-button-input, .a-button-text, button, input[type="button"], input')
+      ];
+
+      let submit = candidates.find((el) => {
+        const text = (el.value || el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+        return text === 'upload now' || text === 'upload';
+      });
+
+      if (!submit) {
+        submit = searchScope.querySelector('input[name="upload"], button[name="upload"], input[type="submit"], button[type="submit"]');
       }
 
+      if (!submit) throw new Error('Seller Central upload button is unavailable');
+
+      // Unlock Amazon AUI button container if disabled
+      const auiContainer = submit.closest('.a-button');
+      if (auiContainer) auiContainer.classList.remove('a-button-disabled');
+      if ('disabled' in submit) submit.disabled = false;
+      submit.removeAttribute('disabled');
+      submit.removeAttribute('aria-disabled');
+
+      // Click the button
       submit.click();
-      return { acknowledged: true };
+      if (auiContainer) {
+        const auiInput = auiContainer.querySelector('input.a-button-input, input[type="submit"]');
+        if (auiInput && auiInput !== submit) {
+          auiInput.removeAttribute('disabled');
+          auiInput.click();
+        }
+      }
+
+      // Fallback: trigger form requestSubmit if available
+      if (form && typeof form.requestSubmit === 'function') {
+        try {
+          form.requestSubmit(submit instanceof HTMLInputElement || submit instanceof HTMLButtonElement ? submit : undefined);
+        } catch {}
+      }
+
+      return {
+        acknowledged: true,
+        inputFound: !!input,
+        filesCount: input.files?.length || 0,
+        buttonText: submit.value || submit.innerText || submit.name || 'Upload now',
+      };
     },
   });
   return result?.result || { acknowledged: false };
