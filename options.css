@@ -475,6 +475,7 @@ output {
 
 .activity-run.is-failed { border-left-color: #ef4444; }
 .activity-run.is-unknown { border-left-color: #f59e0b; }
+.activity-run.is-waiting_amazon { border-left-color: #3b82f6; }
 .activity-run.is-succeeded { border-left-color: #10b981; }
 
 .activity-run-header {
@@ -496,6 +497,7 @@ output {
 
 .is-failed .activity-status { background: #fef2f2; color: #b91c1c; }
 .is-unknown .activity-status { background: #fffbeb; color: #b45309; }
+.is-waiting_amazon .activity-status { background: #eff6ff; color: #1d4ed8; }
 .is-succeeded .activity-status { background: #f0fdf4; color: #15803d; }
 
 .activity-run p {

@@ -95,7 +95,7 @@ export function buildActivityRuns(events = [], { now = Date.now(), commands = []
       run.status = run.confirmedStatus;
       if (run.status === 'SUCCEEDED') run.error = null;
     } else if (command) {
-      run.status = ['SUCCEEDED', 'FAILED', 'QUEUED', 'CLAIMED', 'RUNNING'].includes(command.status) ? command.status : 'UNKNOWN';
+      run.status = ['SUCCEEDED', 'FAILED', 'QUEUED', 'CLAIMED', 'RUNNING', 'WAITING_AMAZON'].includes(command.status) ? command.status : 'UNKNOWN';
       if (['RUNNING', 'CLAIMED'].includes(run.status) && !(Date.parse(command.leaseExpiresAt) > now)) run.status = 'UNKNOWN';
       run.error = command.errorMessage || null;
     } else if (run.status === 'RUNNING' && now - Date.parse(run.events.at(-1).timestamp) > 7 * 60_000) {

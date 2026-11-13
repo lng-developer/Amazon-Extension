@@ -71,7 +71,7 @@ async function renderLogs() {
     title.textContent = run.label;
     const status = document.createElement('span');
     status.className = 'activity-status';
-    status.textContent = run.status === 'UNKNOWN' ? 'Không xác định' : run.status;
+    status.textContent = run.status === 'UNKNOWN' ? 'Không xác định' : run.status === 'WAITING_AMAZON' ? 'Đang chờ Amazon' : run.status;
     header.append(title, status);
     const meta = document.createElement('p');
     const batchId = run.events[0]?.context?.batchId;

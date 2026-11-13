@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { sha256, validateTrackingPayload } from '../amazonTrackingUpload.js';
-import { extractFeedHistoryIds, findNewFeedRow, terminalFeedResult } from '../amazonFeedHistory.js';
+import { extractFeedHistoryIds, findNewFeedRow, findFeedRow, terminalFeedResult } from '../amazonFeedHistory.js';
 
 const tsv = 'order-id\tship-date\tcarrier-code\ttracking-number\tship-method\r\n114-1234567-1234567\t2026-09-28\tUSPS\t9400\tStandard\r\n';
 
@@ -17,5 +17,7 @@ test('extracts stable candidate ids from Feed History rows', () => {
 test('waits when Feed History has no unique new row and recognizes terminal results', () => {
   assert.equal(findNewFeedRow(['123456789 DONE', '987654321 PROCESSING'], ['123456789']), '987654321 PROCESSING');
   assert.equal(findNewFeedRow(['123456789 DONE', '987654321 PROCESSING'], []), null);
+  assert.equal(findFeedRow(['123456789 DONE', '987654321 PROCESSING'], { amazonBatchId: '987654321' }), '987654321 PROCESSING');
   assert.equal(terminalFeedResult('987654321 DONE').status, 'SUCCEEDED');
+  assert.equal(terminalFeedResult('Status: Done Number of records processed from this upload: 1 Number of records that were activated: 1 Number of records with errors: 0').status, 'SUCCEEDED');
 });
