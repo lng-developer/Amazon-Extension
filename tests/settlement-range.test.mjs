@@ -113,6 +113,7 @@ test('page inspection reads shadow DOM download buttons, skips open periods, and
 
 test('dispatcher chooses range for dated commands and retains scheduled discovery', async () => {
   const run = load('pollExtensionCommands', 'async function queueManualOrderImport', {
+    imageTabRecovery: null, cleanupListingImageTabs: async () => {},
     extensionLogger: {}, getBaseShopAndIdentity: async () => ({ base: 'test' }),
     chrome: { runtime: { getManifest: () => ({ version: 'test' }) } },
     runImportTransactions: () => {},

@@ -2,6 +2,39 @@ const IMAGE_LIMIT = 10 * 1024 * 1024;
 const IMAGE_PATH = '/api/integration/listing-image-sync';
 const fatalCodes = new Set(['AMAZON_CHALLENGE', 'AMAZON_AUTH_REQUIRED', 'AMAZON_RATE_LIMIT']);
 const imageError = (code, message) => Object.assign(new Error(message), { code });
+const TAB_KEY = 'listingImageWorkerTabs';
+
+async function tabLog(logger, record, outcome) {
+  try { await logger?.logInfo('Listing image tab cleanup', { taskType: 'SYNC_LISTING_IMAGES', commandId: record.commandId, tabId: record.tabId, outcome }); }
+  catch { /* Logging must not prevent cleanup. */ }
+}
+
+export async function cleanupListingImageTabs({ chromeApi = chrome, logger } = {}) {
+  const records = (await chromeApi.storage.session.get(TAB_KEY))[TAB_KEY] || {};
+  for (const [key, record] of Object.entries(records)) {
+    try {
+      let tab;
+      try { tab = await chromeApi.tabs.get(record.tabId); }
+      catch (error) {
+        if (!/No tab with id/i.test(error.message)) throw error;
+      }
+      const matches = value => {
+        try {
+          const url = new URL(value);
+          return url.protocol === 'https:' && url.hostname === 'www.amazon.com'
+            && url.pathname === `/dp/${record.asin}`;
+        } catch { return false; }
+      };
+      const owned = tab && matches(tab.url) && (!tab.pendingUrl || matches(tab.pendingUrl));
+      if (owned) await chromeApi.tabs.remove(record.tabId);
+      await tabLog(logger, record, !tab ? 'ALREADY_CLOSED' : owned ? 'CLOSED' : 'SKIPPED_NAVIGATED');
+      delete records[key];
+    } catch {
+      await tabLog(logger, record, 'CLOSE_FAILED');
+    }
+  }
+  await chromeApi.storage.session.set({ [TAB_KEY]: records });
+}
 
 // Self-contained: Chrome serializes this function into the product page.
 export function inspectListingMainImage(expectedAsin) {
@@ -81,7 +114,7 @@ async function backendRequest(fetchImpl, url, token, signal, body) {
   return payload?.data;
 }
 
-export async function runListingImageBatch({ base, token, client, command, leaseToken, onProgress,
+export async function runListingImageBatch({ base, token, client, command, leaseToken, onProgress, logger,
   chromeApi = chrome, fetchImpl = fetch, delay = ms => new Promise(resolve => setTimeout(resolve, ms)),
 }) {
   const root = `${base.replace(/\/+$/, '')}${IMAGE_PATH}/agent/commands/${encodeURIComponent(command.id)}`;
@@ -121,6 +154,9 @@ export async function runListingImageBatch({ base, token, client, command, lease
         const productUrl = `https://www.amazon.com/dp/${item.asin}`;
         if (!ownedTab) ownedTab = await chromeApi.tabs.create({url:productUrl,active:true});
         else await chromeApi.tabs.update(ownedTab.id,{url:productUrl});
+        const records = (await chromeApi.storage.session.get(TAB_KEY))[TAB_KEY] || {};
+        records[ownedTab.id] = { tabId: ownedTab.id, commandId: command.id, asin: item.asin };
+        await chromeApi.storage.session.set({ [TAB_KEY]: records });
         for (let attempt=0; attempt<120; attempt++) {
           checkLease();
           if ((await chromeApi.tabs.get(ownedTab.id)).status === 'complete') {
@@ -170,6 +206,6 @@ export async function runListingImageBatch({ base, token, client, command, lease
   } finally {
     clearInterval(timer);
     controller.abort();
-    if(ownedTab?.id) await chromeApi.tabs.remove(ownedTab.id).catch(()=>{});
+    await cleanupListingImageTabs({ chromeApi, logger });
   }
 }

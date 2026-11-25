@@ -21,6 +21,7 @@ test('Amazon wrapper forwards page progress to the task', async () => {
 test('command dispatcher forwards the progress callback all the way into the transaction task', async () => {
   const progress = async () => {};
   const poll = load('pollExtensionCommands', 'async function queueManualOrderImport', {
+    imageTabRecovery: null, cleanupListingImageTabs: async () => {},
     getBaseShopAndIdentity: async () => ({ base: 'test', clientId: 'rdc', clientLabel: 'RDC' }),
     chrome: { runtime: { getManifest: () => ({ version: 'test' }) } },
     pollExtensionCommand: async ({ runTransactions }) => runTransactions({ dateFrom: '2026-09-15', dateTo: '2026-09-16', onProgress: progress }),
@@ -137,4 +138,24 @@ test('restarting a transaction task resumes its batch without downloading or upl
   });
   assert.equal((await run({ dateFrom: '2026-09-15', dateTo: '2026-09-16' })).status, 'COMPLETED');
   assert.equal(removed, 'transactionBatch:scope-hash');
+});
+
+test('worker recovery completes once before concurrent command polls can start', async () => {
+  const events = [];
+  let release;
+  const recovery = new Promise(resolve => { release = resolve; });
+  const poll = load('pollExtensionCommands', 'async function queueManualOrderImport', {
+    imageTabRecovery: null,
+    cleanupListingImageTabs: async () => { events.push('recover'); await recovery; },
+    getBaseShopAndIdentity: async () => ({ base: 'test' }),
+    chrome: { runtime: { getManifest: () => ({ version: 'test' }) } },
+    runImportTransactions: () => {},
+    pollExtensionCommand: async () => { events.push('poll'); },
+  });
+  const first = poll({ ingestToken: 'test' });
+  const second = poll({ ingestToken: 'test' });
+  assert.deepEqual(events, ['recover']);
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ['recover', 'poll', 'poll']);
 });

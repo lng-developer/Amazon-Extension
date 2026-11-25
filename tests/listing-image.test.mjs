@@ -95,7 +95,8 @@ test('CDN URL validation rejects protocol, credentials, ports and hostname looka
 function fixture({fatal=false, paused=false}={}) {
   let remaining = [{id:'item1',listingId:'listing1',asin,marketplaceCode:'US'},{id:'item2',listingId:'listing2',asin,marketplaceCode:'US'}];
   const results=[], removed=[], visited=[], created=[];
-  const chromeApi={tabs:{create:async input=>{created.push(input);return {id:91};},update:async(id,input)=>{visited.push(input.url);},get:async()=>({status:'complete'}),remove:async id=>removed.push(id)},scripting:{executeScript:async()=>[{result:fatal?{errorCode:'AMAZON_CHALLENGE',errorMessage:'CAPTCHA'}:{asin,sourceUrl:url}}]}};
+  const session = {};
+  const chromeApi={storage:{session:{get:async()=>session,set:async value=>Object.assign(session,value)}},tabs:{create:async input=>{created.push(input);return {id:91};},update:async(id,input)=>{visited.push(input.url);},get:async()=>({status:'complete',url:`https://www.amazon.com/dp/${asin}`}),remove:async id=>removed.push(id)},scripting:{executeScript:async()=>[{result:fatal?{errorCode:'AMAZON_CHALLENGE',errorMessage:'CAPTCHA'}:{asin,sourceUrl:url}}]}};
   const fetchImpl=async (target,options={})=>{
     if(target===url)return new Response(new Uint8Array([255,216,255,224]),{headers:{'content-type':'image/jpeg'}});
     if(target.endsWith('/items/query')) return Response.json({data:{jobId:'job',status:paused?'PAUSED':'RUNNING',items:remaining}});
@@ -158,7 +159,7 @@ test('a lost worker tab is reopened once and the same pending listing is retried
   const f = fixture();
   let created = 0;
   f.chromeApi.tabs.create = async input => { f.created.push(input); return { id: ++created }; };
-  f.chromeApi.tabs.get = async id => { if (id === 1) throw new Error('No tab with id: 1'); return { status: 'complete' }; };
+  f.chromeApi.tabs.get = async id => { if (id === 1) throw new Error('No tab with id: 1'); return { status: 'complete', url: `https://www.amazon.com/dp/${asin}` }; };
   const result = await images.runListingImageBatch({ base: 'https://be.test', token: 'token', client: { clientId: 'client' }, command: { id: 'cmd' }, leaseToken: 'lease', onProgress: async () => {}, ...f });
   assert.deepEqual(result, { importedCount: 2, failedCount: 0 });
   assert.deepEqual(f.results, ['UPLOADED', 'UPLOADED']);
@@ -169,8 +170,64 @@ test('a lost worker tab is reopened once and the same pending listing is retried
 test('CAPTCHA still pauses when the tab disappears after detection', async () => {
   const f = fixture({ fatal: true });
   let checks = 0;
-  f.chromeApi.tabs.get = async () => { if (++checks > 1) throw new Error('Tab gone'); return { status: 'complete' }; };
+  f.chromeApi.tabs.get = async () => { if (++checks > 1) throw new Error('Tab gone'); return { status: 'complete', url: `https://www.amazon.com/dp/${asin}` }; };
   await assert.rejects(images.runListingImageBatch({ base: 'https://be.test', token: 'token', client: { clientId: 'client' }, command: { id: 'cmd' }, leaseToken: 'lease', onProgress: async () => {}, ...f }), /CAPTCHA/);
   assert.deepEqual(f.results, ['PAUSED']);
   assert.equal(f.visited.length, 0);
+});
+
+function recoveryFixture() {
+  const records = { 91: { tabId: 91, commandId: 'old-command', asin } };
+  const session = { listingImageWorkerTabs: records };
+  const removed = [], logs = [];
+  return { session, removed, logs,
+    chromeApi: { storage: { session: { get: async () => structuredClone(session), set: async value => Object.assign(session, value) } },
+      tabs: { get: async () => ({ url: `https://www.amazon.com/dp/${asin}?th=1` }), remove: async id => removed.push(id) } },
+    logger: { logInfo: async (_, context) => logs.push(context) },
+  };
+}
+
+test('fresh worker recovers only recorded image tab and logs closure', async () => {
+  const f = recoveryFixture();
+  const freshWorker = await import('../amazonListingImage.js?restarted');
+  await freshWorker.cleanupListingImageTabs(f);
+  assert.deepEqual(f.removed, [91]);
+  assert.deepEqual(f.session.listingImageWorkerTabs, {});
+  assert.equal(f.logs[0].commandId, 'old-command');
+  assert.equal(f.logs[0].outcome, 'CLOSED');
+  await freshWorker.cleanupListingImageTabs(f);
+  assert.deepEqual(f.removed, [91]);
+});
+
+test('cleanup preserves user navigation, including a pending navigation', async () => {
+  for (const tab of [{url:'https://example.com/'}, {url:`https://www.amazon.com/dp/${asin}`,pendingUrl:'https://example.com/'}]) {
+    const f = recoveryFixture();
+    f.chromeApi.tabs.get = async () => tab;
+    await images.cleanupListingImageTabs(f);
+    assert.deepEqual(f.removed, []);
+    assert.equal(f.logs[0].outcome, 'SKIPPED_NAVIGATED');
+    assert.deepEqual(f.session.listingImageWorkerTabs, {});
+  }
+});
+
+test('already closed tabs are forgotten and logged', async () => {
+  const f = recoveryFixture();
+  f.chromeApi.tabs.get = async () => { throw new Error('No tab with id: 91.'); };
+  await images.cleanupListingImageTabs(f);
+  assert.deepEqual(f.removed, []);
+  assert.deepEqual(f.session.listingImageWorkerTabs, {});
+  assert.equal(f.logs[0].outcome, 'ALREADY_CLOSED');
+});
+
+test('failed close retains ownership for retry; logger failure cannot prevent cleanup', async () => {
+  const f = recoveryFixture();
+  f.chromeApi.tabs.remove = async () => { throw new Error('temporary failure'); };
+  await images.cleanupListingImageTabs(f);
+  assert.ok(f.session.listingImageWorkerTabs[91]);
+  assert.equal(f.logs[0].outcome, 'CLOSE_FAILED');
+  f.chromeApi.tabs.remove = async id => f.removed.push(id);
+  f.logger.logInfo = async () => { throw new Error('storage full'); };
+  await images.cleanupListingImageTabs(f);
+  assert.deepEqual(f.removed, [91]);
+  assert.deepEqual(f.session.listingImageWorkerTabs, {});
 });

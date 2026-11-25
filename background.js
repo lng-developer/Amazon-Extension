@@ -17,7 +17,7 @@ import {
 } from './adsReporting.js';
 import { classifyAmazonAdsReportLink, createGmailAdsDownloadFingerprint } from './gmailReportDownload.js';
 import { fetchTransactionsCsv as fetchAmazonTransactionsCsv, summarizeTransactionCsv } from './amazonTransaction.js';
-import { runListingImageBatch } from './amazonListingImage.js';
+import { runListingImageBatch, cleanupListingImageTabs } from './amazonListingImage.js';
 import { submitNativeTrackingFeed, validateTrackingPayload } from './amazonTrackingUpload.js';
 import { findFeedRow, findNewFeedRow, snapshotFeedHistory, terminalFeedResult } from './amazonFeedHistory.js';
 import {
@@ -2350,7 +2350,11 @@ async function reconcileTrackingWatch({ command, leaseToken, payload, watch, roo
     throw error;
   }
 }
+let imageTabRecovery;
 async function pollExtensionCommands(config = null) {
+  // One recovery per worker lifetime, before any new image command can start.
+  imageTabRecovery ||= cleanupListingImageTabs({ logger: extensionLogger }).catch(error => { imageTabRecovery = null; throw error; });
+  await imageTabRecovery;
   config ||= await getCfg();
   const identity = await getBaseShopAndIdentity();
   const client = { clientId: identity.clientId, label: identity.clientLabel, version: chrome.runtime.getManifest().version, apiBaseUrl: identity.base, listingImageSync: true };
@@ -2359,7 +2363,7 @@ async function pollExtensionCommands(config = null) {
     runAds: ({ dateFrom, dateTo }) => runExportAdsSpend({ dateFrom, dateTo }),
     runTransactions: runImportTransactions,
     runSettlements: options => options.dateFrom && options.dateTo ? runSettlementRange(options) : runScheduledSettlementImport(options),
-    runListingImages: options => runListingImageBatch({ ...options, base: identity.base, token: config.ingestToken, client }),
+    runListingImages: options => runListingImageBatch({ ...options, base: identity.base, token: config.ingestToken, client, logger: extensionLogger }),
     ...(typeof runTrackingUpload === 'function' ? { runTracking: runTrackingUpload } : {}),
   });
 }
